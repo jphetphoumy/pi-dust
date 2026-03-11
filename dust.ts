@@ -47,6 +47,32 @@ let currentSessionContext: {
 // Defaults to always-allow so the extension degrades gracefully in non-interactive modes.
 let currentConfirmFn: (title: string, message: string) => Promise<boolean> = async () => true;
 
+// Maps actionId → approval result, populated when validate-action is called.
+// Read by listenMcpRequests to skip the redundant local confirm for tools
+// that were already server-approved.
+const preApprovedActions = new Map<string, boolean>();
+
+// When streamEvents is handling a tool_approve_execution, this promise resolves
+// once the approval decision has been written to preApprovedActions.
+// listenMcpRequests waits on this so it doesn't race past the pre-approval.
+// Set BEFORE listenMcpRequests starts so tools/call always awaits it.
+let pendingApprovalPromise: Promise<void> | null = null;
+let resolveApprovalGate: (() => void) | null = null;
+
+interface ToolApproveExecutionEvent {
+  type: "tool_approve_execution";
+  actionId: string;
+  conversationId: string;
+  messageId: string;
+  stake?: "low" | "medium" | "high" | "never_ask";
+  inputs?: Record<string, unknown>;
+  metadata?: {
+    toolName?: string;
+    agentName?: string;
+    mcpServerName?: string;
+  };
+}
+
 function decodeJwtPayload(token: string): Record<string, unknown> {
   const part = token.split(".")[1];
   return JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/")));
@@ -267,6 +293,9 @@ function clearMcpState(): void {
     mcpRequestsAbortController = null;
   }
   currentMcpServerId = null;
+  preApprovedActions.clear();
+  pendingApprovalPromise = null;
+  resolveApprovalGate = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -373,15 +402,31 @@ async function listenMcpRequests(
                    headers: { ...authHeaders, "Content-Type": "application/json" },
                    body: JSON.stringify({ result: responseMsg, serverId }),
                  }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); });
-               } else if (request.method === "tools/call") {
-                 const toolName: string = request.params?.name ?? "";
-                 const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
+                 } else if (request.method === "tools/call") {
+                   const toolName: string = request.params?.name ?? "";
+                   const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
 
-                 // Show allow/deny prompt before executing the tool.
-                 const allowed = await currentConfirmFn(
-                   `Dust agent wants to run: ${toolName}`,
-                   buildConfirmMessage(toolName, toolArgs),
-                 );
+                   // Check if this tool was already approved via the server-side validate-action flow.
+                   // If a tool_approve_execution is currently being processed by streamEvents,
+                   // wait for it to finish writing to preApprovedActions before proceeding.
+                   if (pendingApprovalPromise !== null) {
+                     await pendingApprovalPromise;
+                   }
+
+                   // Consume from preApprovedActions (FIFO) if a server-side decision was recorded.
+                   // Dust guarantees at most one outstanding tools/call per agent turn.
+                   let allowed: boolean;
+                   if (preApprovedActions.size > 0) {
+                     const [firstKey, firstValue] = preApprovedActions.entries().next().value!;
+                     preApprovedActions.delete(firstKey);
+                     allowed = firstValue;
+                   } else {
+                     // Fallback: no server-side approval received — ask locally.
+                     allowed = await currentConfirmFn(
+                       `Dust agent wants to run: ${toolName}`,
+                       buildConfirmMessage(toolName, toolArgs),
+                     );
+                   }
 
                  let toolResult: McpToolResult;
                  if (!allowed) {
@@ -573,6 +618,11 @@ function dustRealStream(
         const serverId = await registerMcpServer(`${baseUrl}`, authHeaders);
         currentMcpServerId = serverId;
         startMcpHeartbeat(baseUrl, authHeaders, serverId);
+
+        // Set up the approval gate BEFORE starting the listener so it's already
+        // in place when tools/call first arrives.  streamEvents will resolve it.
+        pendingApprovalPromise = new Promise<void>((resolve) => { resolveApprovalGate = resolve; });
+
         // Start MCP request listener in background (detached).
         const ac = new AbortController();
         mcpRequestsAbortController = ac;
@@ -641,6 +691,9 @@ function dustRealStream(
         const agentMsgSId = findAgentMessageSId(data.conversation.content, userMessageSId);
 
         await streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal, stream, model);
+        // Ensure the approval gate is resolved after streamEvents completes so
+        // listenMcpRequests isn't blocked indefinitely in non-approval flows.
+        if (resolveApprovalGate) { resolveApprovalGate(); resolveApprovalGate = null; pendingApprovalPromise = null; }
       } else {
         // ------------------------------------------------------------------ subsequent message
         conversationSId = currentConversationId;
@@ -691,6 +744,7 @@ function dustRealStream(
         const agentMsgSId = findAgentMessageSId(convData.conversation.content, userMessageSId);
 
         await streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal, stream, model);
+        if (resolveApprovalGate) { resolveApprovalGate(); resolveApprovalGate = null; pendingApprovalPromise = null; }
       }
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -715,6 +769,41 @@ function findAgentMessageSId(content: any[][], userMessageSId: string): string {
   throw new Error("No agent message found in conversation content");
 }
 
+/**
+ * Show a confirmation prompt for a tool_approve_execution event.
+ * Returns true if approved, false if rejected.
+ * Skips the prompt and returns true automatically when stake === "never_ask".
+ */
+async function handleToolApproveExecution(event: ToolApproveExecutionEvent): Promise<boolean> {
+  if (event.stake === "never_ask") {
+    return true;
+  }
+  const toolName = event.metadata?.toolName ?? "unknown";
+  const inputs = event.inputs ?? {};
+  const title = `Allow tool: ${toolName}`;
+  const message = buildConfirmMessage(toolName, inputs);
+  return currentConfirmFn(title, message);
+}
+
+/**
+ * POST the approval/rejection decision to Dust's validate-action endpoint.
+ */
+async function postValidateAction(
+  baseUrl: string,
+  authHeaders: Record<string, string>,
+  conversationId: string,
+  messageId: string,
+  actionId: string,
+  approved: boolean,
+): Promise<void> {
+  const url = `${baseUrl}/assistant/conversations/${conversationId}/messages/${messageId}/validate-action`;
+  await fetch(url, {
+    method: "POST",
+    headers: { ...authHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ actionId, approved: approved ? "approved" : "rejected" }),
+  });
+}
+
 /** Stream SSE events from the agent message events endpoint, mapping to pi stream events. */
 async function streamEvents(
   baseUrl: string,
@@ -727,119 +816,161 @@ async function streamEvents(
 ): Promise<void> {
   const sseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
 
-  const res = await fetch(sseUrl, {
-    headers: {
-      ...authHeaders,
-      Accept: "text/event-stream",
-    },
-    signal,
-  });
-
-  if (!res.ok) {
-    if (res.status === 401) {
-      throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
-    }
-    throw new Error(`Failed to stream events: HTTP ${res.status}`);
-  }
-
-  if (!res.body) {
-    throw new Error("SSE response has no body");
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-
   // Build up the complete text as we go so we can put it in the final message.
+  // Persists across reconnects triggered by tool_approve_execution.
   let fullText = "";
 
   // Partial AssistantMessage updated on each text_delta.
   const partial = makeEmptyMessage(model);
 
-  // Minimal SSE parser: accumulate lines, emit on blank line.
-  let buffer = "";
+  // Outer reconnect loop: re-fetches the events SSE after tool_approve_execution handling.
+  reconnect: for (;;) {
+    const res = await fetch(sseUrl, {
+      headers: {
+        ...authHeaders,
+        Accept: "text/event-stream",
+      },
+      signal,
+    });
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (value) {
-        buffer += decoder.decode(value, { stream: true });
+    if (!res.ok) {
+      if (res.status === 401) {
+        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+      }
+      throw new Error(`Failed to stream events: HTTP ${res.status}`);
+    }
 
-        // Split on SSE double-newline boundaries and process complete frames.
-        const frames = buffer.split("\n\n");
-        // The last element may be incomplete — keep it in the buffer.
-        buffer = frames.pop() ?? "";
+    if (!res.body) {
+      throw new Error("SSE response has no body");
+    }
 
-        for (const frame of frames) {
-          // Each frame is one or more "field: value" lines.
-          for (const line of frame.split("\n")) {
-            if (line.startsWith("data:")) {
-              const json = line.slice(5).trim();
-              if (!json) continue;
-              let parsed: any;
-              try {
-                parsed = JSON.parse(json);
-              } catch {
-                continue;
-              }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
 
-              // Wire format: { eventId: "...", data: { type: "...", ... } }
-              const event = parsed.data ?? parsed;
+    // Minimal SSE parser: accumulate lines, emit on blank line.
+    let buffer = "";
+    // Set to true when a tool_approve_execution event triggers a reconnect.
+    let shouldReconnect = false;
 
-              if (event.type === "generation_tokens") {
-                if (event.classification === "tokens") {
-                  const delta: string = event.text ?? "";
-                  fullText += delta;
-                  // Update partial content in place.
+    try {
+      outer: for (;;) {
+        const { value, done } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+
+          // Split on SSE double-newline boundaries and process complete frames.
+          const frames = buffer.split("\n\n");
+          // The last element may be incomplete — keep it in the buffer.
+          buffer = frames.pop() ?? "";
+
+          for (const frame of frames) {
+            // Each frame is one or more "field: value" lines.
+            for (const line of frame.split("\n")) {
+              if (line.startsWith("data:")) {
+                const json = line.slice(5).trim();
+                if (!json) continue;
+                let parsed: any;
+                try {
+                  parsed = JSON.parse(json);
+                } catch {
+                  continue;
+                }
+
+                // Wire format: { eventId: "...", data: { type: "...", ... } }
+                const event = parsed.data ?? parsed;
+
+                if (event.type === "generation_tokens") {
+                  if (event.classification === "tokens") {
+                    const delta: string = event.text ?? "";
+                    fullText += delta;
+                    // Update partial content in place.
+                    if (partial.content.length === 0) {
+                      partial.content.push({ type: "text", text: fullText });
+                    } else {
+                      (partial.content[0] as any).text = fullText;
+                    }
+                    stream.push({ type: "text_delta", contentIndex: 0, delta, partial: { ...partial } });
+                  }
+                  // chain_of_thought: discard
+                } else if (event.type === "tool_params") {
+                  // Emit a text_delta so the user sees which tool is being called.
+                  const toolName: string = event.action?.toolName ?? event.action?.functionCallName ?? "tool";
+                  const indicator = `\n[Tool: ${toolName}]\n`;
+                  fullText += indicator;
                   if (partial.content.length === 0) {
                     partial.content.push({ type: "text", text: fullText });
                   } else {
                     (partial.content[0] as any).text = fullText;
                   }
-                  stream.push({ type: "text_delta", contentIndex: 0, delta, partial: { ...partial } });
+                  stream.push({ type: "text_delta", contentIndex: 0, delta: indicator, partial: { ...partial } });
+                } else if (event.type === "tool_approve_execution") {
+                  // Server is asking for explicit user approval before the tool runs.
+                  const approveEvent = event as ToolApproveExecutionEvent;
+                  const approved = await handleToolApproveExecution(approveEvent);
+                  await postValidateAction(
+                    baseUrl,
+                    authHeaders,
+                    approveEvent.conversationId,
+                    approveEvent.messageId,
+                    approveEvent.actionId,
+                    approved,
+                  );
+                  // Record the decision so listenMcpRequests can consume it when
+                  // the corresponding tools/call arrives, skipping a second prompt.
+                  preApprovedActions.set(approveEvent.actionId, approved);
+                  // Resolve the approval gate so listenMcpRequests can proceed.
+                  if (resolveApprovalGate) {
+                    resolveApprovalGate();
+                    resolveApprovalGate = null;
+                    pendingApprovalPromise = null;
+                  }
+                  // Signal that we need to reconnect after the reader is released.
+                  shouldReconnect = true;
+                  break outer;
+                } else if (event.type === "agent_message_success") {
+                  // Resolve the approval gate before ending the stream so that
+                  // listenMcpRequests (which awaits the gate) can post /mcp/results
+                  // while the test's for-await is still processing the done event.
+                  if (resolveApprovalGate) { resolveApprovalGate(); resolveApprovalGate = null; pendingApprovalPromise = null; }
+                  const finalMessage = makeEmptyMessage(model);
+                  finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                  finalMessage.stopReason = "stop";
+                  stream.push({ type: "done", reason: "stop", message: finalMessage });
+                  stream.end();
+                  return;
+                } else if (event.type === "agent_generation_cancelled") {
+                  if (resolveApprovalGate) { resolveApprovalGate(); resolveApprovalGate = null; pendingApprovalPromise = null; }
+                  const finalMessage = makeEmptyMessage(model);
+                  finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                  finalMessage.stopReason = "stop";
+                  stream.push({ type: "done", reason: "stop", message: finalMessage });
+                  stream.end();
+                  return;
+                } else if (event.type === "agent_error") {
+                  throw new Error(event.error?.message ?? "Agent error");
+                } else if (event.type === "user_message_error") {
+                  throw new Error(event.error?.message ?? "User message error");
                 }
-                // chain_of_thought: discard
-              } else if (event.type === "tool_params") {
-                // Emit a text_delta so the user sees which tool is being called.
-                const toolName: string = event.action?.toolName ?? event.action?.functionCallName ?? "tool";
-                const indicator = `\n[Tool: ${toolName}]\n`;
-                fullText += indicator;
-                if (partial.content.length === 0) {
-                  partial.content.push({ type: "text", text: fullText });
-                } else {
-                  (partial.content[0] as any).text = fullText;
-                }
-                stream.push({ type: "text_delta", contentIndex: 0, delta: indicator, partial: { ...partial } });
-              } else if (event.type === "agent_message_success") {
-                const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
-                finalMessage.stopReason = "stop";
-                stream.push({ type: "done", reason: "stop", message: finalMessage });
-                stream.end();
-                return;
-              } else if (event.type === "agent_generation_cancelled") {
-                const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
-                finalMessage.stopReason = "stop";
-                stream.push({ type: "done", reason: "stop", message: finalMessage });
-                stream.end();
-                return;
-              } else if (event.type === "agent_error") {
-                throw new Error(event.error?.message ?? "Agent error");
-              } else if (event.type === "user_message_error") {
-                throw new Error(event.error?.message ?? "User message error");
+                // agent_action_success, tool_error, tool_* — handled by MCP listener loop
               }
-              // agent_action_success, tool_error, tool_* — handled by MCP listener loop
             }
           }
         }
+        if (done) break;
       }
-      if (done) break;
+    } finally {
+      reader.releaseLock();
     }
-  } finally {
-    reader.releaseLock();
+
+    // If a tool_approve_execution was handled, loop back and reconnect.
+    if (shouldReconnect) continue reconnect;
+
+    // SSE stream ended without an explicit done event — stop reconnecting.
+    break reconnect;
   }
 
   // If SSE stream ended without an explicit done event, synthesize one.
+  if (resolveApprovalGate) { resolveApprovalGate(); resolveApprovalGate = null; pendingApprovalPromise = null; }
   const finalMessage = makeEmptyMessage(model);
   finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
   finalMessage.stopReason = "stop";
