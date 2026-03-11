@@ -939,6 +939,124 @@ describe("dust extension", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // session_switch — reset conversation on /new
+  // ---------------------------------------------------------------------------
+
+  describe("session_switch: conversation reset on /new", () => {
+    it("resets currentConversationId so next message starts a new Dust conversation", async () => {
+      const creds = makeCredentials();
+      let capturedStreamSimple: any;
+      let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+      let sessionSwitchHandler: ((event: unknown) => void) | undefined;
+
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          capturedStreamSimple = config.streamSimple;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: any) => {
+          if (event === "session_start") sessionStartHandler = handler;
+          if (event === "session_switch") sessionSwitchHandler = handler;
+        }),
+      };
+
+      dustExtension(mockApi as any);
+
+      // Trigger buildDustProviderConfig via session_start so credentials are in closure
+      const savedFetch = (globalThis as any).fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+        })
+      );
+      await sessionStartHandler!(
+        {},
+        {
+          modelRegistry: {
+            authStorage: {
+              get: () => creds,
+              set: vi.fn(),
+            },
+          },
+        }
+      );
+      vi.stubGlobal("fetch", savedFetch);
+
+      expect(typeof sessionSwitchHandler).toBe("function");
+
+      const model = {
+        id: "agent-sonnet",
+        sId: "agentSId-1",
+        name: "AgentSonnet",
+        provider: "dust",
+        api: "dust",
+      };
+
+      // First message — sets up a conversation
+      const convCreateResponse = {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            conversation: {
+              sId: "conv-first",
+              content: [[{ type: "user_message", sId: "msg-1" }]],
+            },
+            message: { sId: "msg-1" },
+          }),
+      };
+      const agentMsgResponse = {
+        ok: true,
+        body: makeSseStream([{ type: "agent_message_success", message: { content: "Hi" } }]),
+        headers: { get: () => "text/event-stream" },
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn()
+          .mockResolvedValueOnce(convCreateResponse)
+          .mockResolvedValueOnce(agentMsgResponse)
+      );
+
+      const stream1 = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
+      const events1: any[] = [];
+      for await (const e of stream1) events1.push(e);
+
+      // Simulate /new — session_switch fires
+      sessionSwitchHandler!({});
+
+      // Second message — must create a NEW conversation (POST /assistant/conversations again)
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              conversation: {
+                sId: "conv-new",
+                content: [[{ type: "user_message", sId: "msg-2" }]],
+              },
+              message: { sId: "msg-2" },
+            }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success", message: { content: "Fresh" } }]),
+          headers: { get: () => "text/event-stream" },
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream2 = capturedStreamSimple(model, { messages: [{ role: "user", content: "New session" }] });
+      const events2: any[] = [];
+      for await (const e of stream2) events2.push(e);
+
+      // The first fetch call after session_switch must be POST /assistant/conversations (no conversation ID in URL)
+      const firstCallUrl: string = fetchMock.mock.calls[0][0];
+      expect(firstCallUrl).toMatch(/\/assistant\/conversations$/);
+      expect(firstCallUrl).not.toContain("conv-first");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // login() — username storage
   // ---------------------------------------------------------------------------
 

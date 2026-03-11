@@ -760,6 +760,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Reset conversation when the user starts a new session (/new command).
+  if (typeof (pi as any).on === "function") {
+    (pi as any).on("session_switch", (_event: unknown) => {
+      currentConversationId = null;
+    });
+  }
+
   // On session start, re-register with explicit models so the registry's
   // refresh() path (which resets OAuth providers before calling loadModels)
   // still populates the model list correctly.
