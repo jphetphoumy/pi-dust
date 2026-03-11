@@ -205,7 +205,7 @@ async function loginFn(callbacks: any) {
   const meRes = await fetch(`${apiUrl}/api/v1/me`, {
     headers: {
       Authorization: `Bearer ${tokenData.access_token}`,
-      ...DUST_HEADERS,
+      "Content-Type": "application/json",
     },
     signal,
   });

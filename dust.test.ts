@@ -268,7 +268,7 @@ describe("dust extension", () => {
       expect(agentsCall[0]).toContain("agent_configurations");
     });
 
-    it("login() sends User-Agent 'Dust CLI' header on Dust API calls", async () => {
+    it("login() sends User-Agent 'Dust CLI' header on agent_configurations call but NOT on /me", async () => {
       const jwt = makeFakeJwt({ "https://dust.tt/region": "us-central1" });
       const fetchMock = makeLoginFetchMock({ jwt });
       vi.stubGlobal("fetch", fetchMock);
@@ -277,15 +277,19 @@ describe("dust extension", () => {
       await vi.runAllTimersAsync();
       await loginPromise;
 
-      // /me call (3rd call, index 2) and agents call (4th call, index 3)
-      const meCalls = fetchMock.mock.calls.filter(([url]: [string]) => url.includes("/api/v1"));
-      expect(meCalls.length).toBeGreaterThanOrEqual(2);
-      for (const [, init] of meCalls) {
-        expect(init?.headers?.["User-Agent"]).toBe("Dust CLI");
-      }
+      const meCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/api/v1/me"));
+      const agentsCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("agent_configurations"));
+
+      expect(meCall).toBeDefined();
+      expect(agentsCall).toBeDefined();
+      // dust-cli does NOT send these headers on /me
+      expect(meCall![1]?.headers?.["User-Agent"]).toBeUndefined();
+      expect(meCall![1]?.headers?.["X-Dust-CLI-Version"]).toBeUndefined();
+      // dust-cli DOES send them on agent_configurations
+      expect(agentsCall![1]?.headers?.["User-Agent"]).toBe("Dust CLI");
     });
 
-    it("login() sends X-Dust-CLI-Version header on Dust API calls", async () => {
+    it("login() sends X-Dust-CLI-Version header on agent_configurations call but NOT on /me", async () => {
       const jwt = makeFakeJwt({ "https://dust.tt/region": "us-central1" });
       const fetchMock = makeLoginFetchMock({ jwt });
       vi.stubGlobal("fetch", fetchMock);
@@ -294,10 +298,11 @@ describe("dust extension", () => {
       await vi.runAllTimersAsync();
       await loginPromise;
 
-      const meCalls = fetchMock.mock.calls.filter(([url]: [string]) => url.includes("/api/v1"));
-      for (const [, init] of meCalls) {
-        expect(init?.headers?.["X-Dust-CLI-Version"]).toBeDefined();
-      }
+      const meCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/api/v1/me"));
+      const agentsCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("agent_configurations"));
+
+      expect(meCall![1]?.headers?.["X-Dust-CLI-Version"]).toBeUndefined();
+      expect(agentsCall![1]?.headers?.["X-Dust-CLI-Version"]).toBeDefined();
     });
 
     it("login() stores fetched agents in credentials", async () => {
