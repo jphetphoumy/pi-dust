@@ -383,20 +383,47 @@ describe("dust extension", () => {
       expect(typeof modifyModelsFn).toBe("function");
     });
 
-    it("converts stored agents to models with correct id, name and provider", () => {
+    it("converts stored agents to models with slugified id, human name and provider", () => {
       const creds = makeCredentials({
         agents: [
-          { sId: "agent-abc", name: "My Agent", description: "Does stuff" },
+          { sId: "miV7ukZhGD", name: "AgentSonnet", description: "Does stuff" },
         ],
       });
       const models = modifyModelsFn([], creds);
 
       expect(models).toHaveLength(1);
       expect(models[0]).toMatchObject({
-        id: "agent-abc",
-        name: "My Agent",
+        id: "agent-sonnet",       // slugified name — what the user sees
+        name: "AgentSonnet",      // original name — used for search
         provider: "dust",
       });
+      // sId is preserved for API calls
+      expect(models[0].sId).toBe("miV7ukZhGD");
+    });
+
+    it("slugifies agent names with spaces and mixed case", () => {
+      const creds = makeCredentials({
+        agents: [
+          { sId: "abc123", name: "My Custom Agent", description: "" },
+        ],
+      });
+      const [model] = modifyModelsFn([], creds);
+      expect(model.id).toBe("my-custom-agent");
+    });
+
+    it("replaces existing dust models, keeps non-dust models (slug-based ids)", () => {
+      const creds = makeCredentials({
+        agents: [{ sId: "newSId", name: "New Agent", description: "" }],
+      });
+      const existing = [
+        { provider: "dust", id: "old-agent", name: "Old" },
+        { provider: "anthropic", id: "claude-3", name: "Claude" },
+      ];
+      const result = modifyModelsFn(existing, creds);
+
+      expect(result.some((m: any) => m.id === "old-agent")).toBe(false);
+      expect(result.some((m: any) => m.id === "claude-3")).toBe(true);
+      expect(result.some((m: any) => m.id === "new-agent")).toBe(true);
     });
 
     it("sets baseUrl using dust.tt for us-central1", () => {
@@ -430,7 +457,7 @@ describe("dust extension", () => {
       expect(modifyModelsFn([], creds)).toHaveLength(0);
     });
 
-    it("replaces existing dust models, keeps non-dust models", () => {
+    it("replaces existing dust models, keeps non-dust models (legacy check)", () => {
       const creds = makeCredentials({
         agents: [{ sId: "new-agent", name: "New", description: "" }],
       });
@@ -442,7 +469,7 @@ describe("dust extension", () => {
 
       expect(result.some((m: any) => m.id === "old-agent")).toBe(false);
       expect(result.some((m: any) => m.id === "claude-3")).toBe(true);
-      expect(result.some((m: any) => m.id === "new-agent")).toBe(true);
+      expect(result.some((m: any) => m.id === "new")).toBe(true);
     });
   });
 
@@ -607,6 +634,7 @@ describe("dust extension", () => {
 
     afterEach(() => {
       vi.unstubAllGlobals();
+      vi.useRealTimers();
     });
 
     it("registers a session_start handler", () => {
@@ -741,7 +769,126 @@ describe("dust extension", () => {
       await sessionStartHandler!({}, ctx);
 
       expect(lastRegisteredModels).toBeDefined();
+      // id is slugified name — "New Agent" → "new-agent"
       expect(lastRegisteredModels!.some((m: any) => m.id === "new-agent")).toBe(true);
+    });
+
+    it("refreshes the token before fetching agents when the access token is expired", async () => {
+      const expiredCreds = makeCredentials({
+        access: "expired-token",
+        refresh: "valid-refresh",
+        expires: Date.now() - 1000, // already expired
+        agents: [],
+      });
+
+      const freshToken = "fresh-access-token";
+      const freshAgents = [{ sId: "agent-priv", name: "AgentSonnet", description: "private" }];
+
+      const fetchMock = vi.fn()
+        // 1st call: token refresh
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            access_token: freshToken,
+            refresh_token: "new-refresh",
+            expires_in: 3600,
+          }),
+        })
+        // 2nd call: agent fetch with fresh token
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: freshAgents }),
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const authStorage = { get: vi.fn().mockReturnValue(expiredCreds), set: vi.fn() };
+      const ctx = { modelRegistry: { authStorage } };
+      await sessionStartHandler!({}, ctx);
+
+      // Token refresh was called first
+      const refreshCall = fetchMock.mock.calls[0];
+      expect(refreshCall[1]?.body?.toString()).toContain("refresh_token");
+
+      // Agent fetch used the fresh token
+      const agentCall = fetchMock.mock.calls[1];
+      expect(agentCall[1]?.headers?.["Authorization"]).toBe(`Bearer ${freshToken}`);
+
+      // Updated credentials stored with new token and fresh agents
+      expect(authStorage.set).toHaveBeenCalledWith(
+        "dust",
+        expect.objectContaining({
+          access: freshToken,
+          agents: freshAgents,
+        })
+      );
+    });
+
+    it("uses the stored token without refreshing when the token is still valid", async () => {
+      const validCreds = makeCredentials({
+        access: "valid-token",
+        expires: Date.now() + 3600_000, // not expired
+        agents: [],
+      });
+
+      const freshAgents = [{ sId: "agent-1", name: "Helper", description: "" }];
+      const fetchMock = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: freshAgents }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(validCreds), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      // Only one fetch call (agent fetch, no token refresh)
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][1]?.headers?.["Authorization"]).toBe("Bearer valid-token");
+    });
+
+    it("logs an error to console.error when the agent fetch returns a non-ok response", async () => {
+      const creds = makeCredentials();
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 401 }));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("401"), expect.anything());
+      errorSpy.mockRestore();
+    });
+
+    it("logs an error to console.error when the agent fetch throws a network error", async () => {
+      const creds = makeCredentials();
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("network failure")));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("network failure"), expect.anything());
+      errorSpy.mockRestore();
+    });
+
+    it("falls back to stale agents (not empty) when token refresh fails at session_start", async () => {
+      const expiredCreds = makeCredentials({
+        access: "expired-token",
+        refresh: "bad-refresh",
+        expires: Date.now() - 1000,
+        agents: [{ sId: "stale-agent", name: "Stale", description: "" }],
+      });
+
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 400 }));
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const authStorage = { get: vi.fn().mockReturnValue(expiredCreds), set: vi.fn() };
+      const ctx = { modelRegistry: { authStorage } };
+      await sessionStartHandler!({}, ctx);
+
+      // Should not wipe out stale agents — no credential update with empty agents
+      const setCall = authStorage.set.mock.calls.find(
+        ([, c]: [string, any]) => Array.isArray(c.agents) && c.agents.length === 0
+      );
+      expect(setCall).toBeUndefined();
     });
   });
 });

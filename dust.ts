@@ -28,6 +28,16 @@ function dustApiUrl(region: string): string {
   return region === "europe-west1" ? DUST_EU_URL : DUST_US_URL;
 }
 
+/** Convert an agent name to a URL/display-safe slug, e.g. "AgentSonnet" → "agent-sonnet". */
+function slugify(name: string): string {
+  return name
+    .replace(/([a-z])([A-Z])/g, "$1-$2")   // CamelCase → camel-case
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1-$2") // e.g. "MyHTTPClient" → "My-HTTP-Client"
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")            // non-alphanumeric runs → hyphen
+    .replace(/^-+|-+$/g, "");               // trim leading/trailing hyphens
+}
+
 async function* dustMockStream() {
   yield { type: "text_delta" as const, contentIndex: 0, delta: "Dust agent chat is not yet implemented.", partial: null };
   yield { type: "done" as const, reason: "stop" as const, message: null };
@@ -58,7 +68,8 @@ function buildDustProviderConfig(pi: ExtensionAPI, cred: any) {
         const baseUrl2 = `${apiUrl2}/api/v1/w/${workspaceId2}`;
         const dustModels = agents2.map((agent) => ({
           provider: "dust",
-          id: agent.sId,
+          id: slugify(agent.name),
+          sId: agent.sId,
           name: agent.name,
           api: "dust" as any,
           baseUrl: baseUrl2,
@@ -73,7 +84,8 @@ function buildDustProviderConfig(pi: ExtensionAPI, cred: any) {
       },
     },
     models: agents.map((agent) => ({
-      id: agent.sId,
+      id: slugify(agent.name),
+      sId: agent.sId,
       name: agent.name,
       api: "dust" as any,
       reasoning: false,
@@ -295,10 +307,14 @@ async function fetchAgents(accessToken: string, apiUrl: string, workspaceId: str
         },
       }
     );
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[dust] fetchAgents failed: HTTP ${res.status}`, { workspaceId, apiUrl });
+      return null;
+    }
     const data = (await res.json()) as any;
     return data.agentConfigurations ?? [];
-  } catch {
+  } catch (err) {
+    console.error(`[dust] fetchAgents error: ${(err as Error).message}`, err);
     return null;
   }
 }
@@ -328,7 +344,8 @@ export default function (pi: ExtensionAPI) {
         const baseUrl = `${apiUrl}/api/v1/w/${workspaceId}`;
         const dustModels = agents.map((agent) => ({
           provider: "dust",
-          id: agent.sId,
+          id: slugify(agent.name),
+          sId: agent.sId,
           name: agent.name,
           api: "dust" as any,
           baseUrl,
@@ -349,8 +366,22 @@ export default function (pi: ExtensionAPI) {
   // still populates the model list correctly.
   if (typeof (pi as any).on === "function") {
     (pi as any).on("session_start", async (_event: unknown, ctx: any) => {
-      const cred = ctx.modelRegistry.authStorage.get("dust");
+      let cred = ctx.modelRegistry.authStorage.get("dust");
       if (cred?.type !== "oauth") return;
+
+      // Refresh the token if it has expired (or will expire in the next 30s).
+      if (typeof cred.expires === "number" && cred.expires <= Date.now()) {
+        try {
+          const refreshed = await refreshToken(cred);
+          ctx.modelRegistry.authStorage.set("dust", refreshed);
+          cred = refreshed;
+        } catch (err) {
+          console.error(`[dust] token refresh failed at session_start: ${(err as Error).message}`, err);
+          // Fall back to existing (expired) credentials — the agent fetch will
+          // likely fail too, but we'll still surface the error rather than silently
+          // proceeding with no agents.
+        }
+      }
 
       const apiUrl = dustApiUrl(cred.region ?? "us-central1");
       const freshAgents = await fetchAgents(cred.access, apiUrl, cred.workspaceId);
