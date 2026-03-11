@@ -42,6 +42,11 @@ let currentSessionContext: {
   setCredentials: () => { /* no-op until session_start wires it up */ },
 };
 
+// Confirm function wired up from session context — used by MCP tool handler to
+// show the pi allow/deny selector before executing bash/read/edit on behalf of the agent.
+// Defaults to always-allow so the extension degrades gracefully in non-interactive modes.
+let currentConfirmFn: (title: string, message: string) => Promise<boolean> = async () => true;
+
 function decodeJwtPayload(token: string): Record<string, unknown> {
   const part = token.split(".")[1];
   return JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/")));
@@ -189,6 +194,28 @@ function executeMcpTool(name: string, args: Record<string, unknown>): McpToolRes
   }
 }
 
+function buildConfirmMessage(toolName: string, args: Record<string, unknown>): string {
+  switch (toolName) {
+    case "bash":
+      return String(args.command ?? "");
+    case "read": {
+      const parts = [String(args.path ?? "")];
+      if (args.offset != null) parts.push(`offset: ${args.offset}`);
+      if (args.limit != null) parts.push(`limit: ${args.limit}`);
+      return parts.join("  ");
+    }
+    case "edit": {
+      const path = String(args.path ?? "");
+      const oldText = String(args.oldText ?? "");
+      const newText = String(args.newText ?? "");
+      const preview = (s: string) => s.length > 80 ? s.slice(0, 77) + "..." : s;
+      return `${path}\n- ${preview(oldText)}\n+ ${preview(newText)}`;
+    }
+    default:
+      return JSON.stringify(args);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MCP server registration and heartbeat
 // ---------------------------------------------------------------------------
@@ -255,141 +282,142 @@ async function listenMcpRequests(
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
 
-  // Reconnect loop — the Dust server closes the SSE stream after each agent turn.
-  // We keep reconnecting until the abort controller fires (session ends / new session).
-  while (!abortController.signal.aborted) {
-    const reqUrl = lastEventId
-      ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}`
-      : url;
+   // Reconnect loop — the Dust server closes the SSE stream after each agent turn.
+   // We keep reconnecting until the abort controller fires (session ends / new session).
+   while (!abortController.signal.aborted) {
+     const reqUrl = lastEventId
+       ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}`
+       : url;
 
-    console.error(`[dust:mcp] connecting to ${reqUrl}`);
-    let res: Response;
-    try {
-      res = await fetch(reqUrl, {
-        headers: { ...authHeaders, Accept: "text/event-stream" },
-        signal: abortController.signal,
-      });
-    } catch (e) {
-      console.error(`[dust:mcp] SSE fetch error: ${e}`);
-      // Aborted or network error — exit the loop.
-      return;
-    }
+     let res: Response;
+     try {
+       res = await fetch(reqUrl, {
+         headers: { ...authHeaders, Accept: "text/event-stream" },
+         signal: abortController.signal,
+       });
+     } catch {
+       // Aborted or network error — exit the loop.
+       return;
+     }
 
-    if (!res.ok || !res.body) {
-      console.error(`[dust:mcp] SSE non-ok response: HTTP ${res.status}`);
-      // Brief back-off before retrying on non-abort errors.
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, 1000);
-        abortController.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); });
-      });
-      continue;
-    }
+     if (!res.ok || !res.body) {
+       console.error(`[dust:mcp] SSE non-ok response: HTTP ${res.status}`);
+       // Brief back-off before retrying on non-abort errors.
+       await new Promise<void>((resolve) => {
+         const t = setTimeout(resolve, 1000);
+         abortController.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); });
+       });
+       continue;
+     }
 
-    console.error(`[dust:mcp] SSE connected, listening for requests...`);
+     const reader = res.body.getReader();
+     const decoder = new TextDecoder();
+     let buffer = "";
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+     try {
+       for (;;) {
+         const { value, done } = await reader.read();
+         if (value) {
+           buffer += decoder.decode(value, { stream: true });
+           const frames = buffer.split("\n\n");
+           buffer = frames.pop() ?? "";
 
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (value) {
-          buffer += decoder.decode(value, { stream: true });
-          const frames = buffer.split("\n\n");
-          buffer = frames.pop() ?? "";
+           for (const frame of frames) {
+             // Extract eventId for Last-Event-ID reconnection support.
+             for (const line of frame.split("\n")) {
+               if (line.startsWith("id:")) {
+                 lastEventId = line.slice(3).trim();
+               }
+             }
 
-          for (const frame of frames) {
-            // Extract eventId for Last-Event-ID reconnection support.
-            for (const line of frame.split("\n")) {
-              if (line.startsWith("id:")) {
-                lastEventId = line.slice(3).trim();
-              }
-            }
+             for (const line of frame.split("\n")) {
+               if (!line.startsWith("data:")) continue;
+               const json = line.slice(5).trim();
+               if (!json) continue;
+               let parsed: any;
+               try {
+                 parsed = JSON.parse(json);
+               } catch {
+                 continue;
+               }
 
-            for (const line of frame.split("\n")) {
-              if (!line.startsWith("data:")) continue;
-              const json = line.slice(5).trim();
-              if (!json) continue;
-              let parsed: any;
-              try {
-                parsed = JSON.parse(json);
-              } catch {
-                continue;
-              }
+               // Dust wraps in { eventId, data } — unwrap if present
+               const request = parsed.data ?? parsed;
 
-              // Dust wraps in { eventId, data } — unwrap if present
-              const request = parsed.data ?? parsed;
+               if (request.method === "initialize") {
+                 // Standard MCP handshake — must respond before tools/list is sent.
+                 const responseMsg = {
+                   jsonrpc: "2.0",
+                   id: request.id,
+                   result: {
+                     protocolVersion: "2025-06-18",
+                     capabilities: { tools: {} },
+                     serverInfo: { name: "pi-dust-extension", version: "0.1.0" },
+                   },
+                 };
+                 await fetch(`${baseUrl}/mcp/results`, {
+                   method: "POST",
+                   headers: { ...authHeaders, "Content-Type": "application/json" },
+                   body: JSON.stringify({ result: responseMsg, serverId }),
+                 }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); });
+               } else if (request.method === "notifications/initialized") {
+                 // Fire-and-forget notification, no response needed.
+               } else if (request.method === "tools/list") {
+                 const responseMsg = {
+                   jsonrpc: "2.0",
+                   id: request.id,
+                   result: { tools: MCP_TOOLS },
+                 };
+                 await fetch(`${baseUrl}/mcp/results`, {
+                   method: "POST",
+                   headers: { ...authHeaders, "Content-Type": "application/json" },
+                   body: JSON.stringify({ result: responseMsg, serverId }),
+                 }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); });
+               } else if (request.method === "tools/call") {
+                 const toolName: string = request.params?.name ?? "";
+                 const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
 
-              if (request.method === "initialize") {
-                // Standard MCP handshake — must respond before tools/list is sent.
-                const responseMsg = {
-                  jsonrpc: "2.0",
-                  id: request.id,
-                  result: {
-                    protocolVersion: "2025-06-18",
-                    capabilities: { tools: {} },
-                    serverInfo: { name: "pi-dust-extension", version: "0.1.0" },
-                  },
-                };
-                const postRes = await fetch(`${baseUrl}/mcp/results`, {
-                  method: "POST",
-                  headers: { ...authHeaders, "Content-Type": "application/json" },
-                  body: JSON.stringify({ result: responseMsg, serverId }),
-                }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); return null; });
-                console.error(`[dust:mcp] initialize responded: HTTP ${postRes?.status ?? "err"}`);
-              } else if (request.method === "notifications/initialized") {
-                // Fire-and-forget notification, no response needed.
-                console.error(`[dust:mcp] notifications/initialized received`);
-              } else if (request.method === "tools/list") {
-                console.error(`[dust:mcp] tools/list request received, id=${request.id}`);
-                // Respond with the list of tools we expose
-                const responseMsg = {
-                  jsonrpc: "2.0",
-                  id: request.id,
-                  result: { tools: MCP_TOOLS },
-                };
-                const postRes = await fetch(`${baseUrl}/mcp/results`, {
-                  method: "POST",
-                  headers: { ...authHeaders, "Content-Type": "application/json" },
-                  body: JSON.stringify({ result: responseMsg, serverId }),
-                }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); return null; });
-                console.error(`[dust:mcp] tools/list responded: HTTP ${postRes?.status ?? "err"}`);
-              } else if (request.method === "tools/call") {
-                const toolName: string = request.params?.name ?? "";
-                console.error(`[dust:mcp] tools/call request received: tool=${toolName}, id=${request.id}`);
-                const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
-                const toolResult = executeMcpTool(toolName, toolArgs);
-                const responseMsg = {
-                  jsonrpc: "2.0",
-                  id: request.id,
-                  result: {
-                    content: toolResult.content,
-                    isError: toolResult.isError,
-                  },
-                };
-                const postRes = await fetch(`${baseUrl}/mcp/results`, {
-                  method: "POST",
-                  headers: { ...authHeaders, "Content-Type": "application/json" },
-                  body: JSON.stringify({ result: responseMsg, serverId }),
-                }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); return null; });
-                console.error(`[dust:mcp] tools/call responded: HTTP ${postRes?.status ?? "err"}`);
-              } else {
-                console.error(`[dust:mcp] unknown method: ${request.method}`);
-              }
-            }
-          }
-        }
-        if (done) break;
-      }
-    } finally {
-      reader.releaseLock();
-    }
+                 // Show allow/deny prompt before executing the tool.
+                 const allowed = await currentConfirmFn(
+                   `Dust agent wants to run: ${toolName}`,
+                   buildConfirmMessage(toolName, toolArgs),
+                 );
 
-    console.error(`[dust:mcp] SSE stream closed, reconnecting...`);
-    // Stream closed normally — loop back and reconnect immediately.
-  }
-  console.error(`[dust:mcp] listener exited (aborted)`);
+                 let toolResult: McpToolResult;
+                 if (!allowed) {
+                   toolResult = {
+                     content: [{ type: "text", text: "Tool execution denied by user." }],
+                     isError: true,
+                   };
+                 } else {
+                   toolResult = executeMcpTool(toolName, toolArgs);
+                 }
+
+                 const responseMsg = {
+                   jsonrpc: "2.0",
+                   id: request.id,
+                   result: {
+                     content: toolResult.content,
+                     isError: toolResult.isError,
+                   },
+                 };
+                 await fetch(`${baseUrl}/mcp/results`, {
+                   method: "POST",
+                   headers: { ...authHeaders, "Content-Type": "application/json" },
+                   body: JSON.stringify({ result: responseMsg, serverId }),
+                 }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); });
+               }
+             }
+           }
+         }
+         if (done) break;
+       }
+     } finally {
+       reader.releaseLock();
+     }
+
+     // Stream closed normally — loop back and reconnect immediately.
+   }
 }
 
 
@@ -542,10 +570,8 @@ function dustRealStream(
 
       // Register MCP server once per conversation session.
       if (!currentMcpServerId) {
-        console.error("[dust:mcp] registering MCP server...");
         const serverId = await registerMcpServer(`${baseUrl}`, authHeaders);
         currentMcpServerId = serverId;
-        console.error(`[dust:mcp] registered serverId=${serverId}`);
         startMcpHeartbeat(baseUrl, authHeaders, serverId);
         // Start MCP request listener in background (detached).
         const ac = new AbortController();
@@ -586,7 +612,6 @@ function dustRealStream(
             },
           },
         };
-        console.error(`[dust:mcp] creating conversation with clientSideMCPServerIds=${JSON.stringify(currentMcpServerId ? [currentMcpServerId] : null)}`);
         const res = await fetch(`${baseUrl}/assistant/conversations`, {
           method: "POST",
           headers: {
@@ -1178,6 +1203,11 @@ export default function (pi: ExtensionAPI) {
         setCredentials: (cred: any) => ctx.modelRegistry.authStorage.set("dust", cred),
       };
 
+      // Update confirm function for the new session context.
+      if (ctx.ui?.confirm) {
+        currentConfirmFn = (title: string, message: string) => ctx.ui.confirm(title, message);
+      }
+
       if (event.reason === "resume") {
         // Restore the Dust conversation for the resumed pi session (if any).
         const sessionFile: string | undefined = ctx.sessionManager?.getSessionFile?.();
@@ -1233,6 +1263,11 @@ export default function (pi: ExtensionAPI) {
         getCredentials: () => ctx.modelRegistry.authStorage.get("dust"),
         setCredentials: (cred: any) => ctx.modelRegistry.authStorage.set("dust", cred),
       };
+
+      // Wire confirm function so MCP tool execution can show the allow/deny prompt.
+      if (ctx.ui?.confirm) {
+        currentConfirmFn = (title: string, message: string) => ctx.ui.confirm(title, message);
+      }
 
       // If this session already has messages (startup --resume path), restore
       // the Dust conversation ID so replies continue in the same thread.
