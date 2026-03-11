@@ -262,18 +262,21 @@ async function listenMcpRequests(
       ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}`
       : url;
 
+    console.error(`[dust:mcp] connecting to ${reqUrl}`);
     let res: Response;
     try {
       res = await fetch(reqUrl, {
         headers: { ...authHeaders, Accept: "text/event-stream" },
         signal: abortController.signal,
       });
-    } catch {
+    } catch (e) {
+      console.error(`[dust:mcp] SSE fetch error: ${e}`);
       // Aborted or network error — exit the loop.
       return;
     }
 
     if (!res.ok || !res.body) {
+      console.error(`[dust:mcp] SSE non-ok response: HTTP ${res.status}`);
       // Brief back-off before retrying on non-abort errors.
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, 1000);
@@ -281,6 +284,8 @@ async function listenMcpRequests(
       });
       continue;
     }
+
+    console.error(`[dust:mcp] SSE connected, listening for requests...`);
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -316,20 +321,43 @@ async function listenMcpRequests(
               // Dust wraps in { eventId, data } — unwrap if present
               const request = parsed.data ?? parsed;
 
-              if (request.method === "tools/list") {
+              if (request.method === "initialize") {
+                // Standard MCP handshake — must respond before tools/list is sent.
+                const responseMsg = {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    protocolVersion: "2025-06-18",
+                    capabilities: { tools: {} },
+                    serverInfo: { name: "pi-dust-extension", version: "0.1.0" },
+                  },
+                };
+                const postRes = await fetch(`${baseUrl}/mcp/results`, {
+                  method: "POST",
+                  headers: { ...authHeaders, "Content-Type": "application/json" },
+                  body: JSON.stringify({ result: responseMsg, serverId }),
+                }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); return null; });
+                console.error(`[dust:mcp] initialize responded: HTTP ${postRes?.status ?? "err"}`);
+              } else if (request.method === "notifications/initialized") {
+                // Fire-and-forget notification, no response needed.
+                console.error(`[dust:mcp] notifications/initialized received`);
+              } else if (request.method === "tools/list") {
+                console.error(`[dust:mcp] tools/list request received, id=${request.id}`);
                 // Respond with the list of tools we expose
                 const responseMsg = {
                   jsonrpc: "2.0",
                   id: request.id,
                   result: { tools: MCP_TOOLS },
                 };
-                await fetch(`${baseUrl}/mcp/results`, {
+                const postRes = await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
                   headers: { ...authHeaders, "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
-                }).catch(() => { /* non-fatal */ });
+                }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); return null; });
+                console.error(`[dust:mcp] tools/list responded: HTTP ${postRes?.status ?? "err"}`);
               } else if (request.method === "tools/call") {
                 const toolName: string = request.params?.name ?? "";
+                console.error(`[dust:mcp] tools/call request received: tool=${toolName}, id=${request.id}`);
                 const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
                 const toolResult = executeMcpTool(toolName, toolArgs);
                 const responseMsg = {
@@ -340,11 +368,14 @@ async function listenMcpRequests(
                     isError: toolResult.isError,
                   },
                 };
-                await fetch(`${baseUrl}/mcp/results`, {
+                const postRes = await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
                   headers: { ...authHeaders, "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
-                }).catch(() => { /* non-fatal */ });
+                }).catch((e) => { console.error(`[dust:mcp] results POST error: ${e}`); return null; });
+                console.error(`[dust:mcp] tools/call responded: HTTP ${postRes?.status ?? "err"}`);
+              } else {
+                console.error(`[dust:mcp] unknown method: ${request.method}`);
               }
             }
           }
@@ -355,8 +386,10 @@ async function listenMcpRequests(
       reader.releaseLock();
     }
 
+    console.error(`[dust:mcp] SSE stream closed, reconnecting...`);
     // Stream closed normally — loop back and reconnect immediately.
   }
+  console.error(`[dust:mcp] listener exited (aborted)`);
 }
 
 
@@ -509,13 +542,17 @@ function dustRealStream(
 
       // Register MCP server once per conversation session.
       if (!currentMcpServerId) {
+        console.error("[dust:mcp] registering MCP server...");
         const serverId = await registerMcpServer(`${baseUrl}`, authHeaders);
         currentMcpServerId = serverId;
+        console.error(`[dust:mcp] registered serverId=${serverId}`);
         startMcpHeartbeat(baseUrl, authHeaders, serverId);
         // Start MCP request listener in background (detached).
         const ac = new AbortController();
         mcpRequestsAbortController = ac;
-        listenMcpRequests(baseUrl, authHeaders, serverId, ac).catch(() => { /* non-fatal */ });
+        listenMcpRequests(baseUrl, authHeaders, serverId, ac).catch((e) => {
+          console.error(`[dust:mcp] listenMcpRequests fatal: ${e}`);
+        });
       }
 
       // Extract the last user message text from context.
@@ -549,7 +586,7 @@ function dustRealStream(
             },
           },
         };
-
+        console.error(`[dust:mcp] creating conversation with clientSideMCPServerIds=${JSON.stringify(currentMcpServerId ? [currentMcpServerId] : null)}`);
         const res = await fetch(`${baseUrl}/assistant/conversations`, {
           method: "POST",
           headers: {
