@@ -590,4 +590,158 @@ describe("dust extension", () => {
       expect(ctx.modelRegistry.authStorage.set).not.toHaveBeenCalled();
     });
   });
+
+  describe("session_start: fresh agent fetch", () => {
+    let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+
+    beforeEach(() => {
+      const mockApi = {
+        registerProvider: vi.fn(),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+      };
+      dustExtension(mockApi as any);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("registers a session_start handler", () => {
+      expect(typeof sessionStartHandler).toBe("function");
+    });
+
+    it("fetches agents from the API on session_start and updates credentials", async () => {
+      const creds = makeCredentials({
+        agents: [{ sId: "old-agent", name: "Old", description: "" }],
+      });
+      const freshAgents = [
+        { sId: "agent-1", name: "Helper", description: "A helpful agent" },
+        { sId: "agent-2", name: "My Custom Agent", description: "User created" },
+      ];
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: freshAgents }),
+        })
+      );
+
+      const authStorage = { get: vi.fn().mockReturnValue(creds), set: vi.fn() };
+      const ctx = { modelRegistry: { authStorage } };
+
+      await sessionStartHandler!({}, ctx);
+
+      expect(authStorage.set).toHaveBeenCalledWith(
+        "dust",
+        expect.objectContaining({ agents: freshAgents })
+      );
+    });
+
+    it("calls the correct agent_configurations endpoint for the workspace", async () => {
+      const creds = makeCredentials({ workspaceId: "ws-42", region: "us-central1" });
+      const fetchMock = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      expect(fetchMock.mock.calls[0][0]).toContain("ws-42");
+      expect(fetchMock.mock.calls[0][0]).toContain("agent_configurations");
+    });
+
+    it("sends Authorization header with Bearer token on agent fetch", async () => {
+      const creds = makeCredentials({ access: "my-access-token" });
+      const fetchMock = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      expect(fetchMock.mock.calls[0][1]?.headers?.["Authorization"]).toBe("Bearer my-access-token");
+    });
+
+    it("sends Dust CLI headers on agent fetch", async () => {
+      const creds = makeCredentials();
+      const fetchMock = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      expect(fetchMock.mock.calls[0][1]?.headers?.["User-Agent"]).toBe("Dust CLI");
+      expect(fetchMock.mock.calls[0][1]?.headers?.["X-Dust-CLI-Version"]).toBeDefined();
+    });
+
+    it("does not fetch agents if no credentials on session_start", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(undefined), set: vi.fn() } } };
+      await sessionStartHandler!({}, ctx);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("silently skips credential update when agent fetch fails", async () => {
+      const creds = makeCredentials();
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 500 }));
+
+      const authStorage = { get: vi.fn().mockReturnValue(creds), set: vi.fn() };
+      const ctx = { modelRegistry: { authStorage } };
+
+      // must not throw
+      let threw = false;
+      try { await sessionStartHandler!({}, ctx); } catch { threw = true; }
+      expect(threw).toBe(false);
+      expect(authStorage.set).not.toHaveBeenCalled();
+    });
+
+    it("re-registers the provider with fresh agents after session_start fetch", async () => {
+      const creds = makeCredentials({ agents: [] });
+      const freshAgents = [
+        { sId: "new-agent", name: "New Agent", description: "Fresh" },
+      ];
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: freshAgents }),
+        })
+      );
+
+      let lastRegisteredModels: any[] | undefined;
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          lastRegisteredModels = config.models;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+      };
+      dustExtension(mockApi as any);
+
+      const ctx = {
+        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+      };
+      await sessionStartHandler!({}, ctx);
+
+      expect(lastRegisteredModels).toBeDefined();
+      expect(lastRegisteredModels!.some((m: any) => m.id === "new-agent")).toBe(true);
+    });
+  });
 });

@@ -284,6 +284,25 @@ async function refreshToken(credentials: any) {
   };
 }
 
+async function fetchAgents(accessToken: string, apiUrl: string, workspaceId: string): Promise<DustAgent[] | null> {
+  try {
+    const res = await fetch(
+      `${apiUrl}/api/v1/w/${workspaceId}/assistant/agent_configurations`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          ...DUST_HEADERS,
+        },
+      }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as any;
+    return data.agentConfigurations ?? [];
+  } catch {
+    return null;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   // Register the OAuth provider and streamSimple without models on initial load.
   // The session_start handler will re-register with explicit models if credentials exist.
@@ -329,9 +348,19 @@ export default function (pi: ExtensionAPI) {
   // refresh() path (which resets OAuth providers before calling loadModels)
   // still populates the model list correctly.
   if (typeof (pi as any).on === "function") {
-    (pi as any).on("session_start", (_event: unknown, ctx: any) => {
+    (pi as any).on("session_start", async (_event: unknown, ctx: any) => {
       const cred = ctx.modelRegistry.authStorage.get("dust");
-      if (cred?.type === "oauth") {
+      if (cred?.type !== "oauth") return;
+
+      const apiUrl = dustApiUrl(cred.region ?? "us-central1");
+      const freshAgents = await fetchAgents(cred.access, apiUrl, cred.workspaceId);
+
+      if (freshAgents !== null) {
+        const updatedCred = { ...cred, agents: freshAgents };
+        ctx.modelRegistry.authStorage.set("dust", updatedCred);
+        buildDustProviderConfig(pi, updatedCred);
+      } else {
+        // Fetch failed — fall back to stale credentials
         buildDustProviderConfig(pi, cred);
       }
     });
