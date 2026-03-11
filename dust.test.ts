@@ -939,15 +939,17 @@ describe("dust extension", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // session_switch — reset conversation on /new
+  // session_switch — conversation management on /new and /resume
   // ---------------------------------------------------------------------------
 
-  describe("session_switch: conversation reset on /new", () => {
-    it("resets currentConversationId so next message starts a new Dust conversation", async () => {
-      const creds = makeCredentials();
+  describe("session_switch: conversation management", () => {
+    /** Shared setup: registers dust extension and fires session_start to bake credentials. */
+    async function setupHandlers(sessionFile = "/sessions/s1.json", conversations: Record<string, string> = {}) {
+      const creds = makeCredentials({ conversations });
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
-      let sessionSwitchHandler: ((event: unknown) => void) | undefined;
+      let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
+      const authStorageSet = vi.fn();
 
       const mockApi = {
         registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
@@ -962,97 +964,290 @@ describe("dust extension", () => {
 
       dustExtension(mockApi as any);
 
-      // Trigger buildDustProviderConfig via session_start so credentials are in closure
-      const savedFetch = (globalThis as any).fetch;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn().mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({ agentConfigurations: creds.agents }),
-        })
-      );
-      await sessionStartHandler!(
-        {},
-        {
-          modelRegistry: {
-            authStorage: {
-              get: () => creds,
-              set: vi.fn(),
-            },
+      // Fire session_start to bake credentials into the streamSimple closure.
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+      }));
+
+      const makeCtx = (file: string | undefined, entries: unknown[] = []) => ({
+        modelRegistry: {
+          authStorage: {
+            get: vi.fn().mockReturnValue({ ...creds }),
+            set: authStorageSet,
           },
-        }
-      );
-      vi.stubGlobal("fetch", savedFetch);
+        },
+        sessionManager: {
+          getSessionFile: vi.fn().mockReturnValue(file),
+          getEntries: vi.fn().mockReturnValue(entries),
+        },
+      });
 
-      expect(typeof sessionSwitchHandler).toBe("function");
+      await sessionStartHandler!({}, makeCtx(sessionFile, []));
+      vi.unstubAllGlobals();
 
-      const model = {
-        id: "agent-sonnet",
-        sId: "agentSId-1",
-        name: "AgentSonnet",
-        provider: "dust",
-        api: "dust",
-      };
+      return { capturedStreamSimple, sessionSwitchHandler, makeCtx, authStorageSet, creds };
+    }
 
-      // First message — sets up a conversation
-      const convCreateResponse = {
-        ok: true,
-        json: () =>
-          Promise.resolve({
+    const model = {
+      id: "agent-sonnet",
+      sId: "agentSId-1",
+      name: "AgentSonnet",
+      provider: "dust",
+      api: "dust",
+    };
+
+    function makeConvFetch(convSId: string, msgSId: string) {
+      return vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
             conversation: {
-              sId: "conv-first",
-              content: [[{ type: "user_message", sId: "msg-1" }]],
+              sId: convSId,
+              content: [[{ type: "user_message", sId: msgSId }]],
             },
-            message: { sId: "msg-1" },
+            message: { sId: msgSId },
           }),
-      };
-      const agentMsgResponse = {
-        ok: true,
-        body: makeSseStream([{ type: "agent_message_success", message: { content: "Hi" } }]),
-        headers: { get: () => "text/event-stream" },
-      };
-      vi.stubGlobal(
-        "fetch",
-        vi.fn()
-          .mockResolvedValueOnce(convCreateResponse)
-          .mockResolvedValueOnce(agentMsgResponse)
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success", message: { content: "OK" } }]),
+          headers: { get: () => "text/event-stream" },
+        });
+    }
+
+    it("reason=new resets conversation so next message starts a fresh Dust conversation", async () => {
+      const { capturedStreamSimple, sessionSwitchHandler, makeCtx } = await setupHandlers();
+
+      // First message — establishes a conversation
+      vi.stubGlobal("fetch", makeConvFetch("conv-first", "msg-1"));
+      const stream1 = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
+      for await (const _ of stream1) { /* drain */ }
+
+      // /new fires session_switch with reason="new"
+      sessionSwitchHandler!({ reason: "new" }, makeCtx("/sessions/s1.json"));
+
+      // Next message must POST /assistant/conversations (new conversation)
+      const fetchMock = makeConvFetch("conv-new", "msg-2");
+      vi.stubGlobal("fetch", fetchMock);
+      const stream2 = capturedStreamSimple(model, { messages: [{ role: "user", content: "Fresh start" }] });
+      for await (const _ of stream2) { /* drain */ }
+
+      const firstCallUrl: string = fetchMock.mock.calls[0][0];
+      expect(firstCallUrl).toMatch(/\/assistant\/conversations$/);
+      expect(firstCallUrl).not.toContain("conv-first");
+    });
+
+    it("reason=resume restores conversation from credentials storage", async () => {
+      const existingConvId = "conv-existing";
+      const targetFile = "/sessions/old.json";
+      const { capturedStreamSimple, sessionSwitchHandler, makeCtx } = await setupHandlers(
+        "/sessions/current.json",
+        { [targetFile]: existingConvId },
       );
 
-      const stream1 = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
-      const events1: any[] = [];
-      for await (const e of stream1) events1.push(e);
+      // /resume fires session_switch with reason="resume"; session manager now points to targetFile
+      sessionSwitchHandler!({ reason: "resume" }, makeCtx(targetFile));
 
-      // Simulate /new — session_switch fires
-      sessionSwitchHandler!({});
-
-      // Second message — must create a NEW conversation (POST /assistant/conversations again)
+      // Next message must POST to /messages on the existing conversation (not create a new one)
       const fetchMock = vi.fn()
         .mockResolvedValueOnce({
           ok: true,
-          json: () =>
-            Promise.resolve({
-              conversation: {
-                sId: "conv-new",
-                content: [[{ type: "user_message", sId: "msg-2" }]],
-              },
-              message: { sId: "msg-2" },
-            }),
+          json: () => Promise.resolve({ message: { sId: "msg-new" } }),
         })
         .mockResolvedValueOnce({
           ok: true,
-          body: makeSseStream([{ type: "agent_message_success", message: { content: "Fresh" } }]),
+          json: () => Promise.resolve({
+            conversation: {
+              sId: existingConvId,
+              content: [
+                [{ type: "user_message", sId: "msg-new" }],
+                [{ type: "agent_message", sId: "amsg-new", parentMessageId: "msg-new" }],
+              ],
+            },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success", message: { content: "Continued" } }]),
           headers: { get: () => "text/event-stream" },
         });
       vi.stubGlobal("fetch", fetchMock);
 
-      const stream2 = capturedStreamSimple(model, { messages: [{ role: "user", content: "New session" }] });
-      const events2: any[] = [];
-      for await (const e of stream2) events2.push(e);
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Continue" }] });
+      for await (const _ of stream) { /* drain */ }
 
-      // The first fetch call after session_switch must be POST /assistant/conversations (no conversation ID in URL)
+      // First fetch must be POST to the existing conversation's messages endpoint
+      const firstCallUrl: string = fetchMock.mock.calls[0][0];
+      expect(firstCallUrl).toContain(`/assistant/conversations/${existingConvId}/messages`);
+    });
+
+    it("reason=resume with no stored conversation starts a new one", async () => {
+      const targetFile = "/sessions/unknown.json";
+      const { capturedStreamSimple, sessionSwitchHandler, makeCtx } = await setupHandlers();
+
+      sessionSwitchHandler!({ reason: "resume" }, makeCtx(targetFile));
+
+      const fetchMock = makeConvFetch("conv-brand-new", "msg-x");
+      vi.stubGlobal("fetch", fetchMock);
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const _ of stream) { /* drain */ }
+
       const firstCallUrl: string = fetchMock.mock.calls[0][0];
       expect(firstCallUrl).toMatch(/\/assistant\/conversations$/);
-      expect(firstCallUrl).not.toContain("conv-first");
+    });
+
+    it("persists newly-created conversation ID in credentials storage", async () => {
+      const sessionFile = "/sessions/s1.json";
+      const { capturedStreamSimple, authStorageSet } = await setupHandlers(sessionFile);
+
+      const fetchMock = makeConvFetch("conv-persisted", "msg-1");
+      vi.stubGlobal("fetch", fetchMock);
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Store me" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      // authStorage.set must have been called with conversations map containing the session file
+      const setCall = authStorageSet.mock.calls.find(
+        ([_key, val]: any[]) => val?.conversations?.[sessionFile]
+      );
+      expect(setCall).toBeDefined();
+      expect(setCall[1].conversations[sessionFile]).toBe("conv-persisted");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // session_start — startup resume restores conversation
+  // ---------------------------------------------------------------------------
+
+  describe("session_start: startup resume restores conversation", () => {
+    it("restores conversation ID when session already has entries (--resume at startup)", async () => {
+      const sessionFile = "/sessions/old.json";
+      const existingConvId = "conv-from-last-time";
+      const creds = makeCredentials({ conversations: { [sessionFile]: existingConvId } });
+
+      let capturedStreamSimple: any;
+      let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          capturedStreamSimple = config.streamSimple;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: any) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+      };
+      dustExtension(mockApi as any);
+
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+      }));
+
+      // Simulate startup --resume: session has existing entries
+      await sessionStartHandler!(
+        {},
+        {
+          modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+          sessionManager: {
+            getSessionFile: vi.fn().mockReturnValue(sessionFile),
+            getEntries: vi.fn().mockReturnValue([{ type: "message" }]), // non-empty = resume
+          },
+        },
+      );
+      vi.unstubAllGlobals();
+
+      const model = { id: "agent-sonnet", sId: "agentSId-1", name: "AgentSonnet", provider: "dust", api: "dust" };
+
+      // First call after restore must POST to existing conversation's messages (not create new)
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ message: { sId: "msg-next" } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            conversation: {
+              sId: existingConvId,
+              content: [
+                [{ type: "user_message", sId: "msg-next" }],
+                [{ type: "agent_message", sId: "amsg-next", parentMessageId: "msg-next" }],
+              ],
+            },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success", message: { content: "Resumed" } }]),
+          headers: { get: () => "text/event-stream" },
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Continue" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      const firstCallUrl: string = fetchMock.mock.calls[0][0];
+      expect(firstCallUrl).toContain(`/assistant/conversations/${existingConvId}/messages`);
+    });
+
+    it("starts fresh when session has no entries (new session at startup)", async () => {
+      const sessionFile = "/sessions/new.json";
+      const creds = makeCredentials();
+
+      let capturedStreamSimple: any;
+      let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          capturedStreamSimple = config.streamSimple;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: any) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+      };
+      dustExtension(mockApi as any);
+
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+      }));
+
+      await sessionStartHandler!(
+        {},
+        {
+          modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+          sessionManager: {
+            getSessionFile: vi.fn().mockReturnValue(sessionFile),
+            getEntries: vi.fn().mockReturnValue([]), // empty = fresh start
+          },
+        },
+      );
+      vi.unstubAllGlobals();
+
+      const model = { id: "agent-sonnet", sId: "agentSId-1", name: "AgentSonnet", provider: "dust", api: "dust" };
+
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            conversation: { sId: "conv-fresh", content: [[{ type: "user_message", sId: "msg-1" }]] },
+            message: { sId: "msg-1" },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success", message: { content: "Hello" } }]),
+          headers: { get: () => "text/event-stream" },
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      const firstCallUrl: string = fetchMock.mock.calls[0][0];
+      expect(firstCallUrl).toMatch(/\/assistant\/conversations$/);
     });
   });
 
@@ -1160,6 +1355,10 @@ describe("dust extension", () => {
     const ctx = {
       modelRegistry: {
         authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() },
+      },
+      sessionManager: {
+        getSessionFile: vi.fn().mockReturnValue(undefined),
+        getEntries: vi.fn().mockReturnValue([]),
       },
     };
     await sessionStartHandler!({}, ctx);
