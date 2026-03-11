@@ -1640,6 +1640,102 @@ describe("dust extension", () => {
       const convIdx = callUrls.findIndex((u: string) => u.includes("/assistant/conversations") && !u.includes("/messages") && !u.includes("/events"));
       expect(mcpIdx).toBeLessThan(convIdx);
     });
+
+    it("createConversation body includes clientSideMCPServerIds with the serverId", async () => {
+      const { capturedStreamSimple } = await setupWithMcp();
+      const serverId = "mcp-server-1";
+
+      const fetchMock = makeMcpConvFetch("conv-1", "msg-1", "amsg-1", serverId);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      const convCall = fetchMock.mock.calls.find(([url]: [string]) =>
+        url.includes("/assistant/conversations") && !url.includes("/messages") && !url.includes("/events")
+      );
+      expect(convCall).toBeDefined();
+      const body = JSON.parse(convCall[1].body);
+      expect(body.message.context.clientSideMCPServerIds).toEqual([serverId]);
+    });
+
+    it("postUserMessage body includes clientSideMCPServerIds with the serverId", async () => {
+      const { capturedStreamSimple } = await setupWithMcp();
+      const serverId = "mcp-server-1";
+
+      // Turn 1 + Turn 2 mocks in a single fetch mock to avoid global stub gaps.
+      // makeMcpConvFetch provides: MCP register, create conversation, SSE
+      // (MCP requests SSE is handled by the listener closing immediately)
+      // Turn 2 needs: POST /messages, GET /conversations, SSE
+      const fetchMock = vi.fn()
+        // Turn 1: MCP register
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId, expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        // Turn 1: MCP requests SSE (empty, listener exits immediately)
+        .mockResolvedValueOnce({
+          ok: true,
+          body: new ReadableStream({ start(c) { c.close(); } }),
+        })
+        // Turn 1: POST /assistant/conversations
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            conversation: {
+              sId: "conv-1",
+              content: [
+                [{ type: "user_message", sId: "m1" }],
+                [{ type: "agent_message", sId: "am1", parentMessageId: "m1" }],
+              ],
+            },
+            message: { sId: "m1" },
+          }),
+        })
+        // Turn 1: SSE events
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success" }]),
+        })
+        // Turn 2: POST /messages
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ message: { sId: "m2" } }),
+        })
+        // Turn 2: GET /conversations
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            conversation: {
+              sId: "conv-1",
+              content: [
+                [{ type: "user_message", sId: "m2" }],
+                [{ type: "agent_message", sId: "am2", parentMessageId: "m2" }],
+              ],
+            },
+          }),
+        })
+        // Turn 2: SSE events
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success" }]),
+        });
+
+      vi.stubGlobal("fetch", fetchMock);
+
+      // Turn 1
+      for await (const _ of capturedStreamSimple(model, { messages: [{ role: "user", content: "First" }] })) { /* drain */ }
+
+      // Turn 2
+      for await (const _ of capturedStreamSimple(model, { messages: [{ role: "user", content: "Second" }] })) { /* drain */ }
+
+      const msgCall = fetchMock.mock.calls.find(([url]: [string]) =>
+        url.includes("/assistant/conversations/conv-1/messages") && !url.includes("/events")
+      );
+      expect(msgCall).toBeDefined();
+      const body = JSON.parse(msgCall[1].body);
+      expect(body.context.clientSideMCPServerIds).toEqual([serverId]);
+    });
   });
 
   // ---------------------------------------------------------------------------

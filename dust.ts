@@ -519,6 +519,7 @@ function dustRealStream(
               username,
               timezone,
               origin: "cli",
+              clientSideMCPServerIds: currentMcpServerId ? [currentMcpServerId] : null,
             },
           },
         };
@@ -569,6 +570,7 @@ function dustRealStream(
               username,
               timezone,
               origin: "cli",
+              clientSideMCPServerIds: currentMcpServerId ? [currentMcpServerId] : null,
             },
           }),
           signal,
