@@ -4,6 +4,15 @@ import dustExtension from "./dust.js";
 type Workspace = { sId: string; name: string; role: string };
 type DustAgent = { sId: string; name: string; description: string };
 
+/**
+ * Returns a ReadableStream that stays open indefinitely (never closes).
+ * Use this for MCP requests SSE mocks so the reconnection loop in
+ * listenMcpRequests doesn't fire and consume extra mock fetch slots.
+ */
+function makePendingSseStream(): ReadableStream<Uint8Array> {
+  return new ReadableStream({ start() { /* never enqueue, never close */ } });
+}
+
 function makeCredentials(overrides: Record<string, unknown> = {}) {
   return {
     type: "oauth" as const,
@@ -535,10 +544,10 @@ describe("dust extension", () => {
           ok: true,
           json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
         })
-        // 2. GET /mcp/requests (empty background SSE)
+        // 2. GET /mcp/requests (background SSE — stays open, no reconnect)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         // 3. POST /assistant/conversations
         .mockResolvedValueOnce({
@@ -574,7 +583,7 @@ describe("dust extension", () => {
         // 2. GET /mcp/requests (empty background SSE)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         // 3. POST /assistant/conversations
         .mockResolvedValueOnce({
@@ -1031,7 +1040,7 @@ describe("dust extension", () => {
         // MCP requests SSE (background, empty)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         // POST /assistant/conversations → create conversation
         .mockResolvedValueOnce({
@@ -1096,7 +1105,7 @@ describe("dust extension", () => {
         // MCP requests SSE (background, empty)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         .mockResolvedValueOnce({
           ok: true,
@@ -1276,7 +1285,7 @@ describe("dust extension", () => {
         // MCP requests SSE (background, empty)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         .mockResolvedValueOnce({
           ok: true,
@@ -1357,7 +1366,7 @@ describe("dust extension", () => {
         // MCP requests SSE (background, empty)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         .mockResolvedValueOnce({
           ok: true,
@@ -1485,7 +1494,12 @@ describe("dust extension", () => {
           ok: true,
           json: () => Promise.resolve({ serverId: mcpServerId, expiresAt: new Date(Date.now() + 300_000).toISOString() }),
         })
-        // 2. POST /assistant/conversations → create conversation
+        // 2. GET /mcp/requests → pending SSE (never closes, no reconnect)
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makePendingSseStream(),
+        })
+        // 3. POST /assistant/conversations → create conversation
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve({
@@ -1499,7 +1513,7 @@ describe("dust extension", () => {
             message: { sId: msgSId },
           }),
         })
-        // 3. GET .../events  (SSE stream)
+        // 4. GET .../events  (SSE stream)
         .mockResolvedValueOnce({
           ok: true,
           body: makeSseStream(sseEvents),
@@ -1575,11 +1589,12 @@ describe("dust extension", () => {
       const { capturedStreamSimple } = await setupWithMcp();
 
       const fetchMock = vi.fn()
-        // Turn 1: MCP register + conversation create + SSE
+        // Turn 1: MCP register + MCP requests SSE + conversation create + SSE
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
         })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() }) // MCP requests SSE
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve({
@@ -1676,7 +1691,7 @@ describe("dust extension", () => {
         // Turn 1: MCP requests SSE (empty, listener exits immediately)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         // Turn 1: POST /assistant/conversations
         .mockResolvedValueOnce({
@@ -1827,7 +1842,7 @@ describe("dust extension", () => {
         // 3. GET /mcp/requests (empty SSE)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         // 4. POST /assistant/conversations
         .mockResolvedValueOnce({
@@ -1876,7 +1891,7 @@ describe("dust extension", () => {
         })
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         .mockResolvedValueOnce({
           ok: true,
@@ -2251,7 +2266,7 @@ describe("dust extension", () => {
 
       const fetchMock = vi.fn()
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "srv-1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) }) // MCP requests SSE (empty)
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() }) // MCP requests SSE (pending)
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve({ conversation: { sId: "conv-1", content: [[{ type: "user_message", sId: "m1" }], [{ type: "agent_message", sId: "am1", parentMessageId: "m1" }]] }, message: { sId: "m1" } }),
@@ -2423,7 +2438,7 @@ describe("dust extension", () => {
         // 2. GET /mcp/requests?serverId=... (background SSE listener, empty stream)
         .mockResolvedValueOnce({
           ok: true,
-          body: new ReadableStream({ start(c) { c.close(); } }),
+          body: makePendingSseStream(),
         })
         // 3. POST /assistant/conversations
         .mockResolvedValueOnce({
@@ -2713,7 +2728,7 @@ describe("dust extension", () => {
         // MCP register succeeds
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
         // MCP requests SSE (background, empty)
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
         // POST /assistant/conversations → 401
         .mockResolvedValueOnce({ ok: false, status: 401, text: () => Promise.resolve("") })
       );
@@ -2802,7 +2817,7 @@ describe("dust extension", () => {
         // Turn 1: MCP register
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
         // Turn 1: MCP requests SSE (empty)
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
         // Turn 1: create conversation
         .mockResolvedValueOnce({
           ok: true,
@@ -2837,7 +2852,7 @@ describe("dust extension", () => {
         // Turn 1: MCP register
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
         // Turn 1: MCP requests SSE (empty)
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
@@ -2868,7 +2883,7 @@ describe("dust extension", () => {
         // Turn 1: MCP register
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
         // Turn 1: MCP requests SSE (empty)
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
@@ -2899,7 +2914,7 @@ describe("dust extension", () => {
         // Turn 1: MCP register
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
         // Turn 1: MCP requests SSE (empty)
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
@@ -2937,7 +2952,7 @@ describe("dust extension", () => {
         // Turn 1: MCP register
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
         // Turn 1: MCP requests SSE (empty)
-        .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(c) { c.close(); } }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),

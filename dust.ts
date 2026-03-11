@@ -253,83 +253,109 @@ async function listenMcpRequests(
   abortController: AbortController,
 ): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      headers: { ...authHeaders, Accept: "text/event-stream" },
-      signal: abortController.signal,
-    });
-  } catch {
-    // aborted or network error — silently exit
-    return;
-  }
+  let lastEventId: string | null = null;
 
-  if (!res.ok || !res.body) return;
+  // Reconnect loop — the Dust server closes the SSE stream after each agent turn.
+  // We keep reconnecting until the abort controller fires (session ends / new session).
+  while (!abortController.signal.aborted) {
+    const reqUrl = lastEventId
+      ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}`
+      : url;
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+    let res: Response;
+    try {
+      res = await fetch(reqUrl, {
+        headers: { ...authHeaders, Accept: "text/event-stream" },
+        signal: abortController.signal,
+      });
+    } catch {
+      // Aborted or network error — exit the loop.
+      return;
+    }
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (value) {
-        buffer += decoder.decode(value, { stream: true });
-        const frames = buffer.split("\n\n");
-        buffer = frames.pop() ?? "";
+    if (!res.ok || !res.body) {
+      // Brief back-off before retrying on non-abort errors.
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 1000);
+        abortController.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); });
+      });
+      continue;
+    }
 
-        for (const frame of frames) {
-          for (const line of frame.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const json = line.slice(5).trim();
-            if (!json) continue;
-            let parsed: any;
-            try {
-              parsed = JSON.parse(json);
-            } catch {
-              continue;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+
+          for (const frame of frames) {
+            // Extract eventId for Last-Event-ID reconnection support.
+            for (const line of frame.split("\n")) {
+              if (line.startsWith("id:")) {
+                lastEventId = line.slice(3).trim();
+              }
             }
 
-            // Dust wraps in { eventId, data } — unwrap if present
-            const request = parsed.data ?? parsed;
+            for (const line of frame.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const json = line.slice(5).trim();
+              if (!json) continue;
+              let parsed: any;
+              try {
+                parsed = JSON.parse(json);
+              } catch {
+                continue;
+              }
 
-            if (request.method === "tools/list") {
-              // Respond with the list of tools we expose
-              const responseMsg = {
-                jsonrpc: "2.0",
-                id: request.id,
-                result: { tools: MCP_TOOLS },
-              };
-              await fetch(`${baseUrl}/mcp/results`, {
-                method: "POST",
-                headers: { ...authHeaders, "Content-Type": "application/json" },
-                body: JSON.stringify({ result: responseMsg, serverId }),
-              });
-            } else if (request.method === "tools/call") {
-              const toolName: string = request.params?.name ?? "";
-              const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
-              const toolResult = executeMcpTool(toolName, toolArgs);
-              const responseMsg = {
-                jsonrpc: "2.0",
-                id: request.id,
-                result: {
-                  content: toolResult.content,
-                  isError: toolResult.isError,
-                },
-              };
-              await fetch(`${baseUrl}/mcp/results`, {
-                method: "POST",
-                headers: { ...authHeaders, "Content-Type": "application/json" },
-                body: JSON.stringify({ result: responseMsg, serverId }),
-              });
+              // Dust wraps in { eventId, data } — unwrap if present
+              const request = parsed.data ?? parsed;
+
+              if (request.method === "tools/list") {
+                // Respond with the list of tools we expose
+                const responseMsg = {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: { tools: MCP_TOOLS },
+                };
+                await fetch(`${baseUrl}/mcp/results`, {
+                  method: "POST",
+                  headers: { ...authHeaders, "Content-Type": "application/json" },
+                  body: JSON.stringify({ result: responseMsg, serverId }),
+                }).catch(() => { /* non-fatal */ });
+              } else if (request.method === "tools/call") {
+                const toolName: string = request.params?.name ?? "";
+                const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
+                const toolResult = executeMcpTool(toolName, toolArgs);
+                const responseMsg = {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    content: toolResult.content,
+                    isError: toolResult.isError,
+                  },
+                };
+                await fetch(`${baseUrl}/mcp/results`, {
+                  method: "POST",
+                  headers: { ...authHeaders, "Content-Type": "application/json" },
+                  body: JSON.stringify({ result: responseMsg, serverId }),
+                }).catch(() => { /* non-fatal */ });
+              }
             }
           }
         }
+        if (done) break;
       }
-      if (done) break;
+    } finally {
+      reader.releaseLock();
     }
-  } finally {
-    reader.releaseLock();
+
+    // Stream closed normally — loop back and reconnect immediately.
   }
 }
 
