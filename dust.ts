@@ -15,6 +15,10 @@ const DUST_HEADERS = {
 type Workspace = { sId: string; name: string; role: string };
 type DustAgent = { sId: string; name: string; description: string };
 
+// Session-ephemeral conversation ID. Reset whenever a new provider config is
+// registered (workspace switch, session_start re-register, or logout).
+let currentConversationId: string | null = null;
+
 function decodeJwtPayload(token: string): Record<string, unknown> {
   const part = token.split(".")[1];
   return JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/")));
@@ -43,16 +47,266 @@ async function* dustMockStream() {
   yield { type: "done" as const, reason: "stop" as const, message: null };
 }
 
+/**
+ * Real streamSimple implementation.
+ *
+ * Credentials (`cred`) are closed over from `buildDustProviderConfig` scope
+ * so they are always available regardless of what pi does with model fields.
+ *
+ * Conversation lifecycle:
+ *   - First call: POST /assistant/conversations  → save sId to currentConversationId
+ *   - Subsequent calls: POST /conversations/{id}/messages + GET /conversations/{id}
+ *   - After either: GET /conversations/{id}/messages/{agentMsgId}/events  (SSE)
+ */
+async function* dustRealStream(cred: any, model: any, context: any, options?: any): AsyncGenerator<any> {
+  const signal: AbortSignal | undefined = options?.signal;
+
+  const accessToken: string = cred.access ?? "";
+  const workspaceId: string = cred.workspaceId ?? "";
+  const region: string = cred.region ?? "us-central1";
+  const username: string = cred.username ?? "unknown";
+  const apiUrl = dustApiUrl(region);
+  const baseUrl = `${apiUrl}/api/v1/w/${workspaceId}`;
+  const agentSId: string = model.sId ?? "";
+
+  const authHeaders = {
+    Authorization: `Bearer ${accessToken}`,
+    ...DUST_HEADERS,
+  };
+
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  // Extract the last user message text from context.
+  // pi passes content as either a plain string or an array of content blocks.
+  const messages: any[] = context?.messages ?? [];
+  const lastUserMessage = [...messages].reverse().find((m: any) => m.role === "user");
+  const rawContent = lastUserMessage?.content ?? "";
+  const userText: string = Array.isArray(rawContent)
+    ? rawContent
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text ?? "")
+        .join("")
+    : String(rawContent);
+
+  let conversationSId: string;
+  let userMessageSId: string;
+
+  if (!currentConversationId) {
+    // ------------------------------------------------------------------ first message
+    const reqBody = {
+      title: userText.substring(0, 50) + (userText.length > 50 ? "..." : ""),
+      visibility: "unlisted",
+      message: {
+        content: userText,
+        mentions: [{ configurationId: agentSId }],
+        context: {
+          username,
+          timezone,
+          origin: "cli",
+        },
+      },
+    };
+    const res = await fetch(`${baseUrl}/assistant/conversations`, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(reqBody),
+      signal,
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      if (res.status === 401) {
+        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+      }
+      throw new Error(`Failed to create conversation: HTTP ${res.status} — ${errBody}`);
+    }
+
+    const data = (await res.json()) as any;
+    conversationSId = data.conversation.sId;
+    userMessageSId = data.message.sId;
+
+    currentConversationId = conversationSId;
+
+    // Agent message sId is embedded in the conversation content returned inline.
+    const agentMsgSId = findAgentMessageSId(data.conversation.content, userMessageSId);
+
+    yield* streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal);
+  } else {
+    // ------------------------------------------------------------------ subsequent message
+    conversationSId = currentConversationId;
+
+    const msgRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}/messages`, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        content: userText,
+        mentions: [{ configurationId: agentSId }],
+        context: {
+          username,
+          timezone,
+          origin: "cli",
+        },
+      }),
+      signal,
+    });
+
+    if (!msgRes.ok) {
+      if (msgRes.status === 401) {
+        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+      }
+      throw new Error(`Failed to post message: HTTP ${msgRes.status}`);
+    }
+
+    const msgData = (await msgRes.json()) as any;
+    userMessageSId = msgData.message.sId;
+
+    // Fetch the conversation to find the agent message sId.
+    const convRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}`, {
+      headers: authHeaders,
+      signal,
+    });
+
+    if (!convRes.ok) {
+      if (convRes.status === 401) {
+        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+      }
+      throw new Error(`Failed to fetch conversation: HTTP ${convRes.status}`);
+    }
+
+    const convData = (await convRes.json()) as any;
+    const agentMsgSId = findAgentMessageSId(convData.conversation.content, userMessageSId);
+
+    yield* streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal);
+  }
+}
+
+/** Find the sId of the agent_message whose parentMessageId equals userMessageSId. */
+function findAgentMessageSId(content: any[][], userMessageSId: string): string {
+  for (const versions of content) {
+    const latest = versions[versions.length - 1];
+    if (latest?.type === "agent_message" && latest?.parentMessageId === userMessageSId) {
+      return latest.sId as string;
+    }
+  }
+  throw new Error("No agent message found in conversation content");
+}
+
+/** Stream SSE events from the agent message events endpoint, mapping to pi stream events. */
+async function* streamEvents(
+  baseUrl: string,
+  conversationSId: string,
+  agentMsgSId: string,
+  authHeaders: Record<string, string>,
+  signal?: AbortSignal
+): AsyncGenerator<any> {
+  const sseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
+
+  const res = await fetch(sseUrl, {
+    headers: {
+      ...authHeaders,
+      Accept: "text/event-stream",
+    },
+    signal,
+  });
+
+  if (!res.ok) {
+    if (res.status === 401) {
+      throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+    }
+    throw new Error(`Failed to stream events: HTTP ${res.status}`);
+  }
+
+  if (!res.body) {
+    throw new Error("SSE response has no body");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+
+  // Minimal SSE parser: accumulate lines, emit on blank line.
+  let buffer = "";
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: true });
+
+        // Split on SSE double-newline boundaries and process complete frames.
+        const frames = buffer.split("\n\n");
+        // The last element may be incomplete — keep it in the buffer.
+        buffer = frames.pop() ?? "";
+
+        for (const frame of frames) {
+          // Each frame is one or more "field: value" lines.
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("data:")) {
+              const json = line.slice(5).trim();
+              if (!json) continue;
+              let parsed: any;
+              try {
+                parsed = JSON.parse(json);
+              } catch {
+                continue;
+              }
+
+              // Wire format: { eventId: "...", data: { type: "...", ... } }
+              const event = parsed.data ?? parsed;
+
+              if (event.type === "generation_tokens") {
+                if (event.classification === "tokens") {
+                  yield { type: "text_delta" as const, contentIndex: 0, delta: event.text ?? "", partial: null };
+                }
+                // chain_of_thought: discard
+              } else if (event.type === "agent_message_success") {
+                yield { type: "done" as const, reason: "stop" as const, message: null };
+                return;
+              } else if (event.type === "agent_generation_cancelled") {
+                yield { type: "done" as const, reason: "stop" as const, message: null };
+                return;
+              } else if (event.type === "agent_error") {
+                throw new Error(event.error?.message ?? "Agent error");
+              } else if (event.type === "user_message_error") {
+                throw new Error(event.error?.message ?? "User message error");
+              }
+              // tool_params, agent_action_success, tool_* — ignore for now
+            }
+          }
+        }
+      }
+      if (done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function buildDustProviderConfig(pi: ExtensionAPI, cred: any) {
   const agents: DustAgent[] = cred.agents ?? [];
   const apiUrl = dustApiUrl(cred.region ?? "us-central1");
   const workspaceId: string = cred.workspaceId ?? "";
   const baseUrl = `${apiUrl}/api/v1/w/${workspaceId}`;
 
+  // Reset the ephemeral conversation so a re-register (workspace switch /
+  // session_start) starts a fresh conversation.
+  currentConversationId = null;
+
+  // Snapshot credentials at config-build time. The streamSimple closure
+  // captures this reference so credentials are always available at call time,
+  // regardless of what pi does with model object fields.
+  let latestCred = cred;
+
   pi.registerProvider("dust", {
     api: "dust" as any,
     baseUrl,
-    streamSimple: (_model: unknown, _context: unknown, _options?: unknown) => dustMockStream() as any,
+    streamSimple: (model: unknown, context: unknown, options?: unknown) =>
+      dustRealStream(latestCred, model, context, options) as any,
     oauth: {
       name: "Dust",
       login: async (callbacks) => loginFn(callbacks),
@@ -215,9 +469,10 @@ async function loginFn(callbacks: any) {
   }
 
   const meData = (await meRes.json()) as {
-    user: { workspaces: Workspace[] };
+    user: { workspaces: Workspace[]; username: string };
   };
   const workspaces = meData.user.workspaces;
+  const username = meData.user.username ?? "";
 
   // Step 6: Display workspaces and prompt for selection
   const list = workspaces
@@ -261,6 +516,7 @@ async function loginFn(callbacks: any) {
     workspaces,
     agents,
     region,
+    username,
   };
 }
 
@@ -320,11 +576,16 @@ async function fetchAgents(accessToken: string, apiUrl: string, workspaceId: str
 }
 
 export default function (pi: ExtensionAPI) {
+  // Reset session state on each extension load (new session or test isolation).
+  currentConversationId = null;
+
   // Register the OAuth provider and streamSimple without models on initial load.
   // The session_start handler will re-register with explicit models if credentials exist.
+  // Pre-login stub: no credentials yet — dustRealStream will fail gracefully if called.
   pi.registerProvider("dust", {
     api: "dust" as any,
-    streamSimple: (_model: unknown, _context: unknown, _options?: unknown) => dustMockStream() as any,
+    streamSimple: (model: unknown, context: unknown, options?: unknown) =>
+      dustRealStream({}, model, context, options) as any,
     oauth: {
       name: "Dust",
       login: async (callbacks) => {

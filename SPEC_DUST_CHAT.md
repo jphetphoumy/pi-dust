@@ -1,6 +1,6 @@
 # Spec: Dust Agent Chat via Pi
 
-## Status: Planning
+## Status: Milestone 2 Complete
 
 ## Goal
 
@@ -19,27 +19,29 @@ interactively. Usage must be classified as `origin: "cli"` (user usage, not prog
 | Agents fetched at login, stored in credentials | ✅ |
 | `modifyModels` — agents appear in `/model` | ✅ |
 | `User-Agent: "Dust CLI"` + `X-Dust-CLI-Version` on all Dust API calls | ✅ |
+| `username` stored from `/api/v1/me` at login | ✅ |
+| Real `streamSimple` — creates conversation, streams SSE | ✅ |
+| Subsequent messages reuse existing conversation | ✅ |
+| SSE event → pi stream mapping | ✅ |
 
 ---
 
-## Milestone 1 — Mock Provider (Current)
+## Milestone 1 — Mock Provider (Done)
 
-Register `streamSimple` on the `dust` provider so selecting a Dust agent
-in `/model` does not crash pi. The mock returns a single assistant message
-explaining the feature is not yet implemented.
-
-**Scope:**
-- Add `api: "dust"` and `streamSimple` to `pi.registerProvider("dust", ...)`
-- `streamSimple` yields one text delta: `"Dust agent chat is not yet implemented."`
-- No network calls
-
-**Tests:**
-- `streamSimple` is registered on the provider
-- Returns an async stream that yields at least one text event
+Registered `streamSimple` on the `dust` provider so selecting a Dust agent
+in `/model` does not crash pi. (Superseded by Milestone 2.)
 
 ---
 
-## Milestone 2 — Real Provider
+## Milestone 2 — Real Provider (Complete)
+
+### Design Decisions
+
+| Decision | Choice |
+|---|---|
+| Credential access in `streamSimple` | `model.authStorage` field (set at `buildDustProviderConfig` time, `{ get, set }`) |
+| Conversation state | Module-level `let currentConversationId: string \| null` — reset on `dustExtension()` call and on `buildDustProviderConfig()` call |
+| Username in credentials | `meData.user.username` (dedicated field on Dust `UserType`, matches dust-cli) |
 
 ### Overview
 
@@ -50,9 +52,10 @@ stream format, and correctly identifies the request as interactive CLI usage.
 
 - **One conversation per pi session.** Created on the first message, reused for
   subsequent turns (add messages to the existing conversation).
-- Conversation ID is stored in module-level state (not in credentials — it is
+- Conversation ID is stored in module-level `currentConversationId` (not in credentials — it is
   session-ephemeral).
-- On `/logout` or session end the stored conversation ID is discarded.
+- On workspace switch or session re-register, `buildDustProviderConfig` resets `currentConversationId = null`.
+- On extension load (`dustExtension()`), `currentConversationId` is reset.
 
 ### HTTP Calls (all include `User-Agent: "Dust CLI"` + `X-Dust-CLI-Version`)
 
@@ -61,31 +64,32 @@ stream format, and correctly identifies the request as interactive CLI usage.
 POST {apiUrl}/api/v1/w/{workspaceId}/assistant/conversations
 Authorization: Bearer {access_token}
 User-Agent: Dust CLI
-X-Dust-CLI-Version: 0.1.0
+X-Dust-CLI-Version: 0.4.4
 Content-Type: application/json
 
 {
+  "visibility": "unlisted",
   "message": {
     "content": "<user message>",
     "mentions": [{ "configurationId": "<agentSId>" }],
     "context": {
-      "username":  "<from credentials or os username>",
+      "username":  "<from credentials, stored at login from /api/v1/me>",
       "timezone":  "<Intl.DateTimeFormat().resolvedOptions().timeZone>",
       "origin":    "cli"
     }
-  },
-  "visibility": "unlisted"
+  }
 }
 ```
 
-Response: `{ conversation, message }` — save `conversation.sId` for subsequent turns.
+Response: `{ conversation: { sId, content }, message: { sId } }` — save `conversation.sId` to
+`currentConversationId`. Agent message sId is found in `conversation.content`.
 
 #### Subsequent messages — add to existing conversation
 ```
 POST {apiUrl}/api/v1/w/{workspaceId}/assistant/conversations/{conversationId}/messages
 Authorization: Bearer {access_token}
 User-Agent: Dust CLI
-X-Dust-CLI-Version: 0.1.0
+X-Dust-CLI-Version: 0.4.4
 Content-Type: application/json
 
 {
@@ -99,14 +103,25 @@ Content-Type: application/json
 }
 ```
 
-Response: `UserMessageType` — use the returned `agentMessages[0].sId` to stream.
+Response: `{ message: { sId } }` — use `message.sId` as `userMessageSId`.
+
+Then fetch the conversation to find the agent message sId:
+```
+GET {apiUrl}/api/v1/w/{workspaceId}/assistant/conversations/{conversationId}
+Authorization: Bearer {access_token}
+User-Agent: Dust CLI
+X-Dust-CLI-Version: 0.4.4
+```
+
+Response: `{ conversation: { sId, content } }` — find `agent_message` in content
+where `parentMessageId === userMessageSId`.
 
 #### Stream agent response
 ```
 GET {apiUrl}/api/v1/w/{workspaceId}/assistant/conversations/{conversationId}/messages/{agentMessageId}/events
 Authorization: Bearer {access_token}
 User-Agent: Dust CLI
-X-Dust-CLI-Version: 0.1.0
+X-Dust-CLI-Version: 0.4.4
 Accept: text/event-stream
 ```
 
@@ -114,15 +129,15 @@ Accept: text/event-stream
 
 | Dust SSE event | Pi action |
 |---|---|
-| `generation_tokens` where `classification === "tokens"` | Yield text delta |
+| `generation_tokens` where `classification === "tokens"` | Yield `{ type: "text_delta", delta: event.text }` |
 | `generation_tokens` where `classification === "chain_of_thought"` | Discard (not shown) |
-| `agent_message_success` | End stream (terminal) |
-| `agent_error` | Throw error with `event.error.message` (terminal) |
-| `agent_generation_cancelled` | End stream cleanly (terminal) |
-| `user_message_error` | Throw error with `event.error.message` (terminal) |
-| `tool_params` | Ignore for now (future: show tool name in working message) |
+| `agent_message_success` | Yield `{ type: "done", reason: "stop" }` and return |
+| `agent_error` | Throw `event.error.message` (terminal) |
+| `agent_generation_cancelled` | Yield `{ type: "done", reason: "stop" }` and return |
+| `user_message_error` | Throw `event.error.message` (terminal) |
+| `tool_params` | Ignore for now |
 | `agent_action_success` | Ignore for now |
-| `tool_approve_execution` | Ignore for now (future: prompt user via `ctx.ui.confirm`) |
+| `tool_approve_execution` | Ignore for now |
 | `tool_notification` | Ignore for now |
 | `tool_error` | Ignore for now |
 
@@ -130,27 +145,20 @@ Accept: text/event-stream
 
 | Field | Source |
 |---|---|
-| `username` | Stored from `/api/v1/me` response at login (add to credentials) |
+| `username` | Stored from `/api/v1/me` `user.username` field at login |
 | `timezone` | `Intl.DateTimeFormat().resolvedOptions().timeZone` at runtime |
 | `origin` | Always `"cli"` (interactive pi session) |
-| `fullName` | Optional, from `/api/v1/me` if available |
-| `email` | Optional, from `/api/v1/me` if available |
-
-> `username` is not currently stored in credentials — login must be updated to
-> save `meData.user.name` or `meData.user.email` for use here.
 
 ### Error Handling
 
 - Token refresh is handled by the existing `refreshToken` oauth config.
-- If the conversation API returns 401, surface a clear error:
+- If any conversation/stream API call returns 401, surface:
   `"Dust session expired — run /logout then /login to re-authenticate."`
-- If the agents API returns an empty list after workspace switch, notify the user.
 
 ### AbortSignal
 
-`streamSimple` receives an `AbortSignal` via `options`. Forward it to all fetch
-calls and the SSE stream so the agent stops generating when the user presses
-Escape or switches model.
+`streamSimple` receives an `AbortSignal` via `options.signal`. It is forwarded to all
+fetch calls (`createConversation`, `postUserMessage`, `getConversation`, and the SSE stream).
 
 ---
 
@@ -161,3 +169,4 @@ Escape or switches model.
 - Content fragments / file attachments
 - Conversation history display (`/history` command)
 - Workspace switch mid-session (resets conversation ID)
+
