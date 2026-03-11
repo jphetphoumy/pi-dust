@@ -1113,6 +1113,62 @@ describe("dust extension", () => {
       expect(setCall).toBeDefined();
       expect(setCall[1].conversations[sessionFile]).toBe("conv-persisted");
     });
+
+    it("after resume, persists new conversation under the RESUMED session file, not the original", async () => {
+      const originalFile = "/sessions/s1.json";
+      const resumedFile = "/sessions/s2.json";
+      const authStorageSet = vi.fn();
+
+      const creds = makeCredentials();
+      let capturedStreamSimple: any;
+      let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+      let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
+
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          capturedStreamSimple = config.streamSimple;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: any) => {
+          if (event === "session_start") sessionStartHandler = handler;
+          if (event === "session_switch") sessionSwitchHandler = handler;
+        }),
+      };
+      dustExtension(mockApi as any);
+
+      // session_start: start on originalFile, no entries
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+      }));
+      const makeCtxFor = (file: string) => ({
+        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue({ ...creds }), set: authStorageSet } },
+        sessionManager: { getSessionFile: vi.fn().mockReturnValue(file), getEntries: vi.fn().mockReturnValue([]) },
+      });
+      await sessionStartHandler!({}, makeCtxFor(originalFile));
+      vi.unstubAllGlobals();
+
+      // /resume to resumedFile (no stored conv for it)
+      sessionSwitchHandler!({ reason: "resume" }, makeCtxFor(resumedFile));
+
+      // Send a message — should create new Dust conversation; save under resumedFile
+      const fetchMock = makeConvFetch("conv-for-resumed", "msg-r1");
+      vi.stubGlobal("fetch", fetchMock);
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Resumed msg" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      // Conversation must be saved under resumedFile, NOT originalFile
+      const setCall = authStorageSet.mock.calls.find(
+        ([_key, val]: any[]) => val?.conversations?.[resumedFile]
+      );
+      expect(setCall).toBeDefined();
+      expect(setCall[1].conversations[resumedFile]).toBe("conv-for-resumed");
+      // originalFile must not have been set
+      const badCall = authStorageSet.mock.calls.find(
+        ([_key, val]: any[]) => val?.conversations?.[originalFile] === "conv-for-resumed"
+      );
+      expect(badCall).toBeUndefined();
+    });
   });
 
   // ---------------------------------------------------------------------------

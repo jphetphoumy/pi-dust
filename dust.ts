@@ -20,6 +20,17 @@ type DustAgent = { sId: string; name: string; description: string };
 // Persisted across restarts in cred.conversations[sessionFile].
 let currentConversationId: string | null = null;
 
+// Dynamically-updated session context. Updated on session_start and session_switch
+// so that dustRealStream always reads the current session file at call time — not
+// the one that was active when the extension first loaded.
+let currentSessionContext: {
+  getSessionFile: () => string | undefined;
+  saveConversationId: (id: string) => void;
+} = {
+  getSessionFile: () => undefined,
+  saveConversationId: () => { /* no-op until session_start wires it up */ },
+};
+
 function decodeJwtPayload(token: string): Record<string, unknown> {
   const part = token.split(".")[1];
   return JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/")));
@@ -156,7 +167,6 @@ function dustRealStream(
   model: any,
   context: any,
   options?: any,
-  onConversationCreated?: (id: string) => void,
 ): PiEventStream {
   const stream = createEventStream();
 
@@ -233,7 +243,7 @@ function dustRealStream(
         userMessageSId = data.message.sId;
 
         currentConversationId = conversationSId;
-        onConversationCreated?.(conversationSId);
+        currentSessionContext.saveConversationId(conversationSId);
 
         // Agent message sId is embedded in the conversation content returned inline.
         const agentMsgSId = findAgentMessageSId(data.conversation.content, userMessageSId);
@@ -436,7 +446,6 @@ async function streamEvents(
 function buildDustProviderConfig(
   pi: ExtensionAPI,
   cred: any,
-  onConversationCreated?: (id: string) => void,
 ) {
   const agents: DustAgent[] = cred.agents ?? [];
   const apiUrl = dustApiUrl(cred.region ?? "us-central1");
@@ -452,7 +461,7 @@ function buildDustProviderConfig(
     api: "dust" as any,
     baseUrl,
     streamSimple: (model: unknown, context: unknown, options?: unknown) =>
-      dustRealStream(latestCred, model, context, options, onConversationCreated) as any,
+      dustRealStream(latestCred, model, context, options) as any,
     oauth: {
       name: "Dust",
       login: async (callbacks) => loginFn(callbacks),
@@ -772,6 +781,21 @@ export default function (pi: ExtensionAPI) {
   if (typeof (pi as any).on === "function") {
     (pi as any).on("session_switch", (_event: unknown, ctx: any) => {
       const event = _event as { reason?: string };
+
+      // Update the session context to point at the new session file and its storage.
+      // This ensures dustRealStream always persists to the right session file.
+      currentSessionContext = {
+        getSessionFile: () => ctx.sessionManager?.getSessionFile?.(),
+        saveConversationId: (id: string) => {
+          const sf = ctx.sessionManager?.getSessionFile?.();
+          if (!sf) return;
+          const latestCred = ctx.modelRegistry.authStorage.get("dust") as any;
+          if (!latestCred) return;
+          const convs: Record<string, string> = { ...(latestCred.conversations ?? {}), [sf]: id };
+          ctx.modelRegistry.authStorage.set("dust", { ...latestCred, conversations: convs });
+        },
+      };
+
       if (event.reason === "resume") {
         // Restore the Dust conversation for the resumed pi session (if any).
         const sessionFile: string | undefined = ctx.sessionManager?.getSessionFile?.();
@@ -807,9 +831,23 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // Wire up the session context so dustRealStream always uses the current
+      // session file — even after mid-session /resume switches.
+      const sessionFile: string | undefined = ctx.sessionManager?.getSessionFile?.();
+      currentSessionContext = {
+        getSessionFile: () => ctx.sessionManager?.getSessionFile?.(),
+        saveConversationId: (id: string) => {
+          const sf = ctx.sessionManager?.getSessionFile?.();
+          if (!sf) return;
+          const latestCred = ctx.modelRegistry.authStorage.get("dust") as any;
+          if (!latestCred) return;
+          const convs: Record<string, string> = { ...(latestCred.conversations ?? {}), [sf]: id };
+          ctx.modelRegistry.authStorage.set("dust", { ...latestCred, conversations: convs });
+        },
+      };
+
       // If this session already has messages (startup --resume path), restore
       // the Dust conversation ID so replies continue in the same thread.
-      const sessionFile: string | undefined = ctx.sessionManager?.getSessionFile?.();
       const existingEntries: unknown[] = ctx.sessionManager?.getEntries?.() ?? [];
       const isResume = existingEntries.length > 0;
       if (isResume && sessionFile) {
@@ -819,26 +857,16 @@ export default function (pi: ExtensionAPI) {
         currentConversationId = null;
       }
 
-      // Callback persists a newly-created Dust conversation ID into credentials,
-      // keyed by the pi session file, so it survives restarts.
-      const onConversationCreated = (dustConvId: string) => {
-        if (!sessionFile) return;
-        const latestCred = ctx.modelRegistry.authStorage.get("dust") as any;
-        if (!latestCred) return;
-        const conversations: Record<string, string> = { ...(latestCred.conversations ?? {}), [sessionFile]: dustConvId };
-        ctx.modelRegistry.authStorage.set("dust", { ...latestCred, conversations });
-      };
-
       const apiUrl = dustApiUrl(cred.region ?? "us-central1");
       const freshAgents = await fetchAgents(cred.access, apiUrl, cred.workspaceId);
 
       if (freshAgents !== null) {
         const updatedCred = { ...cred, agents: freshAgents };
         ctx.modelRegistry.authStorage.set("dust", updatedCred);
-        buildDustProviderConfig(pi, updatedCred, onConversationCreated);
+        buildDustProviderConfig(pi, updatedCred);
       } else {
         // Fetch failed — fall back to stale credentials
-        buildDustProviderConfig(pi, cred, onConversationCreated);
+        buildDustProviderConfig(pi, cred);
       }
     });
   }
