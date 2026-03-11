@@ -1643,6 +1643,189 @@ describe("dust extension", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Token refresh in dustRealStream — proactive refresh before each call
+  // ---------------------------------------------------------------------------
+
+  describe("token refresh in dustRealStream", () => {
+    async function setupWithExpiredCreds(expiredAccess = "expired-tok", newAccess = "new-tok") {
+      const expiredCreds = makeCredentials({
+        access: expiredAccess,
+        refresh: "ref-token",
+        expires: Date.now() - 1000, // already expired
+      });
+      const freshCreds = { ...expiredCreds, access: newAccess, expires: Date.now() + 3600_000 };
+
+      let capturedStreamSimple: any;
+      let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+      const authStorageSet = vi.fn();
+      let storedCreds = { ...expiredCreds };
+
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          capturedStreamSimple = config.streamSimple;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: any) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+      };
+
+      dustExtension(mockApi as any);
+
+      // session_start: bake in expired credentials, no token refresh yet (expires check at session_start
+      // uses <= Date.now() which is true — but here we want to test the in-stream refresh path,
+      // so we stub fetch to NOT match the WorkOS refresh at session_start and let it fall through).
+      vi.stubGlobal("fetch", vi.fn()
+        // session_start: token refresh attempt fails → falls back to expired creds
+        .mockResolvedValueOnce({ ok: false, status: 400 })
+        // session_start: agent fetch (uses expired token — still works in test)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: expiredCreds.agents }),
+        })
+      );
+
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const authStorage = {
+        get: vi.fn(() => storedCreds),
+        set: vi.fn((key: string, val: any) => {
+          authStorageSet(key, val);
+          storedCreds = val;
+        }),
+      };
+      const ctx = {
+        modelRegistry: { authStorage },
+        sessionManager: {
+          getSessionFile: vi.fn().mockReturnValue("/sessions/s1.json"),
+          getEntries: vi.fn().mockReturnValue([]),
+        },
+      };
+      await sessionStartHandler!({}, ctx);
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+
+      return { capturedStreamSimple, freshCreds, expiredCreds, authStorage, authStorageSet };
+    }
+
+    const model = { id: "helper", sId: "agentSId-1", name: "Helper", provider: "dust", api: "dust" };
+
+    it("refreshes expired token before sending MCP register", async () => {
+      const { capturedStreamSimple, freshCreds } = await setupWithExpiredCreds();
+
+      vi.stubGlobal("fetch", vi.fn()
+        // 1. Token refresh (WorkOS)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            access_token: freshCreds.access,
+            refresh_token: "new-ref",
+            expires_in: 3600,
+          }),
+        })
+        // 2. POST /mcp/register
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        // 3. GET /mcp/requests (empty SSE)
+        .mockResolvedValueOnce({
+          ok: true,
+          body: new ReadableStream({ start(c) { c.close(); } }),
+        })
+        // 4. POST /assistant/conversations
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            conversation: { sId: "conv-1", content: [[{ type: "user_message", sId: "m1" }], [{ type: "agent_message", sId: "am1", parentMessageId: "m1" }]] },
+            message: { sId: "m1" },
+          }),
+        })
+        // 5. SSE events
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success" }]),
+        })
+      );
+
+      const events: any[] = [];
+      for await (const ev of capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] })) {
+        events.push(ev);
+      }
+
+      // The MCP register call should use the new (refreshed) token, not the expired one.
+      const mcpCall = (globalThis as any).fetch.mock.calls.find(([url]: [string]) =>
+        url.includes("/mcp/register")
+      );
+      expect(mcpCall).toBeDefined();
+      const mcpAuthHeader = mcpCall[1]?.headers?.Authorization;
+      expect(mcpAuthHeader).toBe(`Bearer ${freshCreds.access}`);
+    });
+
+    it("persists refreshed token to authStorage", async () => {
+      const { capturedStreamSimple, freshCreds, authStorageSet } = await setupWithExpiredCreds();
+
+      vi.stubGlobal("fetch", vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            access_token: freshCreds.access,
+            refresh_token: "new-ref",
+            expires_in: 3600,
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: new ReadableStream({ start(c) { c.close(); } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            conversation: { sId: "conv-1", content: [[{ type: "user_message", sId: "m1" }], [{ type: "agent_message", sId: "am1", parentMessageId: "m1" }]] },
+            message: { sId: "m1" },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success" }]),
+        })
+      );
+
+      for await (const _ of capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] })) { /* drain */ }
+
+      const setCall = authStorageSet.mock.calls.find(
+        ([, c]: [string, any]) => c.access === freshCreds.access
+      );
+      expect(setCall).toBeDefined();
+    });
+
+    it("continues with stale token if refresh fails, and surfaces the error downstream", async () => {
+      const { capturedStreamSimple } = await setupWithExpiredCreds();
+
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.stubGlobal("fetch", vi.fn()
+        // 1. Token refresh fails
+        .mockResolvedValueOnce({ ok: false, status: 400 })
+        // 2. POST /mcp/register → 401 (expired token)
+        .mockResolvedValueOnce({ ok: false, status: 401 })
+      );
+
+      const events: any[] = [];
+      for await (const ev of capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] })) {
+        events.push(ev);
+      }
+
+      const errorEvent = events.find((e: any) => e.type === "error");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toMatch(/401/);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // MCP request listener — tools/list and tools/call
   // ---------------------------------------------------------------------------
 

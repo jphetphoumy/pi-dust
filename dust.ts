@@ -33,9 +33,13 @@ let mcpRequestsAbortController: AbortController | null = null;
 let currentSessionContext: {
   getSessionFile: () => string | undefined;
   saveConversationId: (id: string) => void;
+  getCredentials: () => any;
+  setCredentials: (cred: any) => void;
 } = {
   getSessionFile: () => undefined,
   saveConversationId: () => { /* no-op until session_start wires it up */ },
+  getCredentials: () => null,
+  setCredentials: () => { /* no-op until session_start wires it up */ },
 };
 
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -448,10 +452,24 @@ function dustRealStream(
     try {
       const signal: AbortSignal | undefined = options?.signal;
 
-      const accessToken: string = cred.access ?? "";
-      const workspaceId: string = cred.workspaceId ?? "";
-      const region: string = cred.region ?? "us-central1";
-      const username: string = cred.username ?? "unknown";
+      // Use the latest credentials from storage (may have been refreshed since cred was passed in).
+      let liveCred = currentSessionContext.getCredentials() ?? cred;
+
+      // Refresh the token proactively if it has expired or will expire in the next 30s.
+      if (typeof liveCred.expires === "number" && liveCred.expires <= Date.now() + 30_000) {
+        try {
+          liveCred = await refreshToken(liveCred);
+          currentSessionContext.setCredentials(liveCred);
+        } catch (err) {
+          console.error(`[dust] token refresh failed before stream: ${(err as Error).message}`);
+          // Continue with stale token — request will likely 401 and surface a clear error.
+        }
+      }
+
+      const accessToken: string = liveCred.access ?? "";
+      const workspaceId: string = liveCred.workspaceId ?? "";
+      const region: string = liveCred.region ?? "us-central1";
+      const username: string = liveCred.username ?? "unknown";
       const apiUrl = dustApiUrl(region);
       const baseUrl = `${apiUrl}/api/v1/w/${workspaceId}`;
       const agentSId: string = model.sId ?? "";
@@ -1091,6 +1109,8 @@ export default function (pi: ExtensionAPI) {
           const convs: Record<string, string> = { ...(latestCred.conversations ?? {}), [sf]: id };
           ctx.modelRegistry.authStorage.set("dust", { ...latestCred, conversations: convs });
         },
+        getCredentials: () => ctx.modelRegistry.authStorage.get("dust"),
+        setCredentials: (cred: any) => ctx.modelRegistry.authStorage.set("dust", cred),
       };
 
       if (event.reason === "resume") {
@@ -1145,6 +1165,8 @@ export default function (pi: ExtensionAPI) {
           const convs: Record<string, string> = { ...(latestCred.conversations ?? {}), [sf]: id };
           ctx.modelRegistry.authStorage.set("dust", { ...latestCred, conversations: convs });
         },
+        getCredentials: () => ctx.modelRegistry.authStorage.get("dust"),
+        setCredentials: (cred: any) => ctx.modelRegistry.authStorage.set("dust", cred),
       };
 
       // If this session already has messages (startup --resume path), restore
