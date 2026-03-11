@@ -1,3 +1,5 @@
+import { execSync } from "child_process";
+import { readFileSync, writeFileSync } from "fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const WORKOS_DOMAIN = "api.workos.com";
@@ -19,6 +21,11 @@ type DustAgent = { sId: string; name: string; description: string };
 // Null means "no conversation yet" → next streamSimple call will create one.
 // Persisted across restarts in cred.conversations[sessionFile].
 let currentConversationId: string | null = null;
+
+// MCP server state — one server per conversation session.
+let currentMcpServerId: string | null = null;
+let mcpHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let mcpRequestsAbortController: AbortController | null = null;
 
 // Dynamically-updated session context. Updated on session_start and session_switch
 // so that dustRealStream always reads the current session file at call time — not
@@ -55,7 +62,274 @@ function slugify(name: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal AssistantMessageEventStream-compatible implementation.
+// MCP tool definitions (the tools we expose to Dust agents)
+// ---------------------------------------------------------------------------
+
+const MCP_TOOLS = [
+  {
+    name: "bash",
+    description:
+      "Execute a bash command on the user's machine. Returns stdout and stderr. Use for running commands, scripts, and shell operations.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        command: { type: "string", description: "Bash command to execute" },
+        timeout: { type: "number", description: "Timeout in seconds (optional)" },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "read",
+    description:
+      "Read the contents of a file on the user's machine. Supports offset and limit for large files.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        path: { type: "string", description: "Path to the file to read (relative or absolute)" },
+        offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
+        limit: { type: "number", description: "Maximum number of lines to read" },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "edit",
+    description:
+      "Edit a file on the user's machine by replacing an exact string. Fails if oldText is not found.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        path: { type: "string", description: "Path to the file to edit (relative or absolute)" },
+        oldText: { type: "string", description: "Exact text to find and replace" },
+        newText: { type: "string", description: "New text to replace the old text with" },
+      },
+      required: ["path", "oldText", "newText"],
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Tool executors
+// ---------------------------------------------------------------------------
+
+interface McpToolResult {
+  content: Array<{ type: "text"; text: string }>;
+  isError: boolean;
+}
+
+function executeBash(args: Record<string, unknown>): McpToolResult {
+  const command = String(args.command ?? "");
+  const timeoutSecs = typeof args.timeout === "number" ? args.timeout : undefined;
+  try {
+    const stdout = execSync(command, {
+      timeout: timeoutSecs !== undefined ? timeoutSecs * 1000 : undefined,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return { content: [{ type: "text", text: stdout }], isError: false };
+  } catch (err: any) {
+    // execSync throws on non-zero exit; err.stdout / err.stderr may have output
+    const output = [err.stdout, err.stderr].filter(Boolean).join("\n") || String(err.message);
+    return { content: [{ type: "text", text: output }], isError: true };
+  }
+}
+
+function executeRead(args: Record<string, unknown>): McpToolResult {
+  const filePath = String(args.path ?? "");
+  try {
+    const content = readFileSync(filePath, "utf8");
+    const lines = content.split("\n");
+    const offset = typeof args.offset === "number" ? args.offset - 1 : 0; // 1-indexed → 0-indexed
+    const limit = typeof args.limit === "number" ? args.limit : undefined;
+    const sliced = limit !== undefined ? lines.slice(offset, offset + limit) : lines.slice(offset);
+    return { content: [{ type: "text", text: sliced.join("\n") }], isError: false };
+  } catch (err: any) {
+    return { content: [{ type: "text", text: `Error reading file: ${err.message}` }], isError: true };
+  }
+}
+
+function executeEdit(args: Record<string, unknown>): McpToolResult {
+  const filePath = String(args.path ?? "");
+  const oldText = String(args.oldText ?? "");
+  const newText = String(args.newText ?? "");
+  try {
+    const content = readFileSync(filePath, "utf8");
+    if (!content.includes(oldText)) {
+      return {
+        content: [{ type: "text", text: `Error: oldText not found in ${filePath}` }],
+        isError: true,
+      };
+    }
+    const updated = content.replace(oldText, newText);
+    writeFileSync(filePath, updated, "utf8");
+    return { content: [{ type: "text", text: `Successfully edited ${filePath}` }], isError: false };
+  } catch (err: any) {
+    return { content: [{ type: "text", text: `Error editing file: ${err.message}` }], isError: true };
+  }
+}
+
+function executeMcpTool(name: string, args: Record<string, unknown>): McpToolResult {
+  switch (name) {
+    case "bash":
+      return executeBash(args);
+    case "read":
+      return executeRead(args);
+    case "edit":
+      return executeEdit(args);
+    default:
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${name}` }],
+        isError: true,
+      };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MCP server registration and heartbeat
+// ---------------------------------------------------------------------------
+
+async function registerMcpServer(
+  baseUrl: string,
+  authHeaders: Record<string, string>,
+): Promise<string> {
+  const res = await fetch(`${baseUrl}/mcp/register`, {
+    method: "POST",
+    headers: { ...authHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ serverName: "pi-dust-extension" }),
+  });
+  if (!res.ok) {
+    throw new Error(`MCP register failed: HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as { serverId: string; expiresAt: string };
+  return data.serverId;
+}
+
+function startMcpHeartbeat(
+  baseUrl: string,
+  authHeaders: Record<string, string>,
+  serverId: string,
+): void {
+  if (mcpHeartbeatTimer) {
+    clearInterval(mcpHeartbeatTimer);
+  }
+  mcpHeartbeatTimer = setInterval(async () => {
+    try {
+      await fetch(`${baseUrl}/mcp/heartbeat`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ serverId }),
+      });
+    } catch {
+      // heartbeat failures are non-fatal
+    }
+  }, 5 * 60 * 1000);
+}
+
+function clearMcpState(): void {
+  if (mcpHeartbeatTimer) {
+    clearInterval(mcpHeartbeatTimer);
+    mcpHeartbeatTimer = null;
+  }
+  if (mcpRequestsAbortController) {
+    mcpRequestsAbortController.abort();
+    mcpRequestsAbortController = null;
+  }
+  currentMcpServerId = null;
+}
+
+// ---------------------------------------------------------------------------
+// MCP request listener (runs alongside agent SSE, processes tools/call & tools/list)
+// ---------------------------------------------------------------------------
+
+async function listenMcpRequests(
+  baseUrl: string,
+  authHeaders: Record<string, string>,
+  serverId: string,
+  abortController: AbortController,
+): Promise<void> {
+  const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { ...authHeaders, Accept: "text/event-stream" },
+      signal: abortController.signal,
+    });
+  } catch {
+    // aborted or network error — silently exit
+    return;
+  }
+
+  if (!res.ok || !res.body) return;
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+
+        for (const frame of frames) {
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const json = line.slice(5).trim();
+            if (!json) continue;
+            let parsed: any;
+            try {
+              parsed = JSON.parse(json);
+            } catch {
+              continue;
+            }
+
+            // Dust wraps in { eventId, data } — unwrap if present
+            const request = parsed.data ?? parsed;
+
+            if (request.method === "tools/list") {
+              // Respond with the list of tools we expose
+              const responseMsg = {
+                jsonrpc: "2.0",
+                id: request.id,
+                result: { tools: MCP_TOOLS },
+              };
+              await fetch(`${baseUrl}/mcp/results`, {
+                method: "POST",
+                headers: { ...authHeaders, "Content-Type": "application/json" },
+                body: JSON.stringify({ result: responseMsg, serverId }),
+              });
+            } else if (request.method === "tools/call") {
+              const toolName: string = request.params?.name ?? "";
+              const toolArgs: Record<string, unknown> = request.params?.arguments ?? {};
+              const toolResult = executeMcpTool(toolName, toolArgs);
+              const responseMsg = {
+                jsonrpc: "2.0",
+                id: request.id,
+                result: {
+                  content: toolResult.content,
+                  isError: toolResult.isError,
+                },
+              };
+              await fetch(`${baseUrl}/mcp/results`, {
+                method: "POST",
+                headers: { ...authHeaders, "Content-Type": "application/json" },
+                body: JSON.stringify({ result: responseMsg, serverId }),
+              });
+            }
+          }
+        }
+      }
+      if (done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+
 // Mirrors the EventStream / AssistantMessageEventStream from @mariozechner/pi-ai
 // without requiring an external import (which may not resolve in the test env).
 // pi's agent-loop calls: stream[Symbol.asyncIterator]() to iterate events,
@@ -188,6 +462,17 @@ function dustRealStream(
       };
 
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+      // Register MCP server once per conversation session.
+      if (!currentMcpServerId) {
+        const serverId = await registerMcpServer(`${baseUrl}`, authHeaders);
+        currentMcpServerId = serverId;
+        startMcpHeartbeat(baseUrl, authHeaders, serverId);
+        // Start MCP request listener in background (detached).
+        const ac = new AbortController();
+        mcpRequestsAbortController = ac;
+        listenMcpRequests(baseUrl, authHeaders, serverId, ac).catch(() => { /* non-fatal */ });
+      }
 
       // Extract the last user message text from context.
       // pi passes content as either a plain string or an array of content blocks.
@@ -405,6 +690,17 @@ async function streamEvents(
                   stream.push({ type: "text_delta", contentIndex: 0, delta, partial: { ...partial } });
                 }
                 // chain_of_thought: discard
+              } else if (event.type === "tool_params") {
+                // Emit a text_delta so the user sees which tool is being called.
+                const toolName: string = event.action?.toolName ?? event.action?.functionCallName ?? "tool";
+                const indicator = `\n[Tool: ${toolName}]\n`;
+                fullText += indicator;
+                if (partial.content.length === 0) {
+                  partial.content.push({ type: "text", text: fullText });
+                } else {
+                  (partial.content[0] as any).text = fullText;
+                }
+                stream.push({ type: "text_delta", contentIndex: 0, delta: indicator, partial: { ...partial } });
               } else if (event.type === "agent_message_success") {
                 const finalMessage = makeEmptyMessage(model);
                 finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
@@ -424,7 +720,7 @@ async function streamEvents(
               } else if (event.type === "user_message_error") {
                 throw new Error(event.error?.message ?? "User message error");
               }
-              // tool_params, agent_action_success, tool_* — ignore for now
+              // agent_action_success, tool_error, tool_* — handled by MCP listener loop
             }
           }
         }
@@ -733,6 +1029,7 @@ async function fetchAgents(accessToken: string, apiUrl: string, workspaceId: str
 export default function (pi: ExtensionAPI) {
   // Reset session state on each extension load (new session or test isolation).
   currentConversationId = null;
+  clearMcpState();
 
   // Register the OAuth provider and streamSimple without models on initial load.
   // The session_start handler will re-register with explicit models if credentials exist.
@@ -802,9 +1099,13 @@ export default function (pi: ExtensionAPI) {
         const cred = ctx.modelRegistry.authStorage.get("dust") as any;
         const conversations: Record<string, string> = cred?.conversations ?? {};
         currentConversationId = (sessionFile && conversations[sessionFile]) ? conversations[sessionFile] : null;
+        // On resume we also reset the MCP server — it will be re-registered on the next message.
+        clearMcpState();
       } else {
         // /new → start a fresh Dust conversation.
         currentConversationId = null;
+        // Also clear the MCP server so a new one is registered next time.
+        clearMcpState();
       }
     });
   }
