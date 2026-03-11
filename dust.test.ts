@@ -1370,9 +1370,11 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", fetchMock);
 
       const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
-      await expect(async () => {
-        for await (const _ of stream) { /* drain */ }
-      }).rejects.toThrow("Agent exploded");
+      const events: any[] = [];
+      for await (const e of stream) events.push(e);
+      const errorEvent = events.find((e) => e.type === "error");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toContain("Agent exploded");
     });
 
     it("throws with user message error when user_message_error is received", async () => {
@@ -1383,9 +1385,11 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", fetchMock);
 
       const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
-      await expect(async () => {
-        for await (const _ of stream) { /* drain */ }
-      }).rejects.toThrow("Bad input");
+      const events: any[] = [];
+      for await (const e of stream) events.push(e);
+      const errorEvent = events.find((e) => e.type === "error");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toContain("Bad input");
     });
 
     it("throws with session-expired message on 401 from createConversation", async () => {
@@ -1393,9 +1397,11 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 401, text: () => Promise.resolve("") }));
 
       const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
-      await expect(async () => {
-        for await (const _ of stream) { /* drain */ }
-      }).rejects.toThrow(/session expired/i);
+      const events: any[] = [];
+      for await (const e of stream) events.push(e);
+      const errorEvent = events.find((e) => e.type === "error");
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.error.errorMessage).toMatch(/session expired/i);
     });
 
     it("forwards AbortSignal to the createConversation fetch call", async () => {

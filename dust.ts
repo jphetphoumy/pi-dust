@@ -42,13 +42,105 @@ function slugify(name: string): string {
     .replace(/^-+|-+$/g, "");               // trim leading/trailing hyphens
 }
 
-async function* dustMockStream() {
-  yield { type: "text_delta" as const, contentIndex: 0, delta: "Dust agent chat is not yet implemented.", partial: null };
-  yield { type: "done" as const, reason: "stop" as const, message: null };
+// ---------------------------------------------------------------------------
+// Minimal AssistantMessageEventStream-compatible implementation.
+// Mirrors the EventStream / AssistantMessageEventStream from @mariozechner/pi-ai
+// without requiring an external import (which may not resolve in the test env).
+// pi's agent-loop calls: stream[Symbol.asyncIterator]() to iterate events,
+// and stream.result() to get the final AssistantMessage promise.
+// ---------------------------------------------------------------------------
+
+interface AssistantMessageLike {
+  role: "assistant";
+  content: Array<{ type: "text"; text: string }>;
+  api: string;
+  provider: string;
+  model: string;
+  usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } };
+  stopReason: string;
+  errorMessage?: string;
+  timestamp: number;
+}
+
+function makeEmptyMessage(model: any): AssistantMessageLike {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api ?? "dust",
+    provider: model.provider ?? "dust",
+    model: model.id ?? "",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+interface PiEventStream {
+  push(event: any): void;
+  end(): void;
+  result(): Promise<AssistantMessageLike>;
+  [Symbol.asyncIterator](): AsyncIterator<any>;
+}
+
+function createEventStream(): PiEventStream {
+  const queue: any[] = [];
+  const waiters: Array<(r: IteratorResult<any>) => void> = [];
+  let done = false;
+  let resolveResult!: (v: AssistantMessageLike) => void;
+  const resultPromise = new Promise<AssistantMessageLike>((res) => { resolveResult = res; });
+
+  return {
+    push(event: any) {
+      if (done) return;
+      if (event.type === "done") {
+        done = true;
+        resolveResult(event.message);
+      } else if (event.type === "error") {
+        done = true;
+        resolveResult(event.error);
+      }
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter({ value: event, done: false });
+      } else {
+        queue.push(event);
+      }
+    },
+    end() {
+      if (!done) {
+        done = true;
+      }
+      while (waiters.length > 0) {
+        waiters.shift()!({ value: undefined as any, done: true });
+      }
+    },
+    result() {
+      return resultPromise;
+    },
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<any>> {
+          if (queue.length > 0) {
+            return Promise.resolve({ value: queue.shift()!, done: false });
+          }
+          if (done) {
+            return Promise.resolve({ value: undefined as any, done: true });
+          }
+          return new Promise<IteratorResult<any>>((resolve) => waiters.push(resolve));
+        },
+        return(): Promise<IteratorResult<any>> {
+          return Promise.resolve({ value: undefined as any, done: true });
+        },
+      };
+    },
+  };
 }
 
 /**
  * Real streamSimple implementation.
+ *
+ * Returns a PiEventStream (AsyncIterable + result()) compatible with pi's
+ * AssistantMessageEventStream interface.
  *
  * Credentials (`cred`) are closed over from `buildDustProviderConfig` scope
  * so they are always available regardless of what pi does with model fields.
@@ -58,134 +150,149 @@ async function* dustMockStream() {
  *   - Subsequent calls: POST /conversations/{id}/messages + GET /conversations/{id}
  *   - After either: GET /conversations/{id}/messages/{agentMsgId}/events  (SSE)
  */
-async function* dustRealStream(cred: any, model: any, context: any, options?: any): AsyncGenerator<any> {
-  const signal: AbortSignal | undefined = options?.signal;
+function dustRealStream(cred: any, model: any, context: any, options?: any): PiEventStream {
+  const stream = createEventStream();
 
-  const accessToken: string = cred.access ?? "";
-  const workspaceId: string = cred.workspaceId ?? "";
-  const region: string = cred.region ?? "us-central1";
-  const username: string = cred.username ?? "unknown";
-  const apiUrl = dustApiUrl(region);
-  const baseUrl = `${apiUrl}/api/v1/w/${workspaceId}`;
-  const agentSId: string = model.sId ?? "";
+  (async () => {
+    try {
+      const signal: AbortSignal | undefined = options?.signal;
 
-  const authHeaders = {
-    Authorization: `Bearer ${accessToken}`,
-    ...DUST_HEADERS,
-  };
+      const accessToken: string = cred.access ?? "";
+      const workspaceId: string = cred.workspaceId ?? "";
+      const region: string = cred.region ?? "us-central1";
+      const username: string = cred.username ?? "unknown";
+      const apiUrl = dustApiUrl(region);
+      const baseUrl = `${apiUrl}/api/v1/w/${workspaceId}`;
+      const agentSId: string = model.sId ?? "";
 
-  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const authHeaders = {
+        Authorization: `Bearer ${accessToken}`,
+        ...DUST_HEADERS,
+      };
 
-  // Extract the last user message text from context.
-  // pi passes content as either a plain string or an array of content blocks.
-  const messages: any[] = context?.messages ?? [];
-  const lastUserMessage = [...messages].reverse().find((m: any) => m.role === "user");
-  const rawContent = lastUserMessage?.content ?? "";
-  const userText: string = Array.isArray(rawContent)
-    ? rawContent
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text ?? "")
-        .join("")
-    : String(rawContent);
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-  let conversationSId: string;
-  let userMessageSId: string;
+      // Extract the last user message text from context.
+      // pi passes content as either a plain string or an array of content blocks.
+      const messages: any[] = context?.messages ?? [];
+      const lastUserMessage = [...messages].reverse().find((m: any) => m.role === "user");
+      const rawContent = lastUserMessage?.content ?? "";
+      const userText: string = Array.isArray(rawContent)
+        ? rawContent
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text ?? "")
+            .join("")
+        : String(rawContent);
 
-  if (!currentConversationId) {
-    // ------------------------------------------------------------------ first message
-    const reqBody = {
-      title: userText.substring(0, 50) + (userText.length > 50 ? "..." : ""),
-      visibility: "unlisted",
-      message: {
-        content: userText,
-        mentions: [{ configurationId: agentSId }],
-        context: {
-          username,
-          timezone,
-          origin: "cli",
-        },
-      },
-    };
-    const res = await fetch(`${baseUrl}/assistant/conversations`, {
-      method: "POST",
-      headers: {
-        ...authHeaders,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(reqBody),
-      signal,
-    });
+      let conversationSId: string;
+      let userMessageSId: string;
 
-    if (!res.ok) {
-      const errBody = await res.text().catch(() => "");
-      if (res.status === 401) {
-        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+      if (!currentConversationId) {
+        // ------------------------------------------------------------------ first message
+        const reqBody = {
+          title: userText.substring(0, 50) + (userText.length > 50 ? "..." : ""),
+          visibility: "unlisted",
+          message: {
+            content: userText,
+            mentions: [{ configurationId: agentSId }],
+            context: {
+              username,
+              timezone,
+              origin: "cli",
+            },
+          },
+        };
+
+        const res = await fetch(`${baseUrl}/assistant/conversations`, {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(reqBody),
+          signal,
+        });
+
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          if (res.status === 401) {
+            throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+          }
+          throw new Error(`Failed to create conversation: HTTP ${res.status} — ${errBody}`);
+        }
+
+        const data = (await res.json()) as any;
+        conversationSId = data.conversation.sId;
+        userMessageSId = data.message.sId;
+
+        currentConversationId = conversationSId;
+
+        // Agent message sId is embedded in the conversation content returned inline.
+        const agentMsgSId = findAgentMessageSId(data.conversation.content, userMessageSId);
+
+        await streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal, stream, model);
+      } else {
+        // ------------------------------------------------------------------ subsequent message
+        conversationSId = currentConversationId;
+
+        const msgRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}/messages`, {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            content: userText,
+            mentions: [{ configurationId: agentSId }],
+            context: {
+              username,
+              timezone,
+              origin: "cli",
+            },
+          }),
+          signal,
+        });
+
+        if (!msgRes.ok) {
+          if (msgRes.status === 401) {
+            throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+          }
+          throw new Error(`Failed to post message: HTTP ${msgRes.status}`);
+        }
+
+        const msgData = (await msgRes.json()) as any;
+        userMessageSId = msgData.message.sId;
+
+        // Fetch the conversation to find the agent message sId.
+        const convRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}`, {
+          headers: authHeaders,
+          signal,
+        });
+
+        if (!convRes.ok) {
+          if (convRes.status === 401) {
+            throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
+          }
+          throw new Error(`Failed to fetch conversation: HTTP ${convRes.status}`);
+        }
+
+        const convData = (await convRes.json()) as any;
+        const agentMsgSId = findAgentMessageSId(convData.conversation.content, userMessageSId);
+
+        await streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal, stream, model);
       }
-      throw new Error(`Failed to create conversation: HTTP ${res.status} — ${errBody}`);
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      const errMessage = makeEmptyMessage(model);
+      errMessage.stopReason = "error";
+      errMessage.errorMessage = errMsg;
+      stream.push({ type: "error", reason: "error", error: errMessage });
+      stream.end();
     }
+  })();
 
-    const data = (await res.json()) as any;
-    conversationSId = data.conversation.sId;
-    userMessageSId = data.message.sId;
-
-    currentConversationId = conversationSId;
-
-    // Agent message sId is embedded in the conversation content returned inline.
-    const agentMsgSId = findAgentMessageSId(data.conversation.content, userMessageSId);
-
-    yield* streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal);
-  } else {
-    // ------------------------------------------------------------------ subsequent message
-    conversationSId = currentConversationId;
-
-    const msgRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}/messages`, {
-      method: "POST",
-      headers: {
-        ...authHeaders,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        content: userText,
-        mentions: [{ configurationId: agentSId }],
-        context: {
-          username,
-          timezone,
-          origin: "cli",
-        },
-      }),
-      signal,
-    });
-
-    if (!msgRes.ok) {
-      if (msgRes.status === 401) {
-        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
-      }
-      throw new Error(`Failed to post message: HTTP ${msgRes.status}`);
-    }
-
-    const msgData = (await msgRes.json()) as any;
-    userMessageSId = msgData.message.sId;
-
-    // Fetch the conversation to find the agent message sId.
-    const convRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}`, {
-      headers: authHeaders,
-      signal,
-    });
-
-    if (!convRes.ok) {
-      if (convRes.status === 401) {
-        throw new Error("Dust session expired — run /logout then /login to re-authenticate.");
-      }
-      throw new Error(`Failed to fetch conversation: HTTP ${convRes.status}`);
-    }
-
-    const convData = (await convRes.json()) as any;
-    const agentMsgSId = findAgentMessageSId(convData.conversation.content, userMessageSId);
-
-    yield* streamEvents(baseUrl, conversationSId, agentMsgSId, authHeaders, signal);
-  }
+  return stream;
 }
-
 /** Find the sId of the agent_message whose parentMessageId equals userMessageSId. */
 function findAgentMessageSId(content: any[][], userMessageSId: string): string {
   for (const versions of content) {
@@ -198,13 +305,15 @@ function findAgentMessageSId(content: any[][], userMessageSId: string): string {
 }
 
 /** Stream SSE events from the agent message events endpoint, mapping to pi stream events. */
-async function* streamEvents(
+async function streamEvents(
   baseUrl: string,
   conversationSId: string,
   agentMsgSId: string,
   authHeaders: Record<string, string>,
-  signal?: AbortSignal
-): AsyncGenerator<any> {
+  signal: AbortSignal | undefined,
+  stream: PiEventStream,
+  model: any,
+): Promise<void> {
   const sseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
 
   const res = await fetch(sseUrl, {
@@ -228,6 +337,12 @@ async function* streamEvents(
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+
+  // Build up the complete text as we go so we can put it in the final message.
+  let fullText = "";
+
+  // Partial AssistantMessage updated on each text_delta.
+  const partial = makeEmptyMessage(model);
 
   // Minimal SSE parser: accumulate lines, emit on blank line.
   let buffer = "";
@@ -261,14 +376,30 @@ async function* streamEvents(
 
               if (event.type === "generation_tokens") {
                 if (event.classification === "tokens") {
-                  yield { type: "text_delta" as const, contentIndex: 0, delta: event.text ?? "", partial: null };
+                  const delta: string = event.text ?? "";
+                  fullText += delta;
+                  // Update partial content in place.
+                  if (partial.content.length === 0) {
+                    partial.content.push({ type: "text", text: fullText });
+                  } else {
+                    (partial.content[0] as any).text = fullText;
+                  }
+                  stream.push({ type: "text_delta", contentIndex: 0, delta, partial: { ...partial } });
                 }
                 // chain_of_thought: discard
               } else if (event.type === "agent_message_success") {
-                yield { type: "done" as const, reason: "stop" as const, message: null };
+                const finalMessage = makeEmptyMessage(model);
+                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                finalMessage.stopReason = "stop";
+                stream.push({ type: "done", reason: "stop", message: finalMessage });
+                stream.end();
                 return;
               } else if (event.type === "agent_generation_cancelled") {
-                yield { type: "done" as const, reason: "stop" as const, message: null };
+                const finalMessage = makeEmptyMessage(model);
+                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                finalMessage.stopReason = "stop";
+                stream.push({ type: "done", reason: "stop", message: finalMessage });
+                stream.end();
                 return;
               } else if (event.type === "agent_error") {
                 throw new Error(event.error?.message ?? "Agent error");
@@ -285,6 +416,13 @@ async function* streamEvents(
   } finally {
     reader.releaseLock();
   }
+
+  // If SSE stream ended without an explicit done event, synthesize one.
+  const finalMessage = makeEmptyMessage(model);
+  finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+  finalMessage.stopReason = "stop";
+  stream.push({ type: "done", reason: "stop", message: finalMessage });
+  stream.end();
 }
 
 function buildDustProviderConfig(pi: ExtensionAPI, cred: any) {
