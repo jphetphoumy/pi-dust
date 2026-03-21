@@ -1,15 +1,22 @@
 name: Coverage
 
 on:
+  pull_request:
   push:
     branches:
-      - main
-      - master
-  pull_request:
+      - "**"
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -33,3 +40,4 @@ jobs:
           name: coverage-report
           path: coverage/
           if-no-files-found: error
+          retention-days: 14

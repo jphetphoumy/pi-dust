@@ -7,10 +7,9 @@ the project over time.
 
 The repository includes several GitHub Actions workflows:
 
-- `ci.yml` -> standard quality gate on push and pull request
-- `coverage.yml` -> coverage generation
-- `changelog.yml` -> changelog refresh
-- `release.yml` -> GitHub release publication on version tags
+- `ci.yml` -> lint, typecheck, tests, package smoke test, and release-readiness checks on pull requests and branch pushes
+- `coverage.yml` -> coverage generation and artifact upload on pull requests and branch pushes
+- `release.yml` -> validated GitHub release publication on version tags
 
 ## Dependency updates
 
@@ -86,10 +85,15 @@ The release workflow then:
 - installs dependencies
 - validates the tag version
 - runs the quality gate
-- generates the changelog
-- generates release notes
+- generates release notes with the `orhun/git-cliff-action`
+- validates the generated release notes
+- generates a changelog artifact with the same `git-cliff` configuration
 - validates release notes
-- publishes the GitHub release
+- uploads release artifacts
+- publishes the GitHub release from validated artifacts
+
+The regular CI workflow also runs a release-readiness job on branch pushes and
+pull requests so changelog generation failures are caught before tagging.
 
 ## Repository hygiene
 
