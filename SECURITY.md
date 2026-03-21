@@ -4,6 +4,27 @@
 
 Security fixes are applied to the latest code on the default branch.
 
+## Security model
+
+`pi-dust` can execute local tools on the host machine through the Dust MCP flow.
+
+Important implications:
+
+- approval prompts are a user-safety guard, not an operating-system sandbox
+- approving a `bash` command still allows that command to run with the user's permissions
+- file-oriented tools are restricted to allowed local directories
+
+By default, file reads and edits are limited to the current working directory.
+You can override the allowed locations with `PI_DUST_ALLOWED_PATHS`, using the
+platform path separator to declare multiple base directories.
+
+Examples:
+
+- Linux/macOS: `PI_DUST_ALLOWED_PATHS=/workspace/project:/tmp/shared`
+- Windows: `PI_DUST_ALLOWED_PATHS=C:\\work\\project;D:\\shared`
+
+Only approve commands and file operations you understand and expect.
+
 ## Reporting a vulnerability
 
 If you believe you have found a security issue in `pi-dust`, please avoid

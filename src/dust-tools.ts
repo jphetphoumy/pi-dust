@@ -1,7 +1,10 @@
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync } from "fs";
+import { delimiter, isAbsolute, relative, resolve } from "path";
 import type { McpToolArgs } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
+
+const ALLOWED_PATHS_ENV = "PI_DUST_ALLOWED_PATHS";
 
 export const MCP_TOOLS = [
   {
@@ -57,6 +60,43 @@ interface CommandExecutionError extends Error {
   stderr?: string;
 }
 
+function configuredAllowedPaths(): string[] {
+  const rawValue = typeof process !== "undefined" ? process.env[ALLOWED_PATHS_ENV] : undefined;
+  const configured = rawValue
+    ?.split(delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  const candidates = configured && configured.length > 0 ? configured : [process.cwd()];
+  return [...new Set(candidates.map((entry) => resolve(entry)))];
+}
+
+function isPathAllowed(targetPath: string, basePath: string): boolean {
+  const relativePath = relative(basePath, targetPath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function resolveToolPath(filePath: string): string {
+  const normalizedPath = filePath.trim();
+  if (normalizedPath.length === 0) {
+    throw new Error("Path is required");
+  }
+
+  const resolvedPath = resolve(normalizedPath);
+  const allowedPaths = configuredAllowedPaths();
+
+  if (!allowedPaths.some((basePath) => isPathAllowed(resolvedPath, basePath))) {
+    throw new Error(`Path '${filePath}' is outside allowed directories`);
+  }
+
+  return resolvedPath;
+}
+
+function displayPath(filePath: string): string {
+  const normalizedPath = filePath.trim();
+  return normalizedPath.length > 0 ? resolve(normalizedPath) : normalizedPath;
+}
+
 function executeBash(args: McpToolArgs): McpToolResult {
   const command = String(args.command ?? "");
   const timeoutSecs = typeof args.timeout === "number" ? args.timeout : undefined;
@@ -77,7 +117,8 @@ function executeBash(args: McpToolArgs): McpToolResult {
 function executeRead(args: McpToolArgs): McpToolResult {
   const filePath = String(args.path ?? "");
   try {
-    const content = readFileSync(filePath, "utf8");
+    const resolvedPath = resolveToolPath(filePath);
+    const content = readFileSync(resolvedPath, "utf8");
     const lines = content.split("\n");
     const offset = typeof args.offset === "number" ? args.offset - 1 : 0;
     const limit = typeof args.limit === "number" ? args.limit : undefined;
@@ -93,16 +134,25 @@ function executeEdit(args: McpToolArgs): McpToolResult {
   const oldText = String(args.oldText ?? "");
   const newText = String(args.newText ?? "");
   try {
-    const content = readFileSync(filePath, "utf8");
-    if (!content.includes(oldText)) {
+    if (oldText.length === 0) {
       return {
-        content: [{ type: "text", text: `Error: oldText not found in ${filePath}` }],
+        content: [{ type: "text", text: "Error editing file: oldText must not be empty" }],
         isError: true,
       };
     }
-    const updated = content.replace(oldText, newText);
-    writeFileSync(filePath, updated, "utf8");
-    return { content: [{ type: "text", text: `Successfully edited ${filePath}` }], isError: false };
+
+    const resolvedPath = resolveToolPath(filePath);
+    const content = readFileSync(resolvedPath, "utf8");
+    if (!content.includes(oldText)) {
+      return {
+        content: [{ type: "text", text: `Error: oldText not found in ${resolvedPath}` }],
+        isError: true,
+      };
+    }
+    const matchIndex = content.indexOf(oldText);
+    const updated = content.slice(0, matchIndex) + newText + content.slice(matchIndex + oldText.length);
+    writeFileSync(resolvedPath, updated, "utf8");
+    return { content: [{ type: "text", text: `Successfully edited ${resolvedPath}` }], isError: false };
   } catch (err: unknown) {
     return { content: [{ type: "text", text: `Error editing file: ${errorMessage(err)}` }], isError: true };
   }
@@ -129,13 +179,13 @@ export function buildConfirmMessage(toolName: string, args: McpToolArgs): string
     case "bash":
       return String(args.command ?? "");
     case "read": {
-      const parts = [String(args.path ?? "")];
+      const parts = [displayPath(String(args.path ?? ""))];
       if (args.offset != null) parts.push(`offset: ${args.offset}`);
       if (args.limit != null) parts.push(`limit: ${args.limit}`);
       return parts.join("  ");
     }
     case "edit": {
-      const path = String(args.path ?? "");
+      const path = displayPath(String(args.path ?? ""));
       const oldText = String(args.oldText ?? "");
       const newText = String(args.newText ?? "");
       const preview = (value: string) => value.length > 80 ? value.slice(0, 77) + "..." : value;
