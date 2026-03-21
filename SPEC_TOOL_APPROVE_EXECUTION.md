@@ -1,6 +1,6 @@
 # Spec: Tool Approval via `tool_approve_execution` (Server-Side Flow)
 
-## Status: Ready for implementation
+## Status: Implemented
 
 ---
 

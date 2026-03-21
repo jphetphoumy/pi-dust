@@ -1,6 +1,6 @@
 # Spec: MCP Tool Call Confirm + Multi-Turn Reconnect
 
-## Status: Implementation in progress — 4 tests failing
+## Status: Implemented
 
 ---
 

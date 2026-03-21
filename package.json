@@ -3,10 +3,44 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "test": "vitest --run"
+    "prepare": "simple-git-hooks",
+    "lint": "eslint src test --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "coverage": "vitest --run --coverage --coverage.reporter=text --coverage.reporter=lcov --coverage.reporter=json-summary",
+    "changelog": "git-cliff --output CHANGELOG.md",
+    "changelog:release-notes": "git-cliff --current --strip header --output RELEASE_NOTES.md",
+    "commitlint": "commitlint --edit",
+    "precommit": "npm run check",
+    "prepush": "npm run typecheck && npm run lint && npm run coverage",
+    "check": "npm run typecheck && npm run lint && npm test"
   },
   "devDependencies": {
-    "vitest": "^3.2.4",
-    "@types/node": "^22.0.0"
+    "@commitlint/cli": "^20.1.0",
+    "@commitlint/config-conventional": "^20.0.0",
+    "@eslint/js": "^9.39.4",
+    "@mariozechner/pi-coding-agent": "^0.61.1",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.57.1",
+    "@typescript-eslint/parser": "^8.57.1",
+    "@vitest/coverage-v8": "^3.2.4",
+    "eslint": "^9.39.4",
+    "git-cliff": "^2.12.0",
+    "globals": "^17.4.0",
+    "simple-git-hooks": "^2.13.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "npm run precommit",
+    "pre-push": "npm run prepush",
+    "commit-msg": "npm run commitlint -- \"$1\""
+  },
+  "pi": {
+    "extension": [
+      "./src/dust.ts"
+    ],
+    "icon": "./icon.png"
   }
 }
