@@ -24,27 +24,19 @@ import {
   parsePostMessageResponse,
 } from "./dust-validation.js";
 
-let currentConversationId: string | null = null;
-let currentMcpServerId: string | null = null;
-let mcpHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
-let mcpRequestsAbortController: AbortController | null = null;
-
-let currentSessionContext: {
+interface SessionContextController {
   getSessionFile: () => string | undefined;
   saveConversationId: (id: string) => void;
   getCredentials: () => DustCredentials | null;
   setCredentials: (cred: DustCredentials) => void;
-} = {
+}
+
+const NOOP_SESSION_CONTEXT: SessionContextController = {
   getSessionFile: () => undefined,
   saveConversationId: () => { /* no-op until session_start wires it up */ },
   getCredentials: () => null,
   setCredentials: () => { /* no-op until session_start wires it up */ },
 };
-
-let currentConfirmFn: (title: string, message: string) => Promise<boolean> = async () => true;
-const preApprovedActions = new Map<string, boolean>();
-let pendingApprovalPromise: Promise<void> | null = null;
-let resolveApprovalGate: (() => void) | null = null;
 
 type DustProviderModel = Model<Api> & { sId: string };
 const EMPTY_CREDENTIALS: DustCredentials = { type: "oauth", access: "", refresh: "", expires: 0 };
@@ -53,11 +45,56 @@ function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
 }
 
-function resolveCurrentApprovalGate(): void {
-  if (resolveApprovalGate) {
-    resolveApprovalGate();
-    resolveApprovalGate = null;
-    pendingApprovalPromise = null;
+class DustSessionRuntime {
+  conversationId: string | null = null;
+  mcpServerId: string | null = null;
+  mcpHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  mcpRequestsAbortController: AbortController | null = null;
+  sessionContext: SessionContextController = NOOP_SESSION_CONTEXT;
+  confirmFn: (title: string, message: string) => Promise<boolean> = async () => true;
+  preApprovedActions = new Map<string, boolean>();
+  pendingApprovalPromise: Promise<void> | null = null;
+  private resolveApprovalGateFn: (() => void) | null = null;
+
+  createApprovalGate(): void {
+    this.pendingApprovalPromise = new Promise<void>((resolve) => {
+      this.resolveApprovalGateFn = resolve;
+    });
+  }
+
+  resolveApprovalGate(): void {
+    if (this.resolveApprovalGateFn) {
+      this.resolveApprovalGateFn();
+      this.resolveApprovalGateFn = null;
+      this.pendingApprovalPromise = null;
+    }
+  }
+
+  clearMcpState(): void {
+    if (this.mcpHeartbeatTimer) {
+      clearInterval(this.mcpHeartbeatTimer);
+      this.mcpHeartbeatTimer = null;
+    }
+    if (this.mcpRequestsAbortController) {
+      this.mcpRequestsAbortController.abort();
+      this.mcpRequestsAbortController = null;
+    }
+    this.mcpServerId = null;
+    this.preApprovedActions.clear();
+    this.pendingApprovalPromise = null;
+    this.resolveApprovalGateFn = null;
+  }
+
+  resetSessionState(): void {
+    this.conversationId = null;
+    this.clearMcpState();
+  }
+
+  invalidateCurrentCredentials(credentials: DustCredentials): void {
+    debugLog("dust:session", "Invalidating current credentials");
+    this.sessionContext.setCredentials(invalidateCredentials(credentials));
+    this.conversationId = null;
+    this.clearMcpState();
   }
 }
 
@@ -70,26 +107,24 @@ function invalidateCredentials(credentials: DustCredentials): DustCredentials {
   };
 }
 
-function invalidateCurrentCredentials(credentials: DustCredentials): void {
-  debugLog("dust:session", "Invalidating current credentials");
-  currentSessionContext.setCredentials(invalidateCredentials(credentials));
-  currentConversationId = null;
-  clearMcpState();
-}
+const runtime = new DustSessionRuntime();
 
-function clearMcpState(): void {
-  if (mcpHeartbeatTimer) {
-    clearInterval(mcpHeartbeatTimer);
-    mcpHeartbeatTimer = null;
-  }
-  if (mcpRequestsAbortController) {
-    mcpRequestsAbortController.abort();
-    mcpRequestsAbortController = null;
-  }
-  currentMcpServerId = null;
-  preApprovedActions.clear();
-  pendingApprovalPromise = null;
-  resolveApprovalGate = null;
+function buildSessionContext(ctx: PiRuntimeContext): SessionContextController {
+  return {
+    getSessionFile: () => ctx.sessionManager?.getSessionFile?.(),
+    saveConversationId: (id: string) => {
+      const sessionFile = ctx.sessionManager?.getSessionFile?.();
+      if (!sessionFile) return;
+      const latestCred = ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
+      if (!latestCred) return;
+      ctx.modelRegistry.authStorage.set("dust", {
+        ...latestCred,
+        conversations: { ...(latestCred.conversations ?? {}), [sessionFile]: id },
+      });
+    },
+    getCredentials: () => ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null,
+    setCredentials: (nextCred: DustCredentials) => ctx.modelRegistry.authStorage.set("dust", nextCred),
+  };
 }
 
 async function handleToolApproveExecution(event: ToolApproveExecutionEvent): Promise<boolean> {
@@ -98,7 +133,7 @@ async function handleToolApproveExecution(event: ToolApproveExecutionEvent): Pro
   }
   const toolName = event.metadata?.toolName ?? "unknown";
   const inputs = event.inputs ?? {};
-  return currentConfirmFn(`Allow tool: ${toolName}`, buildConfirmMessage(toolName, inputs));
+  return runtime.confirmFn(`Allow tool: ${toolName}`, buildConfirmMessage(toolName, inputs));
 }
 
 async function postValidateAction(
@@ -125,25 +160,25 @@ function dustRealStream(
   options?: StreamOptionsLike,
 ) {
   const stream = createEventStream();
-  let liveCred: DustCredentials = currentSessionContext.getCredentials() ?? cred;
+  let liveCred: DustCredentials = runtime.sessionContext.getCredentials() ?? cred;
 
   (async () => {
     try {
       const signal = options?.signal;
-      liveCred = currentSessionContext.getCredentials() ?? cred;
+      liveCred = runtime.sessionContext.getCredentials() ?? cred;
       debugLog("dust:session", "Starting Dust stream", {
         modelId: model.id,
-        existingConversationId: currentConversationId,
+        existingConversationId: runtime.conversationId,
       });
 
       if (typeof liveCred.expires === "number" && liveCred.expires <= Date.now() + 30_000) {
         try {
           liveCred = await refreshToken(liveCred);
-          currentSessionContext.setCredentials(liveCred);
+          runtime.sessionContext.setCredentials(liveCred);
           debugLog("dust:session", "Pre-stream token refresh succeeded");
         } catch (err) {
           if (isSessionExpiredError(err)) {
-            invalidateCurrentCredentials(liveCred);
+            runtime.invalidateCurrentCredentials(liveCred);
             throw err;
           }
           console.error(`[dust] token refresh failed before stream: ${errorMessage(err)}`);
@@ -166,14 +201,14 @@ function dustRealStream(
 
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-      if (!currentMcpServerId) {
+      if (!runtime.mcpServerId) {
         const serverId = await registerMcpServer(baseUrl, authHeaders);
-        currentMcpServerId = serverId;
-        mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, authHeaders, serverId);
-        pendingApprovalPromise = new Promise<void>((resolve) => { resolveApprovalGate = resolve; });
+        runtime.mcpServerId = serverId;
+        runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, authHeaders, serverId);
+        runtime.createApprovalGate();
 
         const abortController = new AbortController();
-        mcpRequestsAbortController = abortController;
+        runtime.mcpRequestsAbortController = abortController;
         listenMcpRequests({
           baseUrl,
           authHeaders,
@@ -181,9 +216,9 @@ function dustRealStream(
           abortController,
           buildConfirmMessage,
           executeMcpTool,
-          getConfirmFn: () => currentConfirmFn,
-          getPendingApprovalPromise: () => pendingApprovalPromise,
-          preApprovedActions,
+          getConfirmFn: () => runtime.confirmFn,
+          getPendingApprovalPromise: () => runtime.pendingApprovalPromise,
+          preApprovedActions: runtime.preApprovedActions,
         }).catch((err) => {
           console.error(`[dust:mcp] listenMcpRequests fatal: ${err}`);
         });
@@ -195,12 +230,12 @@ function dustRealStream(
       const userText = Array.isArray(rawContent)
         ? rawContent.filter((block) => block.type === "text").map((block) => block.text ?? "").join("")
         : String(rawContent);
-      debugLog("dust:session", "Prepared user message", { userText, currentConversationId });
+      debugLog("dust:session", "Prepared user message", { userText, currentConversationId: runtime.conversationId });
 
       let conversationSId: string;
       let userMessageSId: string;
 
-      if (!currentConversationId) {
+      if (!runtime.conversationId) {
         const reqBody = {
           title: userText.substring(0, 50) + (userText.length > 50 ? "..." : ""),
           visibility: "unlisted",
@@ -211,7 +246,7 @@ function dustRealStream(
               username,
               timezone,
               origin: "cli",
-              clientSideMCPServerIds: currentMcpServerId ? [currentMcpServerId] : null,
+              clientSideMCPServerIds: runtime.mcpServerId ? [runtime.mcpServerId] : null,
             },
           },
         };
@@ -240,8 +275,8 @@ function dustRealStream(
         debugLog("dust:session", "Created Dust conversation", data);
         conversationSId = data.conversation.sId;
         userMessageSId = data.message.sId;
-        currentConversationId = conversationSId;
-        currentSessionContext.saveConversationId(conversationSId);
+        runtime.conversationId = conversationSId;
+        runtime.sessionContext.saveConversationId(conversationSId);
 
         const agentMsgSId = findAgentMessageSId(data.conversation.content, userMessageSId);
         await streamEvents({
@@ -255,11 +290,11 @@ function dustRealStream(
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
             postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
-          recordPreApproval: (actionId, approved) => preApprovedActions.set(actionId, approved),
-          resolveApprovalGate: resolveCurrentApprovalGate,
+          recordPreApproval: (actionId, approved) => runtime.preApprovedActions.set(actionId, approved),
+          resolveApprovalGate: () => runtime.resolveApprovalGate(),
         });
       } else {
-        conversationSId = currentConversationId;
+        conversationSId = runtime.conversationId;
         debugLog("dust:session", "Posting message to existing conversation", { conversationSId, userText });
 
         const msgRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}/messages`, {
@@ -275,7 +310,7 @@ function dustRealStream(
               username,
               timezone,
               origin: "cli",
-              clientSideMCPServerIds: currentMcpServerId ? [currentMcpServerId] : null,
+              clientSideMCPServerIds: runtime.mcpServerId ? [runtime.mcpServerId] : null,
             },
           }),
           signal,
@@ -320,14 +355,14 @@ function dustRealStream(
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
             postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
-          recordPreApproval: (actionId, approved) => preApprovedActions.set(actionId, approved),
-          resolveApprovalGate: resolveCurrentApprovalGate,
+          recordPreApproval: (actionId, approved) => runtime.preApprovedActions.set(actionId, approved),
+          resolveApprovalGate: () => runtime.resolveApprovalGate(),
         });
       }
     } catch (error) {
       debugLog("dust:session", "Dust stream failed", { error: errorMessage(error) });
       if (isSessionExpiredError(error)) {
-        invalidateCurrentCredentials(liveCred);
+        runtime.invalidateCurrentCredentials(liveCred);
       }
       const message = makeEmptyMessage(model);
       message.stopReason = "error";
@@ -335,7 +370,7 @@ function dustRealStream(
       stream.push({ type: "error", reason: "error", error: message });
       stream.end();
     } finally {
-      resolveCurrentApprovalGate();
+      runtime.resolveApprovalGate();
     }
   })();
 
@@ -416,8 +451,7 @@ export default function (pi: ExtensionAPI) {
   const piWithEvents = pi as ExtensionAPIWithEvents;
   debugLog("dust:init", "Initializing Dust extension");
 
-  currentConversationId = null;
-  clearMcpState();
+  runtime.resetSessionState();
 
   pi.registerProvider("dust", {
     api: "dust" as any,
@@ -450,35 +484,19 @@ export default function (pi: ExtensionAPI) {
     registerEvent("session_switch", (_event: unknown, ctx: PiRuntimeContext) => {
       const event = _event as { reason?: string };
       debugLog("dust:session", "Handling session_switch", event);
-      currentSessionContext = {
-        getSessionFile: () => ctx.sessionManager?.getSessionFile?.(),
-        saveConversationId: (id: string) => {
-          const sessionFile = ctx.sessionManager?.getSessionFile?.();
-          if (!sessionFile) return;
-          const latestCred = ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
-          if (!latestCred) return;
-          ctx.modelRegistry.authStorage.set("dust", {
-            ...latestCred,
-            conversations: { ...(latestCred.conversations ?? {}), [sessionFile]: id },
-          });
-        },
-        getCredentials: () => ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null,
-        setCredentials: (nextCred: DustCredentials) => ctx.modelRegistry.authStorage.set("dust", nextCred),
-      };
-
-      if (ctx.ui?.confirm) {
-        currentConfirmFn = (title: string, message: string) => ctx.ui!.confirm!(title, message);
-      }
+      runtime.sessionContext = buildSessionContext(ctx);
+      runtime.confirmFn = ctx.ui?.confirm
+        ? (title: string, message: string) => ctx.ui!.confirm!(title, message)
+        : async () => true;
 
       if (event.reason === "resume") {
         const sessionFile = ctx.sessionManager?.getSessionFile?.();
         const cred = ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
-        currentConversationId = (sessionFile && cred?.conversations?.[sessionFile]) ?? null;
-        clearMcpState();
-        debugLog("dust:session", "Resumed session", { currentConversationId });
+        runtime.conversationId = (sessionFile && cred?.conversations?.[sessionFile]) ?? null;
+        runtime.clearMcpState();
+        debugLog("dust:session", "Resumed session", { currentConversationId: runtime.conversationId });
       } else {
-        currentConversationId = null;
-        clearMcpState();
+        runtime.resetSessionState();
         debugLog("dust:session", "Reset session state");
       }
     });
@@ -509,31 +527,19 @@ export default function (pi: ExtensionAPI) {
       }
 
       const sessionFile = ctx.sessionManager?.getSessionFile?.();
-      currentSessionContext = {
-        getSessionFile: () => ctx.sessionManager?.getSessionFile?.(),
-        saveConversationId: (id: string) => {
-          const activeSessionFile = ctx.sessionManager?.getSessionFile?.();
-          if (!activeSessionFile) return;
-          const latestCred = ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
-          if (!latestCred) return;
-          ctx.modelRegistry.authStorage.set("dust", {
-            ...latestCred,
-            conversations: { ...(latestCred.conversations ?? {}), [activeSessionFile]: id },
-          });
-        },
-        getCredentials: () => ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null,
-        setCredentials: (nextCred: DustCredentials) => ctx.modelRegistry.authStorage.set("dust", nextCred),
-      };
-
-      if (ctx.ui?.confirm) {
-        currentConfirmFn = (title: string, message: string) => ctx.ui!.confirm!(title, message);
-      }
+      runtime.sessionContext = buildSessionContext(ctx);
+      runtime.confirmFn = ctx.ui?.confirm
+        ? (title: string, message: string) => ctx.ui!.confirm!(title, message)
+        : async () => true;
 
       const existingEntries = ctx.sessionManager?.getEntries?.() ?? [];
-      currentConversationId = existingEntries.length > 0 && sessionFile
+      runtime.conversationId = existingEntries.length > 0 && sessionFile
         ? cred.conversations?.[sessionFile] ?? null
         : null;
-      debugLog("dust:session", "Resolved persisted conversation", { currentConversationId, entryCount: existingEntries.length });
+      debugLog("dust:session", "Resolved persisted conversation", {
+        currentConversationId: runtime.conversationId,
+        entryCount: existingEntries.length,
+      });
 
       if (!cred.access) {
         buildDustProviderConfig(pi, cred);

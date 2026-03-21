@@ -108,7 +108,10 @@ Project-wide constants such as Dust headers and auth constants.
 
 ## Session state
 
-The extension keeps lightweight runtime state in memory:
+The extension keeps lightweight runtime state in memory through a dedicated
+runtime state container inside `src/dust.ts`.
+
+That container tracks:
 
 - current conversation id
 - current MCP server id
@@ -116,8 +119,8 @@ The extension keeps lightweight runtime state in memory:
 - MCP request listener abort controller
 - approval state shared between Dust SSE and MCP execution
 
-This state is reset when sessions switch, credentials are invalidated, or the
-extension needs to clear MCP state.
+This runtime state is reset when sessions switch, credentials are invalidated,
+or the extension needs to clear MCP state.
 
 ## Approval model
 
