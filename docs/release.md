@@ -35,21 +35,60 @@ Generate release notes for the current version:
 npm run changelog:release-notes
 ```
 
-## Tagging a release
-
-Typical flow:
+Validate the generated release notes:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+npm run validate:release-notes
 ```
+
+## Version bumping
+
+The repository keeps the version in `package.json` as the source of truth.
+
+Use one of the dedicated bump commands before creating a release tag:
+
+```bash
+npm run release:patch
+npm run release:minor
+npm run release:major
+```
+
+These commands update `package.json` without creating a commit or tag for you.
+This keeps the release preparation explicit and reviewable.
+
+## Recommended release flow
+
+Typical local flow:
+
+```bash
+npm run check
+npm run release:patch
+npm run changelog
+npm run changelog:release-notes
+npm run validate:release-notes
+git add package.json package-lock.json CHANGELOG.md
+git commit -m "chore(release): prepare vX.Y.Z"
+git tag vX.Y.Z
+git push origin HEAD --follow-tags
+```
+
+## Tagging a release
+
+When a tag is pushed, the release workflow validates that:
+
+- the Git tag matches `package.json` exactly
+- the standard quality gate passes
+- `CHANGELOG.md` can be generated
+- `RELEASE_NOTES.md` is non-empty and valid
 
 The release workflow then:
 
 - installs dependencies
+- validates the tag version
 - runs the quality gate
 - generates the changelog
 - generates release notes
+- validates release notes
 - publishes the GitHub release
 
 ## Repository hygiene
@@ -66,3 +105,4 @@ The project enforces quality before code leaves a workstation:
 - `commitlint.config.cjs` -> Conventional Commit rules
 - `.github/dependabot.yml` -> dependency update policy
 - `.github/workflows/*.yml` -> CI and release automation
+- `package.json` -> project version and release helper scripts

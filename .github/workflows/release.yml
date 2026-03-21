@@ -28,6 +28,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate tag matches package version
+        run: npm run validate:tag-version
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
       - name: Run quality gate
         run: npm run check
 
@@ -40,6 +45,9 @@ jobs:
         run: npm run changelog:release-notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate release notes
+        run: npm run validate:release-notes
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
