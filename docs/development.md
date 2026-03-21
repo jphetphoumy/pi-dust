@@ -4,10 +4,36 @@ This guide describes the expected development workflow for contributors.
 
 ## Local workflow
 
+### Option A: use the Nix shell
+
+If you use Nix, enter the repository dev shell first:
+
+```bash
+nix develop
+```
+
+The shell is defined in `flake.nix` and currently provides `nodejs_22`. On the
+first entry, it also installs npm dependencies automatically when
+`node_modules/` is missing.
+
+To leave the environment:
+
+```bash
+exit
+```
+
+### Option B: use a system Node.js installation
+
 ### Install dependencies
 
 ```bash
 npm install
+```
+
+Or:
+
+```bash
+make install
 ```
 
 ### Install hooks
@@ -16,16 +42,34 @@ npm install
 npm run prepare
 ```
 
+Or:
+
+```bash
+make hooks
+```
+
 ### Standard quality gate
 
 ```bash
 npm run check
 ```
 
+Or:
+
+```bash
+make check
+```
+
 ### Extended local gate before pushing
 
 ```bash
 npm run prepush
+```
+
+Or:
+
+```bash
+make prepush
 ```
 
 This runs:
@@ -89,6 +133,17 @@ npm run changelog
 npm run commitlint -- .git/COMMIT_EDITMSG
 ```
 
+Makefile shortcuts:
+
+```bash
+make help
+make test-watch
+make coverage
+make changelog
+make commitlint
+make clean
+```
+
 ## Node.js versions
 
 The CI matrix validates the project against:
@@ -98,3 +153,6 @@ The CI matrix validates the project against:
 - Node.js 24
 
 Using one of these versions locally is recommended.
+
+If you want a pinned local environment with less manual setup, prefer
+`nix develop`, which currently uses Node.js 22.
