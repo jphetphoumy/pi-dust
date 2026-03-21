@@ -1,6 +1,19 @@
 {
   "name": "pi-dust-extension",
   "version": "0.1.0",
+  "description": "Pi extension that connects Dust agents to the Pi coding agent runtime.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jphetphoumy/pi-dust.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jphetphoumy/pi-dust/issues"
+  },
+  "homepage": "https://github.com/jphetphoumy/pi-dust#readme",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
   "type": "module",
   "scripts": {
     "prepare": "simple-git-hooks",

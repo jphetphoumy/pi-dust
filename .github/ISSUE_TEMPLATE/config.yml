@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Support and usage questions
+    url: https://github.com/jphetphoumy/pi-dust/issues
+    about: Use GitHub Issues for support questions and non-sensitive bugs.
+  - name: Security policy
+    url: https://github.com/jphetphoumy/pi-dust/security/policy
+    about: Review the project's security reporting guidance.
