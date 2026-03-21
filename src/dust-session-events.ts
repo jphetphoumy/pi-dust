@@ -12,6 +12,12 @@ function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
 }
 
+function normalizeStoredCredentials(credentials: DustCredentials): DustCredentials {
+  return credentials.type === "oauth"
+    ? credentials
+    : { ...credentials, type: "oauth" };
+}
+
 export function registerDustSessionEvents(
   piWithEvents: ExtensionAPIWithEvents,
   runtime: DustSessionRuntime,
@@ -38,8 +44,9 @@ export function registerDustSessionEvents(
   });
 
   registerEvent("session_start", async (_event: unknown, ctx: PiRuntimeContext) => {
-    let cred = ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
-    if (cred?.type !== "oauth") return;
+    const storedCred = ctx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
+    if (!storedCred) return;
+    let cred = normalizeStoredCredentials(storedCred);
 
     debugLog("dust:session", "Handling session_start", {
       hasAccess: Boolean(cred.access),
@@ -50,13 +57,13 @@ export function registerDustSessionEvents(
       try {
         const refreshed = await refreshToken(cred);
         ctx.modelRegistry.authStorage.set("dust", refreshed);
-        cred = refreshed;
+        cred = normalizeStoredCredentials(refreshed);
         debugLog("dust:session", "Refreshed token during session_start");
       } catch (err) {
         if (isSessionExpiredError(err)) {
           const invalidatedCred = invalidateCredentials(cred);
           ctx.modelRegistry.authStorage.set("dust", invalidatedCred);
-          cred = invalidatedCred;
+          cred = normalizeStoredCredentials(invalidatedCred);
         }
         console.error(`[dust] token refresh failed at session_start: ${errorMessage(err)}`, err);
         debugLog("dust:session", "Token refresh failed during session_start", { error: errorMessage(err) });
@@ -95,7 +102,7 @@ export function registerDustSessionEvents(
     }
 
     if (agentFetch.agents !== null) {
-      const updatedCred = { ...cred, agents: agentFetch.agents };
+      const updatedCred = normalizeStoredCredentials({ ...cred, agents: agentFetch.agents });
       ctx.modelRegistry.authStorage.set("dust", updatedCred);
       registerProviderForCredentials(updatedCred);
       return;

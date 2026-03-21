@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { loadBootstrapDustCredentials } from "./dust-bootstrap.js";
 import { debugLog } from "./dust-debug.js";
 import { registerDustProvider } from "./dust-provider.js";
 import { DustSessionRuntime } from "./dust-runtime.js";
@@ -15,10 +16,11 @@ export default function (pi: ExtensionAPI) {
   const dustRealStream = createDustStreamHandler(runtime);
   const registerProviderForCredentials = (cred: DustCredentials) =>
     registerDustProvider(pi, cred, dustRealStream, registerProviderForCredentials);
+  const bootstrapCredentials = loadBootstrapDustCredentials() ?? EMPTY_CREDENTIALS;
 
   debugLog("dust:init", "Initializing Dust extension");
   runtime.resetSessionState();
-  registerProviderForCredentials(EMPTY_CREDENTIALS);
+  registerProviderForCredentials(bootstrapCredentials);
 
   if (typeof piWithEvents.on === "function") {
     registerDustSessionEvents(piWithEvents, runtime, registerProviderForCredentials);

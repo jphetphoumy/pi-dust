@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { Api, Model, OAuthCredentials } from "@mariozechner/pi-ai";
 import { DUST_HEADERS } from "./dust-constants.js";
 import { dustApiUrl, loginFn, refreshToken, slugify } from "./dust-auth.js";
-import type { DustAgent, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike } from "./dust-types.js";
+import type { DustAgent, DustCredentials, DustModel, LoginCallbacks, StreamContextLike, StreamOptionsLike } from "./dust-types.js";
 
 export type DustProviderModel = Model<Api> & { sId: string };
 
@@ -61,11 +61,10 @@ export function registerDustProvider(
   ) => unknown,
   onLogin?: (cred: DustCredentials) => Promise<void> | void,
 ): void {
-  const baseUrl = buildProviderBaseUrl(credentials);
-
-  pi.registerProvider("dust", {
+  const hasWorkspace = Boolean(credentials.workspaceId);
+  const models = buildRegisteredModels(credentials);
+  const providerConfig: Record<string, unknown> = {
     api: "dust" as any,
-    baseUrl,
     streamSimple: (model: unknown, context: unknown, options?: unknown) =>
       streamSimple(
         credentials,
@@ -75,18 +74,27 @@ export function registerDustProvider(
       ) as any,
     oauth: {
       name: "Dust",
-      login: async (callbacks) => {
+      login: async (callbacks: LoginCallbacks) => {
         const cred = await loginFn(callbacks);
         await onLogin?.(cred);
         return cred;
       },
-      refreshToken: async (cred) => refreshToken(cred as DustCredentials),
-      getApiKey: (cred) => (cred as DustCredentials).access ?? "",
-      modifyModels: (models, cred) => {
+      refreshToken: async (cred: OAuthCredentials) => refreshToken(cred as DustCredentials),
+      getApiKey: (cred: OAuthCredentials) => (cred as DustCredentials).access ?? "",
+      modifyModels: (models: Model<Api>[], cred: OAuthCredentials) => {
         const dustModels = buildOAuthDustModels(cred);
         return [...models.filter((entry) => entry.provider !== "dust"), ...dustModels];
       },
     },
-    models: buildRegisteredModels(credentials),
-  });
+  };
+
+  if (hasWorkspace) {
+    providerConfig.baseUrl = buildProviderBaseUrl(credentials);
+  }
+
+  if (hasWorkspace && models.length > 0) {
+    providerConfig.models = models;
+  }
+
+  pi.registerProvider("dust", providerConfig as Parameters<ExtensionAPI["registerProvider"]>[1]);
 }

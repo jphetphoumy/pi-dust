@@ -54,6 +54,32 @@ describe("dust extension", () => {
       );
     });
 
+    it("restores models from legacy stored credentials without a type field", async () => {
+      const legacyCreds = makeCredentials({
+        type: undefined,
+        agents: [],
+      });
+      const freshAgents = [{ sId: "agent-1", name: "Helper", description: "A helpful agent" }];
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: freshAgents }),
+        }),
+      );
+
+      const authStorage = { get: vi.fn().mockReturnValue(legacyCreds), set: vi.fn() };
+      const ctx = { modelRegistry: { authStorage } };
+
+      await sessionStartHandler!({}, ctx);
+
+      expect(authStorage.set).toHaveBeenCalledWith(
+        "dust",
+        expect.objectContaining({ type: "oauth", agents: freshAgents }),
+      );
+    });
+
     it("calls the correct agent_configurations endpoint for the workspace", async () => {
       const creds = makeCredentials({ workspaceId: "ws-42", region: "us-central1" });
       const fetchMock = vi.fn().mockResolvedValueOnce({

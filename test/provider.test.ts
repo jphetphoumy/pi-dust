@@ -1,8 +1,15 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { makeConversationResponse, makeCredentials, makeModel, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
+  afterEach(() => {
+    delete process.env.PI_CODING_AGENT_DIR;
+  });
+
   it("registers 'Dust' as an OAuth provider", () => {
     let registeredName: string | undefined;
     let registeredConfig: Record<string, any> | undefined;
@@ -22,6 +29,57 @@ describe("dust extension", () => {
     expect(typeof registeredConfig?.oauth?.login).toBe("function");
     expect(typeof registeredConfig?.oauth?.refreshToken).toBe("function");
     expect(typeof registeredConfig?.oauth?.getApiKey).toBe("function");
+  });
+
+  it("keeps the initial provider registration minimal before login", () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-dust-empty-auth-"));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let registeredConfig: Record<string, any> | undefined;
+
+    const mockApi = {
+      registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+        registeredConfig = config;
+      }),
+      registerCommand: vi.fn(),
+    };
+
+    dustExtension(mockApi as any);
+
+    expect(registeredConfig?.baseUrl).toBeUndefined();
+    expect("models" in (registeredConfig ?? {})).toBe(false);
+
+    rmSync(agentDir, { recursive: true, force: true });
+  });
+
+  it("bootstraps provider models from stored auth credentials before session_start", () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-dust-auth-"));
+    writeFileSync(
+      join(agentDir, "auth.json"),
+      JSON.stringify({
+        dust: makeCredentials({
+          agents: [{ sId: "agent-1", name: "Helper", description: "A helpful agent" }],
+          workspaceId: "ws-1",
+        }),
+      }),
+    );
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+
+    let registeredConfig: Record<string, any> | undefined;
+    const mockApi = {
+      registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+        registeredConfig = config;
+      }),
+      registerCommand: vi.fn(),
+    };
+
+    dustExtension(mockApi as any);
+
+    expect(registeredConfig?.baseUrl).toContain("/api/v1/w/ws-1");
+    expect(registeredConfig?.models).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "helper", name: "Helper" })]),
+    );
+
+    rmSync(agentDir, { recursive: true, force: true });
   });
   describe("modifyModels", () => {
     let modifyModelsFn: any;
