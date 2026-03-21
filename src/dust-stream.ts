@@ -17,6 +17,23 @@ import {
   unwrapEnvelope,
 } from "./dust-validation.js";
 
+const INITIAL_STREAM_RETRY_DELAY_MS = 1_000;
+const MAX_STREAM_RETRY_DELAY_MS = 30_000;
+
+function streamRetryDelay(attempt: number): number {
+  return Math.min(INITIAL_STREAM_RETRY_DELAY_MS * 2 ** attempt, MAX_STREAM_RETRY_DELAY_MS);
+}
+
+async function waitForStreamRetry(delayMs: number, signal: AbortSignal | undefined): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
 export function makeEmptyMessage(model: DustModel): AssistantMessageLike {
   return {
     role: "assistant",
@@ -125,20 +142,50 @@ export async function streamEvents({
   let fullText = "";
   const partial = makeEmptyMessage(model);
   debugLog("dust:stream", "Opening SSE stream", { conversationSId, agentMsgSId, sseUrl });
+  let reconnectAttempt = 0;
 
   reconnect: for (;;) {
-    const res = await fetch(sseUrl, {
-      headers: {
-        ...authHeaders,
-        Accept: "text/event-stream",
-      },
-      signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(sseUrl, {
+        headers: {
+          ...authHeaders,
+          Accept: "text/event-stream",
+        },
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
+      const delayMs = streamRetryDelay(reconnectAttempt);
+      debugLog("dust:stream", "SSE request threw, retrying", {
+        sseUrl,
+        delayMs,
+        attempt: reconnectAttempt + 1,
+        error: String(error),
+      });
+      await waitForStreamRetry(delayMs, signal);
+      reconnectAttempt += 1;
+      continue reconnect;
+    }
 
     if (!res.ok) {
       debugLog("dust:stream", "SSE request failed", { status: res.status, sseUrl });
       if (res.status === 401) {
         throw new Error(SESSION_EXPIRED_MESSAGE);
+      }
+      if (res.status >= 500 || res.status === 429) {
+        const delayMs = streamRetryDelay(reconnectAttempt);
+        debugLog("dust:stream", "Transient SSE failure, retrying", {
+          status: res.status,
+          sseUrl,
+          delayMs,
+          attempt: reconnectAttempt + 1,
+        });
+        await waitForStreamRetry(delayMs, signal);
+        reconnectAttempt += 1;
+        continue reconnect;
       }
       throw new Error(`Failed to stream events: HTTP ${res.status}`);
     }
@@ -146,6 +193,8 @@ export async function streamEvents({
       debugLog("dust:stream", "SSE response had no body", { sseUrl });
       throw new Error("SSE response has no body");
     }
+
+    reconnectAttempt = 0;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

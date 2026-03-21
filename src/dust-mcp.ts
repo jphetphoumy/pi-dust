@@ -4,6 +4,23 @@ import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
 import { MCP_TOOLS, type McpToolResult } from "./dust-tools.js";
 
+const INITIAL_RETRY_DELAY_MS = 1_000;
+const MAX_RETRY_DELAY_MS = 30_000;
+
+function retryDelay(attempt: number): number {
+  return Math.min(INITIAL_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+}
+
+async function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
 export async function registerMcpServer(
   baseUrl: string,
   authHeaders: Record<string, string>,
@@ -70,6 +87,7 @@ export async function listenMcpRequests({
 }: ListenMcpRequestsOptions): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
+  let reconnectAttempt = 0;
 
   while (!abortController.signal.aborted) {
     const reqUrl = lastEventId ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}` : url;
@@ -80,22 +98,27 @@ export async function listenMcpRequests({
         headers: { ...authHeaders, Accept: "text/event-stream" },
         signal: abortController.signal,
       });
-    } catch {
-      return;
+    } catch (error) {
+      if (abortController.signal.aborted) {
+        return;
+      }
+      const delayMs = retryDelay(reconnectAttempt);
+      debugLog("dust:mcp", "MCP SSE request failed, retrying", { error: String(error), delayMs, attempt: reconnectAttempt + 1 });
+      await waitForRetry(delayMs, abortController.signal);
+      reconnectAttempt += 1;
+      continue;
     }
 
     if (!res.ok || !res.body) {
       console.error(`[dust:mcp] SSE non-ok response: HTTP ${res.status}`);
-      debugLog("dust:mcp", "MCP SSE non-ok response", { status: res.status });
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 1000);
-        abortController.signal.addEventListener("abort", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
+      const delayMs = retryDelay(reconnectAttempt);
+      debugLog("dust:mcp", "MCP SSE non-ok response", { status: res.status, delayMs, attempt: reconnectAttempt + 1 });
+      await waitForRetry(delayMs, abortController.signal);
+      reconnectAttempt += 1;
       continue;
     }
+
+    reconnectAttempt = 0;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

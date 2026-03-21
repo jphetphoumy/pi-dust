@@ -25,12 +25,18 @@ describe("dust MCP runtime helpers", () => {
     vi.unstubAllGlobals();
   });
 
-  it("retries after a non-ok MCP SSE response until aborted", async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce({
-      ok: false,
-      status: 503,
-      body: null,
-    });
+  it("retries after a non-ok MCP SSE response with exponential backoff", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        body: null,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        body: null,
+      });
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal("fetch", fetchMock);
 
@@ -48,16 +54,67 @@ describe("dust MCP runtime helpers", () => {
     });
 
     await Promise.resolve();
-    abortController.abort();
     await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    abortController.abort();
+    await vi.advanceTimersByTimeAsync(2000);
     await promise;
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(errorSpy).toHaveBeenCalledWith("[dust:mcp] SSE non-ok response: HTTP 503");
+  });
+
+  it("does not open the MCP SSE request loop when already aborted", async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network down"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const abortController = new AbortController();
+    abortController.abort();
+
+    await listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      authHeaders: { Authorization: "Bearer token" },
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool: () => ({ content: [{ type: "text", text: "ok" }], isError: false }),
+      getConfirmFn: () => async () => true,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions: new Map(),
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(0);
+  });
+
+  it("retries after a thrown MCP SSE fetch until aborted", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("network down"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const abortController = new AbortController();
+    const promise = listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      authHeaders: { Authorization: "Bearer token" },
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool: () => ({ content: [{ type: "text", text: "ok" }], isError: false }),
+      getConfirmFn: () => async () => true,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions: new Map(),
+    });
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    abortController.abort();
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
   });
 
   it("ignores malformed MCP JSON frames and still responds to later valid requests", async () => {
     const postedBodies: string[] = [];
+    const abortController = new AbortController();
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({
         ok: true,
@@ -71,9 +128,9 @@ describe("dust MCP runtime helpers", () => {
       })
       .mockImplementationOnce(async (_url: string, options: { body: string }) => {
         postedBodies.push(options.body);
+        abortController.abort();
         return { ok: true, json: async () => ({ success: true }) };
-      })
-      .mockRejectedValueOnce(new Error("stop-listener"));
+      });
 
     vi.stubGlobal("fetch", fetchMock);
 
@@ -81,7 +138,7 @@ describe("dust MCP runtime helpers", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       authHeaders: { Authorization: "Bearer token" },
       serverId: "srv-1",
-      abortController: new AbortController(),
+      abortController,
       buildConfirmMessage: () => "confirm",
       executeMcpTool: () => ({ content: [{ type: "text", text: "ok" }], isError: false }),
       getConfirmFn: () => async () => true,
