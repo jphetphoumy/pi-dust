@@ -107,4 +107,17 @@ describe("dust local tools", () => {
       rmSync(allowedDir, { recursive: true, force: true });
     }
   });
+
+  it("fails gracefully when a bash command times out", () => {
+    const result = executeMcpTool("bash", { command: "sleep 1", timeout: 0.01 });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.length).toBeGreaterThan(0);
+  });
+
+  it("falls back to JSON formatting for unknown confirmation messages", () => {
+    const result = buildConfirmMessage("custom-tool", { answer: 42, nested: { ok: true } });
+
+    expect(result).toBe(JSON.stringify({ answer: 42, nested: { ok: true } }));
+  });
 });
