@@ -20,14 +20,64 @@ Main entrypoint and orchestration layer.
 
 Responsibilities:
 
-- register the Dust provider
-- keep track of current session state
-- manage the current conversation id
-- manage the MCP server lifecycle
-- wire approval flow between Dust SSE and MCP tool execution
+- bootstrap the Dust provider wiring
+- register session lifecycle hooks
+- register user-facing commands
 
 This file should stay focused on orchestration. Protocol parsing and side
 effects belong in dedicated modules.
+
+### `src/dust-provider.ts`
+
+Dust provider registration and model exposure.
+
+Responsibilities:
+
+- register the `dust` provider with Pi
+- expose Dust agents as Pi models
+- keep OAuth model mapping logic in one place
+
+### `src/dust-stream-provider.ts`
+
+Dust conversation execution and stream orchestration.
+
+Responsibilities:
+
+- refresh credentials before streaming when needed
+- create or resume Dust conversations
+- connect Dust SSE with the MCP approval flow
+- translate failures into Pi stream errors
+
+### `src/dust-runtime.ts`
+
+In-memory runtime/session state container.
+
+Responsibilities:
+
+- store the current conversation id
+- store MCP lifecycle objects
+- manage approval-gate coordination
+- bind session-specific auth storage and UI callbacks
+
+### `src/dust-session-events.ts`
+
+Pi session lifecycle integration.
+
+Responsibilities:
+
+- react to `session_start` and `session_switch`
+- restore persisted conversation ids
+- refresh agents and credentials for the active session
+
+### `src/dust-workspace.ts`
+
+Workspace command registration.
+
+Responsibilities:
+
+- expose the `/workspace` command
+- prompt the user for workspace switching
+- persist the selected workspace in auth storage
 
 ### `src/dust-auth.ts`
 
@@ -109,7 +159,7 @@ Project-wide constants such as Dust headers and auth constants.
 ## Session state
 
 The extension keeps lightweight runtime state in memory through a dedicated
-runtime state container inside `src/dust.ts`.
+runtime state container in `src/dust-runtime.ts`.
 
 That container tracks:
 
@@ -141,10 +191,15 @@ src/
   dust-constants.ts
   dust-debug.ts
   dust-mcp.ts
+  dust-provider.ts
+  dust-runtime.ts
+  dust-session-events.ts
   dust-stream.ts
+  dust-stream-provider.ts
   dust-tools.ts
   dust-types.ts
   dust-validation.ts
+  dust-workspace.ts
 
 test/
   *.test.ts
