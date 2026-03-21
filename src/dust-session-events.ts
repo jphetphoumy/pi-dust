@@ -1,10 +1,12 @@
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, fetchAgents, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
-import { applyRuntimeContext, invalidateCredentials } from "./dust-runtime.js";
+import { applyRuntimeContext, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import { errorMessage } from "./dust-validation.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
 import type { DustCredentials, ExtensionAPIWithEvents, PiRuntimeContext } from "./dust-types.js";
+
+const SESSION_START_REFRESH_SKEW_MS = 0;
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
@@ -44,7 +46,7 @@ export function registerDustSessionEvents(
       workspaceId: cred.workspaceId,
     });
 
-    if (typeof cred.expires === "number" && cred.expires <= Date.now()) {
+    if (shouldRefreshAccessToken(cred.expires, SESSION_START_REFRESH_SKEW_MS)) {
       try {
         const refreshed = await refreshToken(cred);
         ctx.modelRegistry.authStorage.set("dust", refreshed);

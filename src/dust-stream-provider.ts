@@ -6,7 +6,10 @@ import { createEventStream, findAgentMessageSId, makeEmptyMessage, streamEvents 
 import { buildConfirmMessage, executeMcpTool } from "./dust-tools.js";
 import type { DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
+import { invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
+
+const STREAM_REFRESH_SKEW_MS = 30_000;
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
@@ -233,14 +236,16 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           existingConversationId: runtime.conversationId,
         });
 
-        if (typeof liveCred.expires === "number" && liveCred.expires <= Date.now() + 30_000) {
+        // Refresh a little before expiry so a long-lived stream does not start with
+        // a token that will expire in the middle of the Dust/MCP exchange.
+        if (shouldRefreshAccessToken(liveCred.expires, STREAM_REFRESH_SKEW_MS)) {
           try {
             liveCred = await refreshToken(liveCred);
             runtime.sessionContext.setCredentials(liveCred);
             debugLog("dust:session", "Pre-stream token refresh succeeded");
           } catch (err) {
             if (isSessionExpiredError(err)) {
-              runtime.invalidateCurrentCredentials(liveCred);
+              invalidateRuntimeCredentials(runtime, liveCred);
               throw err;
             }
             console.error(`[dust] token refresh failed before stream: ${errorMessage(err)}`);
@@ -317,7 +322,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
       } catch (error) {
         debugLog("dust:session", "Dust stream failed", { error: errorMessage(error) });
         if (isSessionExpiredError(error)) {
-          runtime.invalidateCurrentCredentials(liveCred);
+          invalidateRuntimeCredentials(runtime, liveCred);
         }
         const message = makeEmptyMessage(model);
         message.stopReason = "error";

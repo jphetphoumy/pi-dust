@@ -249,5 +249,62 @@ describe("dust extension", () => {
 
       expect(events.some((e) => e.type === "done")).toBe(true);
     });
+
+    it("refreshes the access token shortly before stream startup to avoid mid-stream expiry", async () => {
+      const nearlyExpiredCreds = makeCredentials({
+        access: "old-access",
+        refresh: "valid-refresh",
+        expires: Date.now() + 10_000,
+        agents: [],
+      });
+      const refreshedToken = "fresh-access-token";
+      const streamSimple = await import("./helpers/dust-fixtures.js").then(({ makeStreamSimpleFn }) =>
+        makeStreamSimpleFn(nearlyExpiredCreds),
+      );
+
+      const fetchMock = vi.fn()
+        // pre-stream refresh
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            access_token: refreshedToken,
+            refresh_token: "new-refresh",
+            expires_in: 3600,
+          }),
+        })
+        // mcp register
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        // mcp request stream
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makePendingSseStream(),
+        })
+        // create conversation
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
+        })
+        // assistant stream
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([
+            { type: "generation_tokens", classification: "tokens", text: "Fresh token" },
+            { type: "agent_message_success" },
+          ]),
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      for await (const event of streamSimple(makeModel(), { messages: [{ role: "user", content: "Hi" }] })) {
+        events.push(event);
+      }
+
+      expect(fetchMock.mock.calls[0][1]?.body?.toString()).toContain("refresh_token");
+      expect(fetchMock.mock.calls[1][1]?.headers?.["Authorization"]).toBe(`Bearer ${refreshedToken}`);
+      expect(events.some((e) => e.type === "done")).toBe(true);
+    });
   });
 });

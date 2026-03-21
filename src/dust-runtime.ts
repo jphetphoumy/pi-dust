@@ -61,13 +61,6 @@ export class DustSessionRuntime {
     this.conversationId = null;
     this.clearMcpState();
   }
-
-  invalidateCurrentCredentials(credentials: DustCredentials): void {
-    debugLog("dust:session", "Invalidating current credentials");
-    this.sessionContext.setCredentials(invalidateCredentials(credentials));
-    this.conversationId = null;
-    this.clearMcpState();
-  }
 }
 
 export function invalidateCredentials(credentials: DustCredentials): DustCredentials {
@@ -77,6 +70,17 @@ export function invalidateCredentials(credentials: DustCredentials): DustCredent
     refresh: "",
     expires: 0,
   };
+}
+
+export function invalidateRuntimeCredentials(runtime: DustSessionRuntime, credentials: DustCredentials): void {
+  debugLog("dust:session", "Invalidating current credentials");
+  runtime.sessionContext.setCredentials(invalidateCredentials(credentials));
+  runtime.conversationId = null;
+  runtime.clearMcpState();
+}
+
+export function shouldRefreshAccessToken(expiresAt: number | undefined, skewMs = 0): boolean {
+  return typeof expiresAt === "number" && expiresAt <= Date.now() + skewMs;
 }
 
 export function buildSessionContext(ctx: PiRuntimeContext): SessionContextController {
