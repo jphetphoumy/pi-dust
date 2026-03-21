@@ -50,6 +50,7 @@
     "vitest": "^3.2.4"
   },
   "dependencies": {
+    "@mariozechner/pi-ai": "^0.61.1",
     "@mariozechner/pi-coding-agent": "^0.61.1"
   },
   "simple-git-hooks": {

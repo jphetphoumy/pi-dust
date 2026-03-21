@@ -64,7 +64,7 @@ help: ## Display available targets
 
 install: ## Install npm dependencies
 	$(call print_box,Installing project dependencies)
-	$(NPM) install
+	$(NPM) install --include=dev
 	$(call print_ok,Dependencies installed.)
 
 hooks: ## Install local git hooks

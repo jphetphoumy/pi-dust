@@ -2,3 +2,4 @@ node_modules/
 .direnv/
 coverage/
 RELEASE_NOTES.md
+.nvmrc
