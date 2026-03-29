@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import path, { join } from "path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildConfirmMessage, executeMcpTool } from "../src/dust-tools.js";
 
@@ -11,7 +11,7 @@ function makeTempDir(prefix: string): string {
 }
 
 function setAllowedPaths(...paths: string[]): void {
-  process.env.PI_DUST_ALLOWED_PATHS = paths.join(":");
+  process.env.PI_DUST_ALLOWED_PATHS = paths.join(path.delimiter);
 }
 
 afterEach(() => {
@@ -35,6 +35,40 @@ describe("dust local tools", () => {
 
       expect(result.isError).toBe(false);
       expect(result.content[0].text).toBe("line-2");
+    } finally {
+      rmSync(allowedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("clamps offset: 0 to read from the start of the file", () => {
+    const allowedDir = makeTempDir("pi-dust-offset-");
+    const filePath = join(allowedDir, "sample.txt");
+
+    try {
+      writeFileSync(filePath, "line-1\nline-2\nline-3", "utf8");
+      setAllowedPaths(allowedDir);
+
+      const result = executeMcpTool("read", { path: filePath, offset: 0, limit: 1 });
+
+      expect(result.isError).toBe(false);
+      expect(result.content[0].text).toBe("line-1");
+    } finally {
+      rmSync(allowedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("clamps limit: 0 to return at least one line", () => {
+    const allowedDir = makeTempDir("pi-dust-limit-");
+    const filePath = join(allowedDir, "sample.txt");
+
+    try {
+      writeFileSync(filePath, "line-1\nline-2\nline-3", "utf8");
+      setAllowedPaths(allowedDir);
+
+      const result = executeMcpTool("read", { path: filePath, offset: 1, limit: 0 });
+
+      expect(result.isError).toBe(false);
+      expect(result.content[0].text).toBe("line-1");
     } finally {
       rmSync(allowedDir, { recursive: true, force: true });
     }

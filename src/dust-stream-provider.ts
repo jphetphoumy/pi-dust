@@ -69,6 +69,16 @@ async function ensureMcpServer(
     preApprovedActions: runtime.preApprovedActions,
   }).catch((err) => {
     console.error(`[dust:mcp] listenMcpRequests fatal: ${err}`);
+    // If session expired, invalidate credentials so that the next stream attempt will trigger a re-login
+    if (isSessionExpiredError(err)) {
+      const credentials = runtime.sessionContext.getCredentials();
+      if (credentials) {
+        debugLog("dust:session", "MCP session expired, invalidating credentials in runtime context");
+        invalidateRuntimeCredentials(runtime, credentials);
+      } else {
+        debugLog("dust:session", "Session expired but no credentials found in runtime context — nothing to invalidate");
+      }
+    }
   });
 }
 

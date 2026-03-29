@@ -109,10 +109,25 @@ export async function listenMcpRequests({
       continue;
     }
 
-    if (!res.ok || !res.body) {
-      console.error(`[dust:mcp] SSE non-ok response: HTTP ${res.status}`);
+    if (!res.ok) {
+      if (res.status === 401) {
+        debugLog("dust:mcp", "MCP SSE session expired", { status: res.status });
+        throw new Error(SESSION_EXPIRED_MESSAGE);
+      }
+      if (res.status === 403 || res.status === 404) {
+        debugLog("dust:mcp", "MCP SSE terminal error, aborting", { status: res.status });
+        abortController.abort();
+        return;
+      }
       const delayMs = retryDelay(reconnectAttempt);
-      debugLog("dust:mcp", "MCP SSE non-ok response", { status: res.status, delayMs, attempt: reconnectAttempt + 1 });
+      debugLog("dust:mcp", "MCP SSE non-ok response, retrying", { status: res.status, delayMs, attempt: reconnectAttempt + 1 });
+      await waitForRetry(delayMs, abortController.signal);
+      reconnectAttempt += 1;
+      continue;
+    }
+    if (!res.body) {
+      const delayMs = retryDelay(reconnectAttempt);
+      debugLog("dust:mcp", "MCP SSE empty body, retrying", { delayMs, attempt: reconnectAttempt + 1 });
       await waitForRetry(delayMs, abortController.signal);
       reconnectAttempt += 1;
       continue;

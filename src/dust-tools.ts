@@ -120,8 +120,8 @@ function executeRead(args: McpToolArgs): McpToolResult {
     const resolvedPath = resolveToolPath(filePath);
     const content = readFileSync(resolvedPath, "utf8");
     const lines = content.split("\n");
-    const offset = typeof args.offset === "number" ? args.offset - 1 : 0;
-    const limit = typeof args.limit === "number" ? args.limit : undefined;
+    const offset = typeof args.offset === "number" ? Math.max(0, args.offset - 1) : 0;
+    const limit = typeof args.limit === "number" ? Math.max(1, args.limit) : undefined;
     const sliced = limit !== undefined ? lines.slice(offset, offset + limit) : lines.slice(offset);
     return { content: [{ type: "text", text: sliced.join("\n") }], isError: false };
   } catch (err: unknown) {

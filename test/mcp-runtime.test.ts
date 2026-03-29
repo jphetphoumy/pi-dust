@@ -1,5 +1,6 @@
 import { TextEncoder } from "util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
 import { listenMcpRequests, startMcpHeartbeat } from "../src/dust-mcp.js";
 
 function makeMcpRequestStream(frames: string[]): ReadableStream<Uint8Array> {
@@ -27,17 +28,8 @@ describe("dust MCP runtime helpers", () => {
 
   it("retries after a non-ok MCP SSE response with exponential backoff", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        body: null,
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        body: null,
-      });
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      .mockResolvedValueOnce({ ok: false, status: 503, body: null })
+      .mockResolvedValueOnce({ ok: false, status: 503, body: null });
     vi.stubGlobal("fetch", fetchMock);
 
     const abortController = new AbortController();
@@ -60,8 +52,49 @@ describe("dust MCP runtime helpers", () => {
     abortController.abort();
     await vi.advanceTimersByTimeAsync(2000);
     await promise;
+  });
 
-    expect(errorSpy).toHaveBeenCalledWith("[dust:mcp] SSE non-ok response: HTTP 503");
+  it("throws SESSION_EXPIRED_MESSAGE on HTTP 401 without retrying", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 401, body: null });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const abortController = new AbortController();
+    await expect(
+      listenMcpRequests({
+        baseUrl: "https://dust.test/api/v1/w/ws-1",
+        authHeaders: { Authorization: "Bearer token" },
+        serverId: "srv-1",
+        abortController,
+        buildConfirmMessage: () => "confirm",
+        executeMcpTool: () => ({ content: [{ type: "text", text: "ok" }], isError: false }),
+        getConfirmFn: () => async () => true,
+        getPendingApprovalPromise: () => null,
+        preApprovedActions: new Map(),
+      }),
+    ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([403, 404])("aborts and resolves on terminal HTTP %i without retrying", async (status) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status, body: null });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const abortController = new AbortController();
+    await listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      authHeaders: { Authorization: "Bearer token" },
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool: () => ({ content: [{ type: "text", text: "ok" }], isError: false }),
+      getConfirmFn: () => async () => true,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions: new Map(),
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(abortController.signal.aborted).toBe(true);
   });
 
   it("does not open the MCP SSE request loop when already aborted", async () => {
