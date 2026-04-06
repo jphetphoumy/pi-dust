@@ -1,4 +1,4 @@
-import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { DUST_MCP_PROTOCOL_VERSION, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
@@ -175,7 +175,7 @@ export async function listenMcpRequests({
                   jsonrpc: "2.0",
                   id: request.id,
                   result: {
-                    protocolVersion: "2025-06-18",
+                    protocolVersion: DUST_MCP_PROTOCOL_VERSION,
                     capabilities: { tools: {} },
                     serverInfo: { name: "pi-dust-extension", version: "0.1.0" },
                   },

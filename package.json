@@ -24,8 +24,8 @@
     "coverage": "vitest --run --coverage --config vitest.config.ts",
     "changelog": "git-cliff --output CHANGELOG.md",
     "changelog:release-notes": "git-cliff --current --strip header --output RELEASE_NOTES.md",
-    "validate:release-notes": "node -e \"const fs=require('fs'); const path='RELEASE_NOTES.md'; if(!fs.existsSync(path)) { console.error('RELEASE_NOTES.md was not generated'); process.exit(1); } const content=fs.readFileSync(path,'utf8').trim(); if(!content || !/^## \\[|^- |^### /m.test(content)) { console.error('RELEASE_NOTES.md is empty or invalid'); process.exit(1); }\"",
-    "validate:tag-version": "node -e \"const pkg=require('./package.json'); const tag=process.env.GITHUB_REF_NAME||''; const expected='v'+pkg.version; if(!tag) { console.error('GITHUB_REF_NAME is required'); process.exit(1); } if(tag !== expected) { console.error('Tag '+tag+' does not match package.json version '+expected); process.exit(1); }\"",
+    "validate:release-notes": "node scripts/validate-release-notes.mjs",
+    "validate:tag-version": "node scripts/validate-tag-version.mjs",
     "release:patch": "npm version patch --no-git-tag-version",
     "release:minor": "npm version minor --no-git-tag-version",
     "release:major": "npm version major --no-git-tag-version",
@@ -59,7 +59,7 @@
     "commit-msg": "npm run commitlint -- \"$1\""
   },
   "pi": {
-    "extension": [
+    "extensions": [
       "./src/dust.ts"
     ],
     "icon": "./icon.png"

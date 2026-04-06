@@ -10,3 +10,5 @@ export const DUST_HEADERS = {
   "User-Agent": "Dust CLI",
   "X-Dust-CLI-Version": DUST_CLI_VERSION,
 };
+
+export const DUST_MCP_PROTOCOL_VERSION = "2025-06-18";

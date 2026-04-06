@@ -53,7 +53,7 @@ npm install
 Or:
 
 ```bash
-make install
+just install
 ```
 
 ## Install local git hooks
@@ -65,7 +65,7 @@ npm run prepare
 Or:
 
 ```bash
-make hooks
+just hooks
 ```
 
 This installs:
@@ -83,7 +83,7 @@ npm run check
 Or:
 
 ```bash
-make check
+just check
 ```
 
 This runs:
@@ -101,7 +101,7 @@ npm run coverage
 Or:
 
 ```bash
-make coverage
+just coverage
 ```
 
 ## Main development commands
@@ -114,15 +114,15 @@ npm run typecheck
 npm run changelog
 ```
 
-Equivalent Make targets are available:
+Equivalent Just targets are available:
 
 ```bash
-make test
-make test-watch
-make lint
-make typecheck
-make changelog
-make prepush
+just test
+just test-watch
+just lint
+just typecheck
+just changelog
+just prepush
 ```
 
 ## Repository structure
@@ -150,8 +150,8 @@ npm run check
 
 ```bash
 nix develop
-make hooks
-make check
+just hooks
+just check
 ```
 
 ## Where to go next

@@ -1,5 +1,5 @@
 import { execSync } from "child_process";
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, realpathSync, writeFileSync } from "fs";
 import { delimiter, isAbsolute, relative, resolve } from "path";
 import type { McpToolArgs } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
@@ -68,7 +68,7 @@ function configuredAllowedPaths(): string[] {
     .filter((entry) => entry.length > 0);
 
   const candidates = configured && configured.length > 0 ? configured : [process.cwd()];
-  return [...new Set(candidates.map((entry) => resolve(entry)))];
+  return [...new Set(candidates.map((entry) => realpathSync(resolve(entry))))];
 }
 
 function isPathAllowed(targetPath: string, basePath: string): boolean {
@@ -82,7 +82,7 @@ function resolveToolPath(filePath: string): string {
     throw new Error("Path is required");
   }
 
-  const resolvedPath = resolve(normalizedPath);
+  const resolvedPath = realpathSync(resolve(normalizedPath));
   const allowedPaths = configuredAllowedPaths();
 
   if (!allowedPaths.some((basePath) => isPathAllowed(resolvedPath, basePath))) {
@@ -94,7 +94,12 @@ function resolveToolPath(filePath: string): string {
 
 function displayPath(filePath: string): string {
   const normalizedPath = filePath.trim();
-  return normalizedPath.length > 0 ? resolve(normalizedPath) : normalizedPath;
+  if (normalizedPath.length === 0) return normalizedPath;
+  try {
+    return realpathSync(normalizedPath);
+  } catch {
+    return resolve(normalizedPath);
+  }
 }
 
 function executeBash(args: McpToolArgs): McpToolResult {

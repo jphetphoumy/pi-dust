@@ -33,7 +33,7 @@ npm install
 Or:
 
 ```bash
-make install
+just install
 ```
 
 ### Install hooks
@@ -45,7 +45,7 @@ npm run prepare
 Or:
 
 ```bash
-make hooks
+just hooks
 ```
 
 ### Standard quality gate
@@ -57,7 +57,7 @@ npm run check
 Or:
 
 ```bash
-make check
+just check
 ```
 
 ### Extended local gate before pushing
@@ -69,7 +69,7 @@ npm run prepush
 Or:
 
 ```bash
-make prepush
+just prepush
 ```
 
 This runs:
@@ -133,15 +133,15 @@ npm run changelog
 npm run commitlint -- .git/COMMIT_EDITMSG
 ```
 
-Makefile shortcuts:
+Justfile shortcuts:
 
 ```bash
-make help
-make test-watch
-make coverage
-make changelog
-make commitlint
-make clean
+just help
+just test-watch
+just coverage
+just changelog
+just commitlint
+just clean
 ```
 
 ## Node.js versions

@@ -17,7 +17,7 @@ export function registerDustWorkspaceCommand(pi: ExtensionAPI): void {
 
       const workspaces: Workspace[] = cred.workspaces;
       const current = workspaces.find((workspace) => workspace.sId === cred.workspaceId);
-      const currentName = current?.name ?? cred.workspaceId;
+      const currentName = current?.name ?? cred.workspaceId ?? "Unknown";
       const selected = await runtimeCtx.ui?.select?.(
         `Current workspace: ${currentName}`,
         workspaces.map(workspaceLabel),

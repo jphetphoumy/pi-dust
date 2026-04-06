@@ -27,18 +27,19 @@ npm run prepare
 npm run check
 ```
 
-Or, with the Makefile shortcuts:
+Or, with the justfile shortcuts:
 
 ```bash
-make setup-dev
-make check
+just setup-dev
+just check
 ```
 
 If you use Nix, the repository also provides a dev shell:
 
 ```bash
 nix develop
-make check
+just setup-dev
+just check
 ```
 
 For verbose development:
