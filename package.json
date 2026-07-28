@@ -42,7 +42,7 @@
     "@typescript-eslint/eslint-plugin": "^8.65.0",
     "@typescript-eslint/parser": "^8.65.0",
     "@vitest/coverage-v8": "^4.1.10",
-    "eslint": "^9.39.4",
+    "eslint": "^10.8.0",
     "git-cliff": "^2.13.1",
     "globals": "^17.4.0",
     "simple-git-hooks": "^2.13.1",
