@@ -56,7 +56,7 @@ The project is organized as 15 TypeScript modules in `src/`, each with a single 
 ## Tech Stack
 
 - **Language:** TypeScript 5.9 (strict, ES2023, NodeNext modules, ESM)
-- **Runtime:** Node.js ^20.19.0 || ^22.13.0 || >=24
+- **Runtime:** Node.js >=22.19.0 (required by `pi-ai` / `pi-coding-agent`)
 - **Framework:** `@mariozechner/pi-ai` + `@mariozechner/pi-coding-agent`
 - **Tests:** Vitest 3 with v8 coverage
 - **Linting:** ESLint 9 with TypeScript plugin
