@@ -234,11 +234,12 @@ describe("dust stream runtime helpers", () => {
     );
   });
 
-  it("emits a final done event when the SSE stream ends without a success event", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
-      ok: true,
-      body: makeSseBody([]),
-    }));
+  it("retries a quiet stream before giving up, then emits done", async () => {
+    // Dust caps each agent event stream at 60s and expects the client to
+    // resume, so a closed stream is not the end of the turn. Only after several
+    // silent windows do we conclude the turn is over.
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, body: makeSseBody([]) });
+    vi.stubGlobal("fetch", fetchMock);
 
     const stream = createEventStream();
     const events: unknown[] = [];
@@ -246,7 +247,7 @@ describe("dust stream runtime helpers", () => {
       for await (const event of stream) events.push(event);
     })();
 
-    await streamEvents({
+    const promise = streamEvents({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
@@ -259,18 +260,80 @@ describe("dust stream runtime helpers", () => {
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
     });
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await promise;
     await read;
 
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
     expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "done", reason: "stop" }),
       ]),
     );
   });
-
   it("throws when no matching agent message is found", () => {
     expect(() => findAgentMessageSId([[{ type: "user_message", sId: "u1" }]], "u1")).toThrow(
       "No agent message found in conversation content",
     );
+  });
+});
+
+describe("dust stream resumption", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it("resumes mid-turn instead of reporting the turn complete", async () => {
+    // Dust closes the events stream after 60s even while the agent is still
+    // working. Treating that as completion truncated long turns: the assistant
+    // message stopped mid-sentence with stopReason "stop".
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        body: makeSseBody([{ type: "generation_tokens", classification: "tokens", text: "working" }]),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: makeSseBody([
+          { type: "generation_tokens", classification: "tokens", text: " done" },
+          { type: "agent_message_success" },
+        ]),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stream = createEventStream();
+    const events: unknown[] = [];
+    const read = (async () => {
+      for await (const event of stream) events.push(event);
+    })();
+
+    const promise = streamEvents({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      conversationSId: "conv-1",
+      agentMsgSId: "msg-1",
+      authHeaders: { Authorization: "Bearer token" },
+      signal: undefined,
+      stream,
+      model: { id: "agent-1", api: "dust", provider: "dust" },
+      handleToolApproveExecution: async () => true,
+      postValidateAction: async () => undefined,
+      recordPreApproval: () => undefined,
+      resolveApprovalGate: () => undefined,
+    });
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await promise;
+    await read;
+
+    // The second window must have been opened, and with a cursor.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).toContain("lastEventId=");
+
+    // The turn completes only once the terminal event arrives, carrying the
+    // text from both windows.
+    const done = events.find((e: any) => e.type === "done") as any;
+    expect(done.message.content[0].text).toBe("working done");
   });
 });

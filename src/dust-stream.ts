@@ -19,6 +19,7 @@ import {
 
 const INITIAL_STREAM_RETRY_DELAY_MS = 1_000;
 const MAX_STREAM_RETRY_DELAY_MS = 30_000;
+const MAX_IDLE_RECONNECTS = 3;
 
 function streamRetryDelay(attempt: number): number {
   return Math.min(INITIAL_STREAM_RETRY_DELAY_MS * 2 ** attempt, MAX_STREAM_RETRY_DELAY_MS);
@@ -152,6 +153,11 @@ export async function streamEvents({
   // reconnects again. That is a non-terminating loop with a stuck tool.
   let lastEventId: string | null = null;
 
+  // A window that delivered events means the agent is still working, so the
+  // close is Dust's 60s cap rather than the end of the turn.
+  let sawAnyEvent = false;
+  let idleReconnects = 0;
+
   reconnect: for (;;) {
     const sseUrl = lastEventId
       ? `${baseSseUrl}?lastEventId=${encodeURIComponent(lastEventId)}`
@@ -238,6 +244,7 @@ export async function streamEvents({
               if (isRecord(parsed) && typeof parsed.eventId === "string") {
                 lastEventId = parsed.eventId;
               }
+              sawAnyEvent = true;
 
               const event = unwrapEnvelope(parsed);
               const eventType = getDustEventType(event);
@@ -327,6 +334,30 @@ export async function streamEvents({
     }
 
     if (shouldReconnect) continue reconnect;
+
+    // Reaching here means the stream closed without a terminal event. Dust caps
+    // each agent event stream at 60s server-side ("Do not loop forever, we will
+    // timeout ... to avoid blocking the load balancer") and writes `data: done`,
+    // expecting the client to resume from lastEventId. Treating that close as
+    // completion truncated every turn longer than a minute mid-work, reporting
+    // stopReason "stop" while the agent was still going.
+    if (sawAnyEvent) {
+      idleReconnects = 0;
+      sawAnyEvent = false;
+      debugLog("dust:stream", "Stream window closed, resuming", { lastEventId });
+      continue reconnect;
+    }
+
+    // Nothing arrived in this window either; give up after a few quiet rounds so
+    // a genuinely dead stream cannot spin forever.
+    idleReconnects += 1;
+    if (idleReconnects < MAX_IDLE_RECONNECTS) {
+      debugLog("dust:stream", "Quiet stream window, retrying", { idleReconnects, lastEventId });
+      await waitForStreamRetry(streamRetryDelay(idleReconnects - 1), signal);
+      continue reconnect;
+    }
+
+    debugLog("dust:stream", "Stream ended without a terminal event", { idleReconnects, lastEventId });
     break reconnect;
   }
 
