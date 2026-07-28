@@ -46,7 +46,7 @@
     "git-cliff": "^2.13.1",
     "globals": "^17.8.0",
     "simple-git-hooks": "^2.13.1",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
   "dependencies": {
