@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
-import { makeCredentials, makeFakeJwt, makeLoginFetchMock, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
+import { makeCredentials, makeFakeJwt, makeLoginFetchMock, makePendingSseStream, makeSseStream, readState, seedAuth, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
+  useTempAgentDir();
   describe("session_start: fresh agent fetch", () => {
     let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
 
@@ -43,15 +44,12 @@ describe("dust extension", () => {
         })
       );
 
-      const authStorage = { get: vi.fn().mockReturnValue(creds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
 
       await sessionStartHandler!({}, ctx);
 
-      expect(authStorage.set).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({ agents: freshAgents })
-      );
+      expect(readState()).toMatchObject({ agents: freshAgents });
     });
 
     it("restores models from legacy stored credentials without a type field", async () => {
@@ -69,15 +67,12 @@ describe("dust extension", () => {
         }),
       );
 
-      const authStorage = { get: vi.fn().mockReturnValue(legacyCreds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(legacyCreds);
+      const ctx = { modelRegistry: {} };
 
       await sessionStartHandler!({}, ctx);
 
-      expect(authStorage.set).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({ type: "oauth", agents: freshAgents }),
-      );
+      expect(readState()).toMatchObject({ agents: freshAgents });
     });
 
     it("calls the correct agent_configurations endpoint for the workspace", async () => {
@@ -88,7 +83,8 @@ describe("dust extension", () => {
       });
       vi.stubGlobal("fetch", fetchMock);
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(fetchMock.mock.calls[0][0]).toContain("ws-42");
@@ -103,7 +99,8 @@ describe("dust extension", () => {
       });
       vi.stubGlobal("fetch", fetchMock);
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(fetchMock.mock.calls[0][1]?.headers?.["Authorization"]).toBe("Bearer my-access-token");
@@ -117,7 +114,8 @@ describe("dust extension", () => {
       });
       vi.stubGlobal("fetch", fetchMock);
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(fetchMock.mock.calls[0][1]?.headers?.["User-Agent"]).toBe("Dust CLI");
@@ -128,7 +126,8 @@ describe("dust extension", () => {
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(undefined), set: vi.fn() } } };
+      seedAuth(null);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(fetchMock).not.toHaveBeenCalled();
@@ -138,14 +137,15 @@ describe("dust extension", () => {
       const creds = makeCredentials();
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 500 }));
 
-      const authStorage = { get: vi.fn().mockReturnValue(creds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
 
       // must not throw
       let threw = false;
       try { await sessionStartHandler!({}, ctx); } catch { threw = true; }
       expect(threw).toBe(false);
-      expect(authStorage.set).not.toHaveBeenCalled();
+      // A failed fetch must leave the previously stored agents untouched.
+      expect(readState()).toMatchObject({ agents: creds.agents });
     });
 
     it("re-registers the provider with fresh agents after session_start fetch", async () => {
@@ -174,9 +174,8 @@ describe("dust extension", () => {
       };
       dustExtension(mockApi as any);
 
-      const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
-      };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(lastRegisteredModels).toBeDefined();
@@ -212,8 +211,8 @@ describe("dust extension", () => {
         });
       vi.stubGlobal("fetch", fetchMock);
 
-      const authStorage = { get: vi.fn().mockReturnValue(expiredCreds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(expiredCreds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       // Token refresh was called first
@@ -225,13 +224,7 @@ describe("dust extension", () => {
       expect(agentCall[1]?.headers?.["Authorization"]).toBe(`Bearer ${freshToken}`);
 
       // Updated credentials stored with new token and fresh agents
-      expect(authStorage.set).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({
-          access: freshToken,
-          agents: freshAgents,
-        })
-      );
+      expect(readState()).toMatchObject({ agents: freshAgents });
     });
 
     it("uses the stored token without refreshing when the token is still valid", async () => {
@@ -248,7 +241,8 @@ describe("dust extension", () => {
       });
       vi.stubGlobal("fetch", fetchMock);
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(validCreds), set: vi.fn() } } };
+      seedLoggedIn(validCreds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       // Only one fetch call (agent fetch, no token refresh)
@@ -261,7 +255,8 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 401 }));
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("401"), expect.anything());
@@ -273,14 +268,11 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 401 }));
       vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const authStorage = { get: vi.fn().mockReturnValue(creds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
-      expect(authStorage.set).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({ access: "", refresh: "", expires: 0 })
-      );
+      expect(readState()).toMatchObject({ invalidated: true });
     });
 
     it("logs an error to console.error when the agent fetch throws a network error", async () => {
@@ -288,7 +280,8 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("network failure")));
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("network failure"), expect.anything());
@@ -306,15 +299,12 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 400 }));
       vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const authStorage = { get: vi.fn().mockReturnValue(expiredCreds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(expiredCreds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
       // Should not wipe out stale agents — no credential update with empty agents
-      const setCall = authStorage.set.mock.calls.find(
-        ([, c]: [string, any]) => Array.isArray(c.agents) && c.agents.length === 0
-      );
-      expect(setCall).toBeUndefined();
+      expect(readState().agents).not.toEqual([]);
     });
 
     it("invalidates credentials when token refresh returns 401 at session_start", async () => {
@@ -327,14 +317,11 @@ describe("dust extension", () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 401 }));
       vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const authStorage = { get: vi.fn().mockReturnValue(expiredCreds), set: vi.fn() };
-      const ctx = { modelRegistry: { authStorage } };
+      seedLoggedIn(expiredCreds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
 
-      expect(authStorage.set).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({ access: "", refresh: "", expires: 0 })
-      );
+      expect(readState()).toMatchObject({ invalidated: true });
       expect((globalThis as any).fetch).toHaveBeenCalledTimes(1);
     });
   });
@@ -347,10 +334,10 @@ describe("dust extension", () => {
     /** Shared setup: registers dust extension and fires session_start to bake credentials. */
     async function setupHandlers(sessionFile = "/sessions/s1.json", conversations: Record<string, string> = {}) {
       const creds = makeCredentials({ conversations });
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
       let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
-      const authStorageSet = vi.fn();
 
       const mockApi = {
         registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
@@ -372,12 +359,7 @@ describe("dust extension", () => {
       }));
 
       const makeCtx = (file: string | undefined, entries: unknown[] = []) => ({
-        modelRegistry: {
-          authStorage: {
-            get: vi.fn().mockReturnValue({ ...creds }),
-            set: authStorageSet,
-          },
-        },
+        modelRegistry: {},
         sessionManager: {
           getSessionFile: vi.fn().mockReturnValue(file),
           getEntries: vi.fn().mockReturnValue(entries),
@@ -387,7 +369,7 @@ describe("dust extension", () => {
       await sessionStartHandler!({}, makeCtx(sessionFile, []));
       vi.unstubAllGlobals();
 
-      return { capturedStreamSimple, sessionSwitchHandler, makeCtx, authStorageSet, creds };
+      return { capturedStreamSimple, sessionSwitchHandler, makeCtx, creds };
     }
 
     const model = {
@@ -527,27 +509,22 @@ describe("dust extension", () => {
 
     it("persists newly-created conversation ID in credentials storage", async () => {
       const sessionFile = "/sessions/s1.json";
-      const { capturedStreamSimple, authStorageSet } = await setupHandlers(sessionFile);
+      const { capturedStreamSimple  } = await setupHandlers(sessionFile);
 
       const fetchMock = makeConvFetch("conv-persisted", "msg-1");
       vi.stubGlobal("fetch", fetchMock);
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Store me" }] });
       for await (const _ of stream) { /* drain */ }
 
-      // authStorage.set must have been called with conversations map containing the session file
-      const setCall = authStorageSet.mock.calls.find(
-        ([_key, val]: any[]) => val?.conversations?.[sessionFile]
-      );
-      expect(setCall).toBeDefined();
-      expect(setCall![1].conversations[sessionFile]).toBe("conv-persisted");
+      expect(readState().conversations).toMatchObject({ [sessionFile]: "conv-persisted" });
     });
 
     it("after resume, persists new conversation under the RESUMED session file, not the original", async () => {
       const originalFile = "/sessions/s1.json";
       const resumedFile = "/sessions/s2.json";
-      const authStorageSet = vi.fn();
 
       const creds = makeCredentials();
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
       let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
@@ -570,7 +547,7 @@ describe("dust extension", () => {
         json: () => Promise.resolve({ agentConfigurations: creds.agents }),
       }));
       const makeCtxFor = (file: string) => ({
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue({ ...creds }), set: authStorageSet } },
+        modelRegistry: {},
         sessionManager: { getSessionFile: vi.fn().mockReturnValue(file), getEntries: vi.fn().mockReturnValue([]) },
       });
       await sessionStartHandler!({}, makeCtxFor(originalFile));
@@ -586,16 +563,9 @@ describe("dust extension", () => {
       for await (const _ of stream) { /* drain */ }
 
       // Conversation must be saved under resumedFile, NOT originalFile
-      const setCall = authStorageSet.mock.calls.find(
-        ([_key, val]: any[]) => val?.conversations?.[resumedFile]
-      );
-      expect(setCall).toBeDefined();
-      expect(setCall![1].conversations[resumedFile]).toBe("conv-for-resumed");
-      // originalFile must not have been set
-      const badCall = authStorageSet.mock.calls.find(
-        ([_key, val]: any[]) => val?.conversations?.[originalFile] === "conv-for-resumed"
-      );
-      expect(badCall).toBeUndefined();
+      const conversations = readState().conversations as Record<string, string>;
+      expect(conversations[resumedFile]).toBe("conv-for-resumed");
+      expect(conversations[originalFile]).not.toBe("conv-for-resumed");
     });
   });
 
@@ -608,6 +578,7 @@ describe("dust extension", () => {
       const sessionFile = "/sessions/old.json";
       const existingConvId = "conv-from-last-time";
       const creds = makeCredentials({ conversations: { [sessionFile]: existingConvId } });
+      seedLoggedIn(creds);
 
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
@@ -632,7 +603,7 @@ describe("dust extension", () => {
       await sessionStartHandler!(
         {},
         {
-          modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+          modelRegistry: {},
           sessionManager: {
             getSessionFile: vi.fn().mockReturnValue(sessionFile),
             getEntries: vi.fn().mockReturnValue([{ type: "message" }]), // non-empty = resume
@@ -691,6 +662,7 @@ describe("dust extension", () => {
     it("starts fresh when session has no entries (new session at startup)", async () => {
       const sessionFile = "/sessions/new.json";
       const creds = makeCredentials();
+      seedLoggedIn(creds);
 
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
@@ -714,7 +686,7 @@ describe("dust extension", () => {
       await sessionStartHandler!(
         {},
         {
-          modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+          modelRegistry: {},
           sessionManager: {
             getSessionFile: vi.fn().mockReturnValue(sessionFile),
             getEntries: vi.fn().mockReturnValue([]), // empty = fresh start

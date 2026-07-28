@@ -48,6 +48,31 @@ Responsibilities:
 - connect Dust SSE with the MCP approval flow
 - translate failures into Pi stream errors
 
+### `src/dust-state.ts`
+
+Persistence, split across two files.
+
+pi 0.81 removed `ModelRegistry.authStorage` from the extension API, so
+`auth.json` became pi's private store. Ownership is now:
+
+- **pi owns the OAuth token trio** (`access` / `refresh` / `expires`) in
+  `auth.json`. It rotates them by calling the `oauth.refreshToken` hook that
+  `dust-provider.ts` registers, and persists the result itself.
+- **the extension owns Dust state** in `dust-state.json`: `workspaceId`,
+  `workspaces`, `agents`, `region`, `username`, the per-session
+  `conversations` map, and an `invalidated` flag.
+
+Responsibilities:
+
+- merge both halves into the `DustCredentials` view the rest of the code uses
+- persist only the state half, never tokens
+- carry over legacy installs that kept state inside the auth.json credential
+- write state atomically (temp file + rename)
+
+The `invalidated` flag replaces the old "zero the tokens" trick: the extension
+can no longer blank pi's copy, so it records the dead session itself and masks
+the tokens on read until the next successful login.
+
 ### `src/dust-runtime.ts`
 
 In-memory runtime/session state container.
@@ -57,7 +82,7 @@ Responsibilities:
 - store the current conversation id
 - store MCP lifecycle objects
 - manage approval-gate coordination
-- bind session-specific auth storage and UI callbacks
+- bind session-specific persistence and UI callbacks
 
 ### `src/dust-session-events.ts`
 
@@ -77,7 +102,7 @@ Responsibilities:
 
 - expose the `/workspace` command
 - prompt the user for workspace switching
-- persist the selected workspace in auth storage
+- persist the selected workspace in extension state
 
 ### `src/dust-auth.ts`
 
@@ -122,6 +147,7 @@ Provided tools:
 
 - `bash`
 - `read`
+- `write` (create or overwrite — `edit` is substitution-only and cannot create)
 - `edit`
 
 The module also formats the confirmation message shown to the user before a
@@ -194,6 +220,7 @@ src/
   dust-provider.ts
   dust-runtime.ts
   dust-session-events.ts
+  dust-state.ts
   dust-stream.ts
   dust-stream-provider.ts
   dust-tools.ts

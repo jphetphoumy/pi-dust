@@ -7,9 +7,11 @@ import {
   invalidateRuntimeCredentials,
   shouldRefreshAccessToken,
 } from "../src/dust-runtime.js";
-import { makeCredentials } from "./helpers/dust-fixtures.js";
+import { makeCredentials, readState, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust runtime", () => {
+  useTempAgentDir();
+
   it("creates and resolves the approval gate", async () => {
     const runtime = new DustSessionRuntime();
     runtime.createApprovalGate();
@@ -41,36 +43,29 @@ describe("dust runtime", () => {
     expect(runtime.pendingApprovalPromise).toBeNull();
   });
 
-  it("buildSessionContext persists conversation ids in auth storage", () => {
-    const storedCred = makeCredentials({ conversations: { old: "conv-old" } });
-    const authStorage = {
-      get: vi.fn().mockReturnValue(storedCred),
-      set: vi.fn(),
-    };
+  it("buildSessionContext persists conversation ids in extension state", () => {
+    seedLoggedIn(makeCredentials({ conversations: { old: "conv-old" } }));
     const ctx = {
-      modelRegistry: { authStorage },
+      modelRegistry: {},
       sessionManager: { getSessionFile: vi.fn().mockReturnValue("session-a") },
     } as any;
 
     const sessionContext = buildSessionContext(ctx);
     sessionContext.saveConversationId("conv-123");
 
-    expect(authStorage.set).toHaveBeenCalledWith(
-      "dust",
-      expect.objectContaining({
-        conversations: {
-          old: "conv-old",
-          "session-a": "conv-123",
-        },
-      }),
-    );
+    expect(readState()).toMatchObject({
+      conversations: {
+        old: "conv-old",
+        "session-a": "conv-123",
+      },
+    });
   });
 
   it("applyRuntimeContext wires the UI confirm callback", async () => {
     const runtime = new DustSessionRuntime();
     const confirm = vi.fn().mockResolvedValue(false);
     const ctx = {
-      modelRegistry: { authStorage: { get: vi.fn(), set: vi.fn() } },
+      modelRegistry: {},
       ui: { confirm },
     } as any;
 
@@ -80,11 +75,11 @@ describe("dust runtime", () => {
     expect(confirm).toHaveBeenCalledWith("Allow tool", "details");
   });
 
-  it("invalidateRuntimeCredentials clears tokens and runtime state", () => {
+  it("invalidateRuntimeCredentials marks state invalidated and clears runtime state", () => {
     const runtime = new DustSessionRuntime();
-    const authStorage = { get: vi.fn(), set: vi.fn() };
+    seedLoggedIn(makeCredentials());
     const ctx = {
-      modelRegistry: { authStorage },
+      modelRegistry: {},
       sessionManager: { getSessionFile: vi.fn().mockReturnValue("session-a") },
     } as any;
 
@@ -96,10 +91,7 @@ describe("dust runtime", () => {
     const cred = makeCredentials({ access: "access-1", refresh: "refresh-1" });
     invalidateRuntimeCredentials(runtime, cred);
 
-    expect(authStorage.set).toHaveBeenCalledWith(
-      "dust",
-      expect.objectContaining({ access: "", refresh: "", expires: 0 }),
-    );
+    expect(readState()).toMatchObject({ invalidated: true });
     expect(runtime.conversationId).toBeNull();
     expect(runtime.mcpServerId).toBeNull();
     expect(runtime.preApprovedActions.size).toBe(0);

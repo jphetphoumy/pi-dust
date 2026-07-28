@@ -3,9 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
-import { makeConversationResponse, makeCredentials, makeModel, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
+import { makeConversationResponse, makeCredentials, makeModel, makePendingSseStream, makeSseStream, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
+  useTempAgentDir();
   afterEach(() => {
     delete process.env.PI_CODING_AGENT_DIR;
   });
@@ -212,7 +213,8 @@ describe("dust extension", () => {
         ok: true,
         json: () => Promise.resolve({ agentConfigurations: creds.agents }),
       }));
-      const ctx = { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } } };
+      seedLoggedIn(creds);
+      const ctx = { modelRegistry: {} };
       await sessionStartHandler!({}, ctx);
       vi.unstubAllGlobals();
     });

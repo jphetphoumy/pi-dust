@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { OAuthCredentials } from "@mariozechner/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { OAuthCredentials } from "@earendil-works/pi-ai";
 
 export type Workspace = { sId: string; name: string; role: string };
 export type DustAgent = { sId: string; name: string; description: string };
@@ -18,11 +18,6 @@ export interface DustCredentials extends OAuthCredentials {
   conversations?: Record<string, string>;
 }
 
-export interface AuthStorage {
-  get(key: string): unknown;
-  set(key: string, value: unknown): void;
-}
-
 export interface SessionManagerLike {
   getSessionFile?: () => string | undefined;
   getEntries?: () => unknown[];
@@ -34,10 +29,20 @@ export interface UiLike {
   select?: WorkspaceSelector;
 }
 
+/**
+ * pi 0.81 removed `ModelRegistry.authStorage`. What remains that we care about
+ * is `getProviderAuth`, which resolves a provider's current API key and, for
+ * OAuth providers, drives pi's refresh-and-persist path.
+ */
+export interface ModelRegistryLike {
+  getProviderAuth?: (providerId: string) => Promise<{
+    auth?: { apiKey?: string; headers?: Record<string, string> };
+    source?: string;
+  }>;
+}
+
 export interface PiRuntimeContext {
-  modelRegistry: {
-    authStorage: AuthStorage;
-  };
+  modelRegistry?: ModelRegistryLike;
   sessionManager?: SessionManagerLike;
   ui?: UiLike;
 }
@@ -65,6 +70,7 @@ export interface ChatMessageLike {
 }
 
 export interface StreamContextLike {
+  systemPrompt?: string;
   messages?: ChatMessageLike[];
 }
 

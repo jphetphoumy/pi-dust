@@ -1,14 +1,15 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { workspaceLabel } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
-import type { DustCredentials, PiRuntimeContext, Workspace } from "./dust-types.js";
+import { getStoredCredentials, patchDustState } from "./dust-state.js";
+import type { PiRuntimeContext, Workspace } from "./dust-types.js";
 
 export function registerDustWorkspaceCommand(pi: ExtensionAPI): void {
   pi.registerCommand("workspace", {
     description: "Show current Dust workspace and switch between workspaces",
     handler: async (_args, ctx) => {
       const runtimeCtx = ctx as PiRuntimeContext;
-      const cred = runtimeCtx.modelRegistry.authStorage.get("dust") as DustCredentials | null;
+      const cred = getStoredCredentials();
 
       if (!cred || !Array.isArray(cred.workspaces) || cred.workspaces.length === 0) {
         runtimeCtx.ui?.notify?.("Not logged in to Dust. Run /login first.", "warning");
@@ -28,7 +29,7 @@ export function registerDustWorkspaceCommand(pi: ExtensionAPI): void {
       const picked = workspaces.find((workspace) => workspaceLabel(workspace) === selected);
       if (!picked || picked.sId === cred.workspaceId) return;
 
-      runtimeCtx.modelRegistry.authStorage.set("dust", { ...cred, workspaceId: picked.sId });
+      patchDustState({ workspaceId: picked.sId });
       debugLog("dust:session", "Switched workspace", { from: cred.workspaceId, to: picked.sId, name: picked.name });
       runtimeCtx.ui?.notify?.(`Switched to workspace: ${picked.name}`, "info");
     },

@@ -1,8 +1,111 @@
-import { vi } from "vitest";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, vi } from "vitest";
 import dustExtension from "../../src/dust.js";
+
+const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+
+let currentAgentDir: string | null = null;
+
+export function agentDir(): string {
+  if (!currentAgentDir) {
+    throw new Error("useTempAgentDir() must be installed before touching the store");
+  }
+  return currentAgentDir;
+}
+
+/**
+ * Points the extension's file-backed store at a throwaway directory.
+ *
+ * Since pi 0.81 there is no injectable AuthStorage, so `auth.json` (pi's, read
+ * only) and `dust-state.json` (ours) are read from disk under
+ * PI_CODING_AGENT_DIR. Tests seed and assert on those files instead of mocking
+ * a registry object.
+ */
+export function useTempAgentDir(): void {
+  let previous: string | undefined;
+
+  beforeEach(() => {
+    previous = process.env[PI_AGENT_DIR_ENV];
+    currentAgentDir = mkdtempSync(join(tmpdir(), "pi-dust-test-"));
+    process.env[PI_AGENT_DIR_ENV] = currentAgentDir;
+  });
+
+  afterEach(() => {
+    if (previous === undefined) {
+      delete process.env[PI_AGENT_DIR_ENV];
+    } else {
+      process.env[PI_AGENT_DIR_ENV] = previous;
+    }
+    if (currentAgentDir) {
+      rmSync(currentAgentDir, { recursive: true, force: true });
+    }
+    currentAgentDir = null;
+  });
+}
+
+function writeJson(name: string, value: unknown): void {
+  const dir = agentDir();
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), JSON.stringify(value, null, 2), "utf8");
+}
+
+function readJson<T>(name: string): T | null {
+  try {
+    return JSON.parse(readFileSync(join(agentDir(), name), "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** Seeds pi's auth.json with a `dust` credential. */
+export function seedAuth(credentials: Record<string, unknown> | null): void {
+  writeJson("auth.json", credentials === null ? {} : { dust: credentials });
+}
+
+/** Seeds the extension-owned state file. */
+export function seedState(state: Record<string, unknown>): void {
+  writeJson("dust-state.json", state);
+}
+
+/** Reads back the extension-owned state file. */
+export function readState(): Record<string, unknown> {
+  return readJson<Record<string, unknown>>("dust-state.json") ?? {};
+}
+
+/** Reads back pi's auth.json `dust` entry, to assert we never wrote to it. */
+export function readAuth(): Record<string, unknown> | null {
+  return readJson<Record<string, unknown>>("auth.json")?.dust as Record<string, unknown> ?? null;
+}
+
+/**
+ * Seeds both halves from a single credential object, the way a logged-in
+ * install looks: tokens in auth.json, Dust state in dust-state.json.
+ */
+export function seedLoggedIn(credentials: Record<string, unknown>): void {
+  const { access, refresh, expires, type, ...state } = credentials;
+  seedAuth({ type: type ?? "oauth", access, refresh, expires });
+  seedState(state);
+}
 
 type Workspace = { sId: string; name: string; role: string };
 type DustAgent = { sId: string; name: string; description: string };
+
+/**
+ * Context fields pi's own tools read during execute().
+ *
+ * Tool calls from Dust run pi's built-in implementations, which reach into the
+ * ExtensionContext: bash needs `sessionManager.getSessionId()`, `model` and
+ * `thinkingLevel` for PI_SESSION_ID and friends; read consults `model.input` to
+ * decide whether images may be returned. Real pi supplies all of these.
+ */
+export function piToolContextFields(): Record<string, unknown> {
+  return {
+    model: { id: "test-model", provider: "dust", input: ["text"] },
+    thinkingLevel: "off",
+  };
+}
 
 export function makePendingSseStream(): ReadableStream<Uint8Array> {
   return new ReadableStream({ start() { /* never enqueue, never close */ } });
@@ -128,6 +231,7 @@ export function makeModel() {
 
 export async function makeStreamSimpleFn(credOverrides: Record<string, unknown> = {}): Promise<any> {
   const creds = makeCredentials(credOverrides);
+  seedLoggedIn(creds);
   let capturedStreamSimple: any;
   let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
 
@@ -150,9 +254,7 @@ export async function makeStreamSimpleFn(credOverrides: Record<string, unknown> 
   }));
 
   const ctx = {
-    modelRegistry: {
-      authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() },
-    },
+    modelRegistry: {},
     sessionManager: {
       getSessionFile: vi.fn().mockReturnValue(undefined),
       getEntries: vi.fn().mockReturnValue([]),

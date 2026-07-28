@@ -1,9 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
-import { makeCredentials } from "./helpers/dust-fixtures.js";
+import {
+  makeCredentials,
+  readState,
+  seedAuth,
+  seedLoggedIn,
+  seedState,
+  useTempAgentDir,
+} from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
   describe("/workspace command", () => {
+    useTempAgentDir();
+
     let workspaceFn: (args: string, ctx: any) => Promise<void>;
 
     beforeEach(() => {
@@ -21,31 +30,26 @@ describe("dust extension", () => {
     });
 
     it("notifies if not logged in (no credentials)", async () => {
-      const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(undefined) } },
-        ui: { notify: vi.fn(), select: vi.fn() },
-      };
+      seedAuth(null);
+      const ctx = { modelRegistry: {}, ui: { notify: vi.fn(), select: vi.fn() } };
       await workspaceFn("", ctx);
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/log.?in/i), "warning");
       expect(ctx.ui.select).not.toHaveBeenCalled();
     });
 
     it("notifies if credentials have no workspace list (old login)", async () => {
-      const ctx = {
-        modelRegistry: {
-          authStorage: { get: vi.fn().mockReturnValue({ type: "oauth", workspaceId: "ws-1" }) },
-        },
-        ui: { notify: vi.fn(), select: vi.fn() },
-      };
+      seedAuth({ type: "oauth", access: "tok", refresh: "ref", expires: Date.now() + 3600_000 });
+      seedState({ workspaceId: "ws-1" });
+      const ctx = { modelRegistry: {}, ui: { notify: vi.fn(), select: vi.fn() } };
       await workspaceFn("", ctx);
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/log.?in/i), "warning");
       expect(ctx.ui.select).not.toHaveBeenCalled();
     });
 
     it("shows select with current workspace name in title and all workspaces as options", async () => {
-      const creds = makeCredentials();
+      seedLoggedIn(makeCredentials());
       const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+        modelRegistry: {},
         ui: { notify: vi.fn(), select: vi.fn().mockResolvedValue(undefined) },
       };
       await workspaceFn("", ctx);
@@ -56,38 +60,35 @@ describe("dust extension", () => {
       );
     });
 
-    it("updates workspaceId in credentials when user selects a different workspace", async () => {
-      const creds = makeCredentials();
+    it("updates workspaceId in state when user selects a different workspace", async () => {
+      seedLoggedIn(makeCredentials());
       const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+        modelRegistry: {},
         ui: { notify: vi.fn(), select: vi.fn().mockResolvedValue("Personal (member)") },
       };
       await workspaceFn("", ctx);
-      expect(ctx.modelRegistry.authStorage.set).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({ workspaceId: "ws-2" })
-      );
+      expect(readState()).toMatchObject({ workspaceId: "ws-2" });
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Personal"), "info");
     });
 
-    it("does not update credentials when user cancels the selector", async () => {
-      const creds = makeCredentials();
+    it("does not update state when user cancels the selector", async () => {
+      seedLoggedIn(makeCredentials());
       const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+        modelRegistry: {},
         ui: { notify: vi.fn(), select: vi.fn().mockResolvedValue(undefined) },
       };
       await workspaceFn("", ctx);
-      expect(ctx.modelRegistry.authStorage.set).not.toHaveBeenCalled();
+      expect(readState()).toMatchObject({ workspaceId: "ws-1" });
     });
 
-    it("does not update credentials when user selects the already active workspace", async () => {
-      const creds = makeCredentials();
+    it("does not update state when user selects the already active workspace", async () => {
+      seedLoggedIn(makeCredentials());
       const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+        modelRegistry: {},
         ui: { notify: vi.fn(), select: vi.fn().mockResolvedValue("Acme Corp (admin)") },
       };
       await workspaceFn("", ctx);
-      expect(ctx.modelRegistry.authStorage.set).not.toHaveBeenCalled();
+      expect(readState()).toMatchObject({ workspaceId: "ws-1" });
     });
   });
 });

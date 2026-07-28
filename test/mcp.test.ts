@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { makeCredentials, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
+import { piToolContextFields, readState, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
+  useTempAgentDir();
   // ---------------------------------------------------------------------------
   // MCP server management
   // ---------------------------------------------------------------------------
@@ -10,10 +12,10 @@ describe("dust extension", () => {
   describe("MCP server management", () => {
     async function setupWithMcp(conversations: Record<string, string> = {}) {
       const creds = makeCredentials({ conversations });
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
       let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
-      const authStorageSet = vi.fn();
 
       const mockApi = {
         registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
@@ -34,19 +36,20 @@ describe("dust extension", () => {
       }));
 
       const makeCtx = (file: string | undefined = "/sessions/s1.json", entries: unknown[] = []) => ({
-        modelRegistry: {
-          authStorage: { get: vi.fn().mockReturnValue({ ...creds }), set: authStorageSet },
-        },
+        modelRegistry: {},
+        ...piToolContextFields(),
         sessionManager: {
           getSessionFile: vi.fn().mockReturnValue(file),
           getEntries: vi.fn().mockReturnValue(entries),
+
+          getSessionId: vi.fn().mockReturnValue("test-session"),
         },
       });
 
       await sessionStartHandler!({}, makeCtx());
       vi.unstubAllGlobals();
 
-      return { capturedStreamSimple, sessionSwitchHandler, makeCtx, authStorageSet, creds };
+      return { capturedStreamSimple, sessionSwitchHandler, makeCtx, creds };
     }
 
     const model = {
@@ -130,6 +133,7 @@ describe("dust extension", () => {
 
     it("POST /mcp/register sends Authorization Bearer token", async () => {
       const creds = makeCredentials({ access: "mcp-access-token" });
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((e: unknown, ctx: any) => Promise<void>) | undefined;
 
@@ -145,7 +149,8 @@ describe("dust extension", () => {
         json: () => Promise.resolve({ agentConfigurations: creds.agents }),
       }));
       const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
+        modelRegistry: {},
+        ...piToolContextFields(),
         sessionManager: { getSessionFile: vi.fn().mockReturnValue("/s/s1.json"), getEntries: vi.fn().mockReturnValue([]) },
       };
       await sessionStartHandler!({}, ctx);
@@ -344,7 +349,6 @@ describe("dust extension", () => {
 
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
-      const authStorageSet = vi.fn();
       let storedCreds = { ...expiredCreds };
 
       const mockApi = {
@@ -374,25 +378,22 @@ describe("dust extension", () => {
 
       vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const authStorage = {
-        get: vi.fn(() => storedCreds),
-        set: vi.fn((key: string, val: any) => {
-          authStorageSet(key, val);
-          storedCreds = val;
-        }),
-      };
+      seedLoggedIn(storedCreds);
       const ctx = {
-        modelRegistry: { authStorage },
+        modelRegistry: {},
+        ...piToolContextFields(),
         sessionManager: {
           getSessionFile: vi.fn().mockReturnValue("/sessions/s1.json"),
           getEntries: vi.fn().mockReturnValue([]),
+
+          getSessionId: vi.fn().mockReturnValue("test-session"),
         },
       };
       await sessionStartHandler!({}, ctx);
       vi.unstubAllGlobals();
       vi.restoreAllMocks();
 
-      return { capturedStreamSimple, freshCreds, expiredCreds, authStorage, authStorageSet };
+      return { capturedStreamSimple, freshCreds, expiredCreds };
     }
 
     const model = { id: "helper", sId: "agentSId-1", name: "Helper", provider: "dust", api: "dust" };
@@ -449,8 +450,8 @@ describe("dust extension", () => {
       expect(mcpAuthHeader).toBe(`Bearer ${freshCreds.access}`);
     });
 
-    it("persists refreshed token to authStorage", async () => {
-      const { capturedStreamSimple, freshCreds, authStorageSet } = await setupWithExpiredCreds();
+    it("uses the refreshed token without writing tokens into extension state", async () => {
+      const { capturedStreamSimple, freshCreds } = await setupWithExpiredCreds();
 
       vi.stubGlobal("fetch", vi.fn()
         .mockResolvedValueOnce({
@@ -484,10 +485,15 @@ describe("dust extension", () => {
 
       for await (const _ of capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] })) { /* drain */ }
 
-      const setCall = authStorageSet.mock.calls.find(
-        ([, c]: [string, any]) => c.access === freshCreds.access
-      );
-      expect(setCall).toBeDefined();
+      const calls = (globalThis.fetch as any).mock.calls;
+      const mcpCall = calls.find(([url]: [string]) => url.includes("/mcp/register"));
+      expect(mcpCall[1]?.headers?.Authorization).toBe(`Bearer ${freshCreds.access}`);
+
+      // pi owns the token trio; our state file must never carry it.
+      const state = readState();
+      expect(state).not.toHaveProperty("access");
+      expect(state).not.toHaveProperty("refresh");
+      expect(state).not.toHaveProperty("expires");
     });
 
     it("continues with stale token if refresh fails with a non-auth error, and surfaces the downstream failure", async () => {
@@ -511,8 +517,8 @@ describe("dust extension", () => {
       expect(errorEvent.error.errorMessage).toMatch(/session expired/i);
     });
 
-    it("invalidates stored credentials when refresh returns 401 before streaming", async () => {
-      const { capturedStreamSimple, authStorageSet } = await setupWithExpiredCreds();
+    it("marks the session invalidated when refresh returns 401 before streaming", async () => {
+      const { capturedStreamSimple } = await setupWithExpiredCreds();
 
       vi.spyOn(console, "error").mockImplementation(() => {});
       vi.stubGlobal("fetch", vi.fn()
@@ -527,10 +533,7 @@ describe("dust extension", () => {
       const errorEvent = events.find((e: any) => e.type === "error");
       expect(errorEvent).toBeDefined();
       expect(errorEvent.error.errorMessage).toMatch(/session expired/i);
-      expect(authStorageSet).toHaveBeenCalledWith(
-        "dust",
-        expect.objectContaining({ access: "", refresh: "", expires: 0 })
-      );
+      expect(readState()).toMatchObject({ invalidated: true });
     });
   });
 
@@ -557,6 +560,7 @@ describe("dust extension", () => {
 
     async function setupWithMcpListener(tools: { name: string; description: string; inputSchema: Record<string, unknown> }[] = []) {
       const creds = makeCredentials();
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
 
@@ -577,8 +581,13 @@ describe("dust extension", () => {
         json: () => Promise.resolve({ agentConfigurations: creds.agents }),
       }));
       const ctx = {
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } },
-        sessionManager: { getSessionFile: vi.fn().mockReturnValue("/s/s1.json"), getEntries: vi.fn().mockReturnValue([]) },
+        modelRegistry: {},
+        ...piToolContextFields(),
+        sessionManager: {
+          getSessionFile: vi.fn().mockReturnValue("/s/s1.json"),
+          getEntries: vi.fn().mockReturnValue([]),
+          getSessionId: vi.fn().mockReturnValue("test-session"),
+        },
       };
       await sessionStartHandler!({}, ctx);
       vi.unstubAllGlobals();
@@ -628,6 +637,48 @@ describe("dust extension", () => {
         url.includes("/mcp/requests") && url.includes("srv-42")
       );
       expect(mcpRequestsCall).toBeDefined();
+    });
+
+    it("resumes from the envelope eventId after the stream ends, instead of replaying", async () => {
+      const { capturedStreamSimple } = await setupWithMcpListener();
+
+      // Dust emits no SSE `id:` lines — the cursor is `eventId` inside the JSON
+      // envelope, and each stream ends with a bare `data: done`. Losing the
+      // cursor makes the reconnect replay the Redis stream from the start and
+      // re-run past tools/call requests.
+      const firstStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ eventId: "evt-7", data: { jsonrpc: "2.0", id: "r1", method: "ping" } })}\n\n`,
+          ));
+          controller.enqueue(encoder.encode("data: done\n\n"));
+          controller.close();
+        },
+      });
+
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "srv-cursor", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        .mockResolvedValueOnce({ ok: true, body: firstStream })
+        // Reconnect: must carry lastEventId. Park it so the loop stops here.
+        .mockResolvedValue({ ok: true, body: makePendingSseStream() });
+
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
+      for await (const _ of stream) { /* drain */ }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const reconnect = fetchMock.mock.calls
+        .map(([url]: [string]) => String(url))
+        .filter((url) => url.includes("/mcp/requests"))
+        .find((url) => url.includes("lastEventId"));
+
+      expect(reconnect).toBeDefined();
+      expect(reconnect).toContain("lastEventId=evt-7");
     });
 
     it("responds to tools/list with tools in MCP format", async () => {
@@ -706,6 +757,8 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
+      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
       const resultBody = JSON.parse(resultPostCall[1].body);
@@ -742,6 +795,8 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
+      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
       expect(resultPostCall).toBeDefined();
@@ -774,6 +829,8 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
+      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
       const resultBody = JSON.parse(resultPostCall[1].body);
@@ -803,6 +860,8 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
+      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
       const resultBody = JSON.parse(resultPostCall[1].body);
@@ -813,6 +872,7 @@ describe("dust extension", () => {
 
     it("POST /mcp/results sends Authorization Bearer token", async () => {
       const creds = makeCredentials({ access: "results-access-token" });
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((e: unknown, ctx: any) => Promise<void>) | undefined;
       const mockApi = {
@@ -822,7 +882,7 @@ describe("dust extension", () => {
       };
       dustExtension(mockApi as any);
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ agentConfigurations: creds.agents }) }));
-      await sessionStartHandler!({}, { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } }, sessionManager: { getSessionFile: vi.fn().mockReturnValue("/s/s.json"), getEntries: vi.fn().mockReturnValue([]) } });
+      await sessionStartHandler!({}, { modelRegistry: {}, sessionManager: { getSessionFile: vi.fn().mockReturnValue("/s/s.json"), getEntries: vi.fn().mockReturnValue([]) } });
       vi.unstubAllGlobals();
 
       const callRequest = { jsonrpc: "2.0", id: "req-bash-2", method: "tools/call", params: { name: "bash", arguments: { command: "echo auth-test" } } };
@@ -838,6 +898,8 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple({ id: "agent-sonnet", sId: "agentSId-1", name: "AgentSonnet", provider: "dust", api: "dust" }, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
+      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
       expect(resultPostCall![1].headers["Authorization"]).toBe("Bearer results-access-token");
@@ -851,6 +913,7 @@ describe("dust extension", () => {
   describe("tool_params visibility in pi stream", () => {
     async function setupStreamFn() {
       const creds = makeCredentials();
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
       const mockApi = {
@@ -860,14 +923,14 @@ describe("dust extension", () => {
       };
       dustExtension(mockApi as any);
       vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ agentConfigurations: creds.agents }) }));
-      await sessionStartHandler!({}, { modelRegistry: { authStorage: { get: vi.fn().mockReturnValue(creds), set: vi.fn() } }, sessionManager: { getSessionFile: vi.fn().mockReturnValue("/s/s.json"), getEntries: vi.fn().mockReturnValue([]) } });
+      await sessionStartHandler!({}, { modelRegistry: {}, sessionManager: { getSessionFile: vi.fn().mockReturnValue("/s/s.json"), getEntries: vi.fn().mockReturnValue([]) } });
       vi.unstubAllGlobals();
       return capturedStreamSimple;
     }
 
     const model = { id: "agent-sonnet", sId: "agentSId-1", name: "AgentSonnet", provider: "dust", api: "dust" };
 
-    it("emits a text_delta indicating tool name when tool_params event is received", async () => {
+    it("does not emit tool marker text, since tool calls render as their own entry", async () => {
       const capturedStreamSimple = await setupStreamFn();
 
       const fetchMock = vi.fn()
@@ -890,8 +953,8 @@ describe("dust extension", () => {
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Run bash" }] });
       for await (const e of stream) events.push(e);
 
-      const toolDeltas = events.filter((e) => e.type === "text_delta" && e.delta.toLowerCase().includes("bash"));
-      expect(toolDeltas.length).toBeGreaterThan(0);
+      const toolDeltas = events.filter((e) => e.type === "text_delta" && e.delta.includes("[Tool:"));
+      expect(toolDeltas).toHaveLength(0);
     });
   });
 });

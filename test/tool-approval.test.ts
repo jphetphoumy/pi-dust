@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { makeConversationResponse, makeCredentials, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
+import { piToolContextFields, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
+  useTempAgentDir();
   describe("tool_approve_execution", () => {
     beforeEach(() => {
       vi.spyOn(console, "error").mockImplementation(() => {});
@@ -15,6 +17,7 @@ describe("dust extension", () => {
      */
     async function setupWithConfirm(confirmFn: (title: string, message: string) => Promise<boolean>) {
       const creds = makeCredentials();
+      seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
       let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
@@ -38,10 +41,13 @@ describe("dust extension", () => {
       }));
 
       const makeCtx = (file = "/sessions/s1.json") => ({
-        modelRegistry: { authStorage: { get: vi.fn().mockReturnValue({ ...creds }), set: vi.fn() } },
+        modelRegistry: {},
+        ...piToolContextFields(),
         sessionManager: {
           getSessionFile: vi.fn().mockReturnValue(file),
           getEntries: vi.fn().mockReturnValue([]),
+
+          getSessionId: vi.fn().mockReturnValue("test-session"),
         },
         ui: { confirm: confirmFn },
       });
@@ -395,6 +401,9 @@ describe("dust extension", () => {
       // NOT a second time when tools/call arrives.
       expect(confirmFn).toHaveBeenCalledTimes(1);
 
+      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
       // The tool result must have been POSTed to /mcp/results (tool was executed)
       const mcpResultCall = fetchMock.mock.calls.find(([url]: [string]) =>
         url.includes("/mcp/results")
@@ -520,6 +529,74 @@ describe("dust extension", () => {
 
       // And a done event
       expect(events.some((e) => e.type === "done")).toBe(true);
+    });
+
+    // Test 10
+    it("resumes the agent stream from lastEventId so the reconnect does not replay text", async () => {
+      const confirmFn = vi.fn().mockResolvedValue(true);
+      const { capturedStreamSimple } = await setupWithConfirm(confirmFn);
+
+      const approveEvent = {
+        type: "tool_approve_execution",
+        actionId: "action-10",
+        conversationId: "conv-tool-2",
+        messageId: "amsg-3",
+        stake: "medium",
+        inputs: { command: "echo hi" },
+        metadata: { toolName: "bash" },
+      };
+
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-srv-4", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationResponse("conv-tool-2", "umsg-3", "amsg-3")),
+        })
+        // First events stream: some text, then the approval that forces a reconnect.
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([
+            { type: "generation_tokens", classification: "tokens", text: "Working on it." },
+            approveEvent,
+          ]),
+        })
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) })
+        // Reconnect stream: only the continuation, because the cursor was sent.
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([
+            { type: "generation_tokens", classification: "tokens", text: " Done." },
+            { type: "agent_message_success" },
+          ]),
+        })
+        .mockResolvedValue({ ok: true, json: () => Promise.resolve({}) });
+
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      for await (const e of capturedStreamSimple(model, { messages: [{ role: "user", content: "Run it" }] })) {
+        events.push(e);
+      }
+
+      // The reconnect must carry the cursor from the last envelope it saw.
+      const eventStreamCalls = fetchMock.mock.calls
+        .map(([url]: [string]) => String(url))
+        .filter((url) => url.includes("/events"));
+      expect(eventStreamCalls.length).toBeGreaterThan(1);
+      expect(eventStreamCalls[0]).not.toContain("lastEventId");
+      expect(eventStreamCalls[1]).toContain("lastEventId=");
+
+      // Without the cursor Dust replays from 0-0 and the opening text is
+      // appended a second time, which is what produced the duplicated
+      // transcript in the TUI.
+      const done = events.find((e) => e.type === "done");
+      const finalText = done.message.content[0].text as string;
+      expect(finalText.match(/Working on it\./g) ?? []).toHaveLength(1);
+      expect(finalText).toContain(" Done.");
     });
   });
 });

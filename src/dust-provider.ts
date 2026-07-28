@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { Api, Model, OAuthCredentials } from "@mariozechner/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, OAuthCredentials } from "@earendil-works/pi-ai";
 import { DUST_HEADERS } from "./dust-constants.js";
 import { dustApiUrl, loginFn, refreshToken, slugify } from "./dust-auth.js";
 import type { DustAgent, DustCredentials, DustModel, LoginCallbacks, StreamContextLike, StreamOptionsLike } from "./dust-types.js";
