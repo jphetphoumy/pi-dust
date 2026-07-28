@@ -55,8 +55,8 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported through the security and support channels documented in
-[`SECURITY.md`](SECURITY.md) and [`SUPPORT.md`](SUPPORT.md).
+reported through the security channel documented in
+[`SECURITY.md`](SECURITY.md).
 
 All complaints will be reviewed and investigated promptly and fairly.
 
