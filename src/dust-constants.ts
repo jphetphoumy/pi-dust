@@ -6,6 +6,10 @@ export const DUST_EU_URL = "https://eu.dust.tt";
 export const DUST_CLI_VERSION = "0.4.4";
 export const SESSION_EXPIRED_MESSAGE = "Dust session expired — run /logout then /login to re-authenticate.";
 
+/** Name registered with Dust; tools are exposed as `<slugified name>__<tool>`. */
+export const MCP_SERVER_NAME = "pi-dust-extension";
+export const MCP_TOOL_PREFIX = "pi_dust_extension";
+
 export const DUST_HEADERS = {
   "User-Agent": "Dust CLI",
   "X-Dust-CLI-Version": DUST_CLI_VERSION,

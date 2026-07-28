@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeConversationGetResponse, makeConversationResponse, makeModel, makePendingSseStream, makeRawSseStream, makeSseStream, makeStreamSimpleFn } from "./helpers/dust-fixtures.js";
+import { useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
+  useTempAgentDir();
   // ---------------------------------------------------------------------------
   // streamSimple — first message (creates new conversation)
   // ---------------------------------------------------------------------------
@@ -78,7 +80,11 @@ describe("dust extension", () => {
         url.includes("assistant/conversations") && !url.includes("/messages")
       )!;
       const body = JSON.parse(postCall[1].body);
-      expect(body.message.content).toBe("What is 2+2?");
+      // The user's text is preceded by a preamble steering the agent to the
+      // local pi_dust_extension__* tools rather than Dust's remote files__*.
+      expect(body.message.content).toContain("What is 2+2?");
+      expect(body.message.content).toContain("pi_dust_extension__write");
+      expect(body.message.content).toContain("files__create");
     });
 
     it("createConversation body has mentions with model.sId", async () => {
