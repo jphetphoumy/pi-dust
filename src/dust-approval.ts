@@ -9,13 +9,15 @@ const STATUS_KEY = "dust-approval";
 /**
  * Claude Code binds auto-accept to shift+tab, but pi reserves that for
  * `app.thinking.cycle` and refuses extension shortcuts that collide with a
- * built-in ("conflicts with built-in shortcut. Skipping."). shift+ctrl+a is
- * free and follows pi's own shift+ctrl+* pattern.
+ * built-in ("conflicts with built-in shortcut. Skipping.").
  *
- * To actually get shift+tab, remap the built-in in ~/.pi/agent/keybindings.json
- * ("app.thinking.cycle" to something else) and set PI_DUST_APPROVAL_SHORTCUT.
+ * ctrl+shift+space is unreserved and close to the muscle memory. It relies on
+ * the Kitty keyboard protocol to tell ctrl+space and ctrl+shift+space apart —
+ * pi enables that where the terminal supports it (Kitty, Ghostty, WezTerm,
+ * iTerm2, recent VS Code). On a terminal without it the key may not arrive at
+ * all; use /auto, or set PI_DUST_APPROVAL_SHORTCUT to something plainer.
  */
-const DEFAULT_TOGGLE_SHORTCUT = "shift+ctrl+a";
+const DEFAULT_TOGGLE_SHORTCUT = "ctrl+shift+space";
 const SHORTCUT_ENV = "PI_DUST_APPROVAL_SHORTCUT";
 
 function describe(autoApprove: boolean): string {

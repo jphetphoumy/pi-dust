@@ -85,7 +85,7 @@ describe("dust approval mode", () => {
     applyRuntimeContext(runtime, ctx);
     const { shortcuts } = register(runtime);
 
-    const handler = shortcuts.get("shift+ctrl+a");
+    const handler = shortcuts.get("ctrl+shift+space");
     expect(handler).toBeDefined();
 
     handler!(ctx);
