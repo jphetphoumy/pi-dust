@@ -25,7 +25,7 @@ tool bridge (`bash`, `read`, `edit`) with local approval.
 |-------------|---------|
 | Pi (`pi` CLI) | `0.82.x` (tested with `0.82.0`) |
 | `@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui` | `^0.82.1` |
-| Node.js | `^20.19.0 \|\| ^22.13.0 \|\| >=24` |
+| Node.js | `>=22.19.0` (required by `pi-ai` / `pi-coding-agent`) |
 
 Check your local Pi version with:
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { makeConversationResponse, makeCredentials, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
-import { piToolContextFields, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
+import { piToolContextFields, seedLoggedIn, useTempAgentDir, waitForMcpResult } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
   useTempAgentDir();
@@ -401,15 +401,8 @@ describe("dust extension", () => {
       // NOT a second time when tools/call arrives.
       expect(confirmFn).toHaveBeenCalledTimes(1);
 
-      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
       // The tool result must have been POSTed to /mcp/results (tool was executed)
-      const mcpResultCall = fetchMock.mock.calls.find(([url]: [string]) =>
-        url.includes("/mcp/results")
-      );
-      expect(mcpResultCall).toBeDefined();
-      const body = JSON.parse(mcpResultCall![1].body);
+      const body = await waitForMcpResult(fetchMock, "tc-req-1");
       expect(body.result.result?.isError).toBe(false);
     });
 
