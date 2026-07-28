@@ -1,7 +1,7 @@
 import { DUST_HEADERS, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
-import { listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
+import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
 import { createEventStream, findAgentMessageSId, makeEmptyMessage, streamEvents } from "./dust-stream.js";
 import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
@@ -82,14 +82,24 @@ async function ensureMcpServer(
 
   const serverId = await registerMcpServer(baseUrl, authHeaders);
   runtime.mcpServerId = serverId;
-  runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, authHeaders, serverId);
+
+  // The listener and heartbeat outlive the access token that registered the
+  // server, so they must not close over the headers used above. Re-read the
+  // stored credential each time and fall back to those headers only if nothing
+  // is stored yet.
+  const getAuthHeaders = (): Record<string, string> => {
+    const access = runtime.sessionContext.getCredentials()?.access;
+    return access ? buildAuthHeaders(access) : authHeaders;
+  };
+
+  runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, getAuthHeaders, serverId);
   runtime.createApprovalGate();
 
   const abortController = new AbortController();
   runtime.mcpRequestsAbortController = abortController;
   listenMcpRequests({
     baseUrl,
-    authHeaders,
+    getAuthHeaders,
     serverId,
     abortController,
     buildConfirmMessage,
@@ -115,6 +125,11 @@ async function ensureMcpServer(
     getPendingApprovalPromise: () => runtime.pendingApprovalPromise,
     preApprovedActions: runtime.preApprovedActions,
   }).catch((err) => {
+    // Shutting the session down aborts the listener; that is not a failure.
+    if (isAbortError(err, abortController.signal)) {
+      debugLog("dust:mcp", "MCP listener stopped by abort");
+      return;
+    }
     console.error(`[dust:mcp] listenMcpRequests fatal: ${err}`);
     // If session expired, invalidate credentials so that the next stream attempt will trigger a re-login
     if (isSessionExpiredError(err)) {

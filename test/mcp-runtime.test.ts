@@ -35,7 +35,7 @@ describe("dust MCP runtime helpers", () => {
     const abortController = new AbortController();
     const promise = listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -63,7 +63,7 @@ describe("dust MCP runtime helpers", () => {
     await expect(
       listenMcpRequests({
         baseUrl: "https://dust.test/api/v1/w/ws-1",
-        authHeaders: { Authorization: "Bearer token" },
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
         serverId: "srv-1",
         abortController,
         buildConfirmMessage: () => "confirm",
@@ -85,7 +85,7 @@ describe("dust MCP runtime helpers", () => {
     const abortController = new AbortController();
     await listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -109,7 +109,7 @@ describe("dust MCP runtime helpers", () => {
 
     await listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -130,7 +130,7 @@ describe("dust MCP runtime helpers", () => {
     const abortController = new AbortController();
     const promise = listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -174,7 +174,7 @@ describe("dust MCP runtime helpers", () => {
 
     await listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -198,7 +198,7 @@ describe("dust MCP runtime helpers", () => {
 
     const timer = startMcpHeartbeat(
       "https://dust.test/api/v1/w/ws-1",
-      { Authorization: "Bearer token" },
+      () => ({ Authorization: "Bearer token" }),
       "srv-1",
     );
 
@@ -206,5 +206,70 @@ describe("dust MCP runtime helpers", () => {
     clearInterval(timer);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("dust MCP listener shutdown", () => {
+  it("resolves quietly when the stream is aborted mid-read", async () => {
+    // Tearing down a session aborts the SSE stream, rejecting the pending read.
+    // That must not surface as "listenMcpRequests fatal".
+    const abortController = new AbortController();
+
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        abortController.signal.addEventListener("abort", () => {
+          controller.error(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
+        });
+      },
+    });
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, body }));
+
+    const promise = listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      serverId: "srv-abort",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
+      getTools: () => [],
+      getConfirmFn: () => async () => true,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions: new Map(),
+    });
+
+    await Promise.resolve();
+    abortController.abort();
+
+    await expect(promise).resolves.toBeUndefined();
+  });
+});
+
+describe("dust MCP auth freshness", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it("heartbeats with the current token, not the one captured at registration", async () => {
+    // The heartbeat outlives the access token that registered the server.
+    // Closing over the original headers let the registration lapse once the
+    // token rotated, taking the client-side tools with it.
+    let token = "old-token";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const timer = startMcpHeartbeat(
+      "https://dust.test/api/v1/w/ws-1",
+      () => ({ Authorization: `Bearer ${token}` }),
+      "srv-rotate",
+    );
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    token = "rotated-token";
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    clearInterval(timer);
+
+    const used = fetchMock.mock.calls.map(([, opts]: [string, any]) => opts?.headers?.Authorization);
+    expect(used[0]).toBe("Bearer old-token");
+    expect(used.at(-1)).toBe("Bearer rotated-token");
   });
 });

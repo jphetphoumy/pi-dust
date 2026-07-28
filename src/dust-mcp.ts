@@ -7,6 +7,14 @@ import { type McpToolResult } from "./dust-tools.js";
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 
+/** True when an error is just this listener being shut down. */
+export function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) {
+    return true;
+  }
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
 function retryDelay(attempt: number): number {
   return Math.min(INITIAL_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
 }
@@ -45,15 +53,17 @@ export async function registerMcpServer(
 
 export function startMcpHeartbeat(
   baseUrl: string,
-  authHeaders: Record<string, string>,
+  getAuthHeaders: () => Record<string, string>,
   serverId: string,
 ): ReturnType<typeof setInterval> {
   return setInterval(async () => {
     try {
       debugLog("dust:mcp", "Sending MCP heartbeat", { serverId });
+      // Headers are resolved per beat: this outlives the access token, and a
+      // stale one lets the registration lapse, taking the tools with it.
       await fetch(`${baseUrl}/mcp/heartbeat`, {
         method: "POST",
-        headers: { ...authHeaders, "Content-Type": "application/json" },
+        headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ serverId }),
       });
     } catch {
@@ -64,7 +74,8 @@ export function startMcpHeartbeat(
 
 interface ListenMcpRequestsOptions {
   baseUrl: string;
-  authHeaders: Record<string, string>;
+  /** Resolved per request: the token rotates during a long session. */
+  getAuthHeaders: () => Record<string, string>;
   serverId: string;
   abortController: AbortController;
   buildConfirmMessage: (toolName: string, args: JsonObject) => string;
@@ -77,7 +88,7 @@ interface ListenMcpRequestsOptions {
 
 export async function listenMcpRequests({
   baseUrl,
-  authHeaders,
+  getAuthHeaders,
   serverId,
   abortController,
   buildConfirmMessage,
@@ -97,7 +108,7 @@ export async function listenMcpRequests({
     let res: Response;
     try {
       res = await fetch(reqUrl, {
-        headers: { ...authHeaders, Accept: "text/event-stream" },
+        headers: { ...getAuthHeaders(), Accept: "text/event-stream" },
         signal: abortController.signal,
       });
     } catch (error) {
@@ -193,7 +204,7 @@ export async function listenMcpRequests({
                 };
                 await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
-                  headers: { ...authHeaders, "Content-Type": "application/json" },
+                  headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
                 }).catch((error) => { console.error(`[dust:mcp] results POST error: ${error}`); });
                 debugLog("dust:mcp", "Posted initialize result", responseMsg);
@@ -205,7 +216,7 @@ export async function listenMcpRequests({
                 };
                 await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
-                  headers: { ...authHeaders, "Content-Type": "application/json" },
+                  headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
                 }).catch((error) => { console.error(`[dust:mcp] results POST error: ${error}`); });
                 debugLog("dust:mcp", "Posted tools/list result", { toolCount: getTools().length });
@@ -251,7 +262,7 @@ export async function listenMcpRequests({
                 };
                 await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
-                  headers: { ...authHeaders, "Content-Type": "application/json" },
+                  headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
                 }).catch((error) => { console.error(`[dust:mcp] results POST error: ${error}`); });
                 debugLog("dust:mcp", "Posted tools/call result", {
@@ -266,6 +277,15 @@ export async function listenMcpRequests({
         }
         if (done) break;
       }
+    } catch (error) {
+      // Tearing the session down aborts this stream, which rejects the pending
+      // read. That is ordinary shutdown, not a failure — without this the abort
+      // escaped and was reported as "listenMcpRequests fatal".
+      if (isAbortError(error, abortController.signal)) {
+        debugLog("dust:mcp", "MCP SSE aborted, stopping listener");
+        return;
+      }
+      throw error;
     } finally {
       reader.releaseLock();
     }
