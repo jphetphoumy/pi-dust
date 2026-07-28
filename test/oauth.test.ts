@@ -388,6 +388,32 @@ describe("dust extension", () => {
       ).rejects.toThrow(/session expired/i);
     });
 
+    it("refreshToken() treats 400 invalid_grant as an expired session", async () => {
+      // WorkOS returns 400, not 401, for an expired or revoked refresh token.
+      // If this is reported as a generic failure the session is never marked
+      // invalidated and every session_start retries the same doomed refresh.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValueOnce({
+          ok: false,
+          status: 400,
+          text: () => Promise.resolve('{"error":"invalid_grant"}'),
+        })
+      );
+
+      await expect(
+        refreshFn({ access: "old", refresh: "dead-refresh", expires: 12345, workspaceId: "ws-123", region: "us-central1" })
+      ).rejects.toThrow(/session expired/i);
+    });
+
+    it("refreshToken() still reports other failures as generic errors", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 500 }));
+
+      await expect(
+        refreshFn({ access: "old", refresh: "old-refresh", expires: 12345, workspaceId: "ws-123", region: "us-central1" })
+      ).rejects.toThrow(/Token refresh failed: 500/);
+    });
+
     it("refreshToken() falls back to expires_at when expires_in is absent", async () => {
       const expiresAt = new Date(Date.now() + 3600_000).toISOString();
       vi.stubGlobal(

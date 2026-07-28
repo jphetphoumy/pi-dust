@@ -138,13 +138,25 @@ export async function streamEvents({
   recordPreApproval,
   resolveApprovalGate,
 }: StreamEventsOptions): Promise<void> {
-  const sseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
+  const baseSseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
   let fullText = "";
   const partial = makeEmptyMessage(model);
-  debugLog("dust:stream", "Opening SSE stream", { conversationSId, agentMsgSId, sseUrl });
+  debugLog("dust:stream", "Opening SSE stream", { conversationSId, agentMsgSId, sseUrl: baseSseUrl });
   let reconnectAttempt = 0;
 
+  // Dust replays this stream from the very beginning unless a cursor is given
+  // (the backend reads history from `lastEventId || "0-0"`). Every tool call
+  // forces a reconnect here, so without the cursor each reconnect re-delivers
+  // all prior generation_tokens — the text accumulates a second copy of the
+  // whole message — and re-delivers the tool_approve_execution event, which
+  // reconnects again. That is a non-terminating loop with a stuck tool.
+  let lastEventId: string | null = null;
+
   reconnect: for (;;) {
+    const sseUrl = lastEventId
+      ? `${baseSseUrl}?lastEventId=${encodeURIComponent(lastEventId)}`
+      : baseSseUrl;
+
     let res: Response;
     try {
       res = await fetch(sseUrl, {
@@ -222,6 +234,11 @@ export async function streamEvents({
                 continue;
               }
 
+              // Cursor lives on the envelope, alongside the event payload.
+              if (isRecord(parsed) && typeof parsed.eventId === "string") {
+                lastEventId = parsed.eventId;
+              }
+
               const event = unwrapEnvelope(parsed);
               const eventType = getDustEventType(event);
               if (!eventType) continue;
@@ -240,19 +257,15 @@ export async function streamEvents({
                   debugLog("dust:stream", "Forwarded text delta", { delta });
                 }
               } else if (eventType === "tool_params") {
+                // Client-side tool calls render as their own transcript entry
+                // (see dust-tool-render.ts), using pi's native renderers. Adding
+                // a "[Tool: x]" line here as well would duplicate that, and it
+                // would also land inside the assistant message text.
                 const action = isRecord(event) && isRecord(event.action) ? event.action : undefined;
                 const toolName = getOptionalStringField(action ?? {}, "toolName")
                   ?? getOptionalStringField(action ?? {}, "functionCallName")
                   ?? "tool";
-                const indicator = `\n[Tool: ${toolName}]\n`;
-                fullText += indicator;
-                if (partial.content.length === 0) {
-                  partial.content.push({ type: "text", text: fullText });
-                } else {
-                  partial.content[0].text = fullText;
-                }
-                stream.push({ type: "text_delta", contentIndex: 0, delta: indicator, partial: { ...partial } });
-                debugLog("dust:stream", "Forwarded tool indicator", { toolName });
+                debugLog("dust:stream", "Tool params received", { toolName });
               } else if (eventType === "tool_approve_execution") {
                 const approveEvent = parseToolApproveExecutionEvent(event);
                 debugLog("dust:stream", "Handling tool approval request", approveEvent);
@@ -276,6 +289,17 @@ export async function streamEvents({
                 stream.push({ type: "done", reason: "stop", message: finalMessage });
                 stream.end();
                 debugLog("dust:stream", "Stream completed successfully", { fullText });
+                return;
+              } else if (eventType === "agent_message_gracefully_stopped") {
+                // Terminal per the Dust SDK's terminalEventTypes; without this
+                // the stream never completes and the turn hangs.
+                resolveApprovalGate();
+                const finalMessage = makeEmptyMessage(model);
+                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                finalMessage.stopReason = "stop";
+                stream.push({ type: "done", reason: "stop", message: finalMessage });
+                stream.end();
+                debugLog("dust:stream", "Stream gracefully stopped", { fullText });
                 return;
               } else if (eventType === "agent_generation_cancelled") {
                 resolveApprovalGate();

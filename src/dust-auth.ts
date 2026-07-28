@@ -187,7 +187,16 @@ export async function refreshToken(credentials: DustCredentials): Promise<DustCr
 
   if (!res.ok) {
     debugLog("dust:auth", "Token refresh failed", { status: res.status });
-    if (res.status === 401) {
+
+    // 401, and 400 which is what WorkOS actually returns for an expired or
+    // revoked refresh token (OAuth `invalid_grant`). Treating 400 as a generic
+    // failure leaves the dead session unmarked, so every session_start retries
+    // the same doomed refresh and re-reports the error.
+    if (res.status === 401 || res.status === 400) {
+      if (res.status === 400) {
+        const body = await Promise.resolve(res.text?.()).catch(() => "");
+        debugLog("dust:auth", "Token refresh rejected", { body });
+      }
       throw new Error(SESSION_EXPIRED_MESSAGE);
     }
     throw new Error(`Token refresh failed: ${res.status}`);

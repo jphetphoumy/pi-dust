@@ -159,7 +159,7 @@ describe("dust stream runtime helpers", () => {
     ).rejects.toThrow("SSE response has no body");
   });
 
-  it("falls back to functionCallName for tool indicators", async () => {
+  it("does not inject tool marker text into the assistant message", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
       ok: true,
       body: makeSseBody([
@@ -190,14 +190,14 @@ describe("dust stream runtime helpers", () => {
     });
     await read;
 
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "text_delta", delta: "\n[Tool: bash]\n" }),
-      ]),
-    );
+    // Tool calls render as their own transcript entry via pi's native
+    // renderers, so tool_params must not add text to the message.
+    const deltas = events.filter((e: any) => e.type === "text_delta");
+    expect(deltas.every((e: any) => !e.delta.includes("[Tool:"))).toBe(true);
+    expect(deltas.some((e: any) => e.delta === "prefix")).toBe(true);
   });
 
-  it("uses the generic tool indicator when no tool name is available", async () => {
+  it("keeps the transcript clean when a tool has no name", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
       ok: true,
       body: makeSseBody([
@@ -229,7 +229,7 @@ describe("dust stream runtime helpers", () => {
 
     expect(events).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: "text_delta", delta: "\n[Tool: tool]\n" }),
+        expect.objectContaining({ type: "done" }),
       ]),
     );
   });
