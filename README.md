@@ -19,6 +19,20 @@ tool bridge (`bash`, `read`, `edit`) with local approval.
 - Local quality gates: lint, typecheck, tests, coverage
 - CI, changelog, release automation, Dependabot, and git hooks
 
+## Requirements
+
+| Requirement | Version |
+|-------------|---------|
+| Pi (`pi` CLI) | `0.82.x` (tested with `0.82.0`) |
+| `@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui` | `^0.82.1` |
+| Node.js | `^20.19.0 \|\| ^22.13.0 \|\| >=24` |
+
+Check your local Pi version with:
+
+```bash
+pi --version
+```
+
 ## Quick start
 
 ```bash
