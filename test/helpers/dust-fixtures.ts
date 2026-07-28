@@ -284,6 +284,48 @@ export function makeConversationResponse(conversationSId: string, userMessageSId
   };
 }
 
+/**
+ * Wait for the POST to /mcp/results carrying `requestId` and return its parsed body.
+ *
+ * pi's tools execute asynchronously, so the result lands some time after the pi
+ * stream drains. Sleeping a fixed interval and then reading the mock is racy in
+ * two ways: a tool that spawns a subprocess can overrun any fixed wait on a
+ * loaded machine, and because each test installs a fresh fetch mock while the
+ * previous test's MCP listener is still alive, a late result from an earlier
+ * test can land in this test's mock. Matching on the request id addresses both —
+ * we wait for our own result and ignore anyone else's.
+ */
+export async function waitForMcpResult(fetchMock: { mock: { calls: unknown[][] } }, requestId: string, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    for (const [url, init] of fetchMock.mock.calls as [string, { body?: string }][]) {
+      if (!String(url).includes("/mcp/results") || !init?.body) continue;
+      const body = JSON.parse(init.body);
+      if (body.result?.id === requestId) return body;
+    }
+    if (Date.now() >= deadline) {
+      const seen = (fetchMock.mock.calls as [string][]).map(([url]) => String(url));
+      throw new Error(`timed out waiting for /mcp/results with id ${requestId}; saw: ${seen.join(", ")}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * Wait until `read` returns a defined value, polling instead of sleeping a fixed
+ * interval. Same rationale as waitForMcpResult, for assertions that watch for a
+ * request rather than a result.
+ */
+export async function waitForCall<T>(read: () => T | undefined, describeWhat: string, timeoutMs = 5_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const found = read();
+    if (found !== undefined) return found;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${describeWhat}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 export function makeConversationGetResponse(conversationSId: string, userMessageSId: string, agentMessageSId: string) {
   return {
     conversation: {

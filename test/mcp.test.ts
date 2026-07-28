@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
-import { makeCredentials, makePendingSseStream, makeSseStream } from "./helpers/dust-fixtures.js";
+import { makeCredentials, makePendingSseStream, makeSseStream, waitForCall, waitForMcpResult } from "./helpers/dust-fixtures.js";
 import { piToolContextFields, readState, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
@@ -670,12 +670,13 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
       for await (const _ of stream) { /* drain */ }
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      const reconnect = fetchMock.mock.calls
-        .map(([url]: [string]) => String(url))
-        .filter((url) => url.includes("/mcp/requests"))
-        .find((url) => url.includes("lastEventId"));
+      const reconnect = await waitForCall(
+        () => fetchMock.mock.calls
+          .map(([url]: [string]) => String(url))
+          .filter((url) => url.includes("/mcp/requests"))
+          .find((url) => url.includes("lastEventId")),
+        "MCP SSE reconnect carrying lastEventId",
+      );
 
       expect(reconnect).toBeDefined();
       expect(reconnect).toContain("lastEventId=evt-7");
@@ -757,11 +758,7 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
-      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
-      const resultBody = JSON.parse(resultPostCall[1].body);
+      const resultBody = await waitForMcpResult(fetchMock, "req-list-2");
       const tools: any[] = resultBody.result.result?.tools ?? [];
       const bashTool = tools.find((t: any) => t.name === "bash");
       expect(bashTool).toBeDefined();
@@ -795,12 +792,7 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
-      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
-      expect(resultPostCall).toBeDefined();
-      const resultBody = JSON.parse(resultPostCall[1].body);
+      const resultBody = await waitForMcpResult(fetchMock, "req-bash-1");
       expect(resultBody.result.id).toBe("req-bash-1");
       // content must be array with text block
       const content: any[] = resultBody.result.result?.content ?? [];
@@ -829,11 +821,7 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
-      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
-      const resultBody = JSON.parse(resultPostCall[1].body);
+      const resultBody = await waitForMcpResult(fetchMock, "req-bash-fail");
       // isError should be true for failed commands
       expect(resultBody.result.result?.isError).toBe(true);
     });
@@ -860,11 +848,7 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
-      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
-      const resultBody = JSON.parse(resultPostCall[1].body);
+      const resultBody = await waitForMcpResult(fetchMock, "req-unknown");
       expect(resultBody.result.result?.isError).toBe(true);
       const content: any[] = resultBody.result.result?.content ?? [];
       expect(content.some((c: any) => c.type === "text" && c.text.toLowerCase().includes("nonexistent_tool"))).toBe(true);
@@ -898,11 +882,13 @@ describe("dust extension", () => {
 
       const stream = capturedStreamSimple({ id: "agent-sonnet", sId: "agentSId-1", name: "AgentSonnet", provider: "dust", api: "dust" }, { messages: [{ role: "user", content: "Hi" }] });
       for await (const _ of stream) { /* drain */ }
-      // pi's tools execute asynchronously, so /mcp/results lands after the drain.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const resultPostCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("/mcp/results"))!;
-      expect(resultPostCall![1].headers["Authorization"]).toBe("Bearer results-access-token");
+      const resultPostCall = await waitForCall(
+        () => fetchMock.mock.calls.find(
+          ([url, init]: [string, any]) => url.includes("/mcp/results") && JSON.parse(init.body).result?.id === "req-bash-2",
+        ),
+        "/mcp/results POST for req-bash-2",
+      );
+      expect(resultPostCall[1].headers["Authorization"]).toBe("Bearer results-access-token");
     });
   });
 
