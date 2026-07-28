@@ -20,6 +20,11 @@ export interface SessionContextController {
    * caller falls back to refreshing directly.
    */
   resolveAccessToken: () => Promise<string | null>;
+  /**
+   * Current access token, re-read rather than captured. Dust tokens live about
+   * 15 minutes, which is shorter than a long agent turn.
+   */
+  getAccessToken: () => string;
 }
 
 const NOOP_SESSION_CONTEXT: SessionContextController = {
@@ -28,6 +33,7 @@ const NOOP_SESSION_CONTEXT: SessionContextController = {
   getCredentials: () => null,
   setCredentials: () => { /* no-op until session_start wires it up */ },
   resolveAccessToken: async () => null,
+  getAccessToken: () => "",
 };
 
 const NOOP_CONFIRM = async () => true;
@@ -120,6 +126,7 @@ export function buildSessionContext(ctx: PiRuntimeContext): SessionContextContro
       persistConversationId(sessionFile, id);
     },
     getCredentials: () => getStoredCredentials(),
+    getAccessToken: () => getStoredCredentials()?.access ?? "",
     setCredentials: (nextCred: DustCredentials) => persistCredentialState(nextCred),
     resolveAccessToken: async () => {
       const getProviderAuth = ctx.modelRegistry?.getProviderAuth;

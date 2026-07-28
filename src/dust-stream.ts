@@ -116,7 +116,9 @@ interface StreamEventsOptions {
   baseUrl: string;
   conversationSId: string;
   agentMsgSId: string;
-  authHeaders: Record<string, string>;
+  getAuthHeaders: () => Record<string, string>;
+  /** Attempts a token refresh after a 401. Returns true if a retry is worthwhile. */
+  refreshAuth: () => Promise<boolean>;
   signal: AbortSignal | undefined;
   stream: PiEventStream;
   model: DustModel;
@@ -130,7 +132,8 @@ export async function streamEvents({
   baseUrl,
   conversationSId,
   agentMsgSId,
-  authHeaders,
+  getAuthHeaders,
+  refreshAuth,
   signal,
   stream,
   model,
@@ -157,6 +160,7 @@ export async function streamEvents({
   // close is Dust's 60s cap rather than the end of the turn.
   let sawAnyEvent = false;
   let idleReconnects = 0;
+  let refreshedAfterUnauthorized = false;
 
   reconnect: for (;;) {
     const sseUrl = lastEventId
@@ -167,7 +171,7 @@ export async function streamEvents({
     try {
       res = await fetch(sseUrl, {
         headers: {
-          ...authHeaders,
+          ...getAuthHeaders(),
           Accept: "text/event-stream",
         },
         signal,
@@ -191,6 +195,16 @@ export async function streamEvents({
     if (!res.ok) {
       debugLog("dust:stream", "SSE request failed", { status: res.status, sseUrl });
       if (res.status === 401) {
+        // Dust access tokens last about 15 minutes, far less than a long turn,
+        // so a 401 here usually means the token aged out mid-stream rather than
+        // that the session is dead. Refresh once and resume; only give up if the
+        // refresh itself fails, since declaring the session expired forces the
+        // user to log in again.
+        if (!refreshedAfterUnauthorized && await refreshAuth()) {
+          refreshedAfterUnauthorized = true;
+          debugLog("dust:stream", "Refreshed token after 401, resuming stream");
+          continue reconnect;
+        }
         throw new Error(SESSION_EXPIRED_MESSAGE);
       }
       if (res.status >= 500 || res.status === 429) {
@@ -245,6 +259,7 @@ export async function streamEvents({
                 lastEventId = parsed.eventId;
               }
               sawAnyEvent = true;
+              refreshedAfterUnauthorized = false;
 
               const event = unwrapEnvelope(parsed);
               const eventType = getDustEventType(event);

@@ -41,7 +41,8 @@ describe("dust stream runtime helpers", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       signal: undefined,
       stream,
       model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -81,7 +82,8 @@ describe("dust stream runtime helpers", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       signal: undefined,
       stream,
       model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -107,7 +109,8 @@ describe("dust stream runtime helpers", () => {
         baseUrl: "https://dust.test/api/v1/w/ws-1",
         conversationSId: "conv-1",
         agentMsgSId: "msg-1",
-        authHeaders: { Authorization: "Bearer token" },
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
         signal: undefined,
         stream: createEventStream(),
         model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -127,7 +130,8 @@ describe("dust stream runtime helpers", () => {
         baseUrl: "https://dust.test/api/v1/w/ws-1",
         conversationSId: "conv-1",
         agentMsgSId: "msg-1",
-        authHeaders: { Authorization: "Bearer token" },
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
         signal: undefined,
         stream: createEventStream(),
         model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -147,7 +151,8 @@ describe("dust stream runtime helpers", () => {
         baseUrl: "https://dust.test/api/v1/w/ws-1",
         conversationSId: "conv-1",
         agentMsgSId: "msg-1",
-        authHeaders: { Authorization: "Bearer token" },
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
         signal: undefined,
         stream: createEventStream(),
         model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -179,7 +184,8 @@ describe("dust stream runtime helpers", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       signal: undefined,
       stream,
       model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -216,7 +222,8 @@ describe("dust stream runtime helpers", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       signal: undefined,
       stream,
       model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -251,7 +258,8 @@ describe("dust stream runtime helpers", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       signal: undefined,
       stream,
       model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -312,7 +320,8 @@ describe("dust stream resumption", () => {
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       conversationSId: "conv-1",
       agentMsgSId: "msg-1",
-      authHeaders: { Authorization: "Bearer token" },
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       signal: undefined,
       stream,
       model: { id: "agent-1", api: "dust", provider: "dust" },
@@ -335,5 +344,69 @@ describe("dust stream resumption", () => {
     // text from both windows.
     const done = events.find((e: any) => e.type === "done") as any;
     expect(done.message.content[0].text).toBe("working done");
+  });
+});
+
+describe("dust stream auth recovery", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it("refreshes and resumes on a mid-stream 401 instead of ending the session", async () => {
+    // Dust access tokens last ~15 minutes, shorter than a long turn. Declaring
+    // the session expired on the first 401 forced a re-login and made the
+    // extension unusable for long tasks.
+    let token = "stale";
+    const refreshAuth = vi.fn(async () => { token = "fresh"; return true; });
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 401 })
+      .mockResolvedValueOnce({ ok: true, body: makeSseBody([{ type: "agent_message_success" }]) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stream = createEventStream();
+    const promise = streamEvents({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      conversationSId: "conv-1",
+      agentMsgSId: "msg-1",
+      getAuthHeaders: () => ({ Authorization: `Bearer ${token}` }),
+      refreshAuth,
+      signal: undefined,
+      stream,
+      model: { id: "agent-1", api: "dust", provider: "dust" },
+      handleToolApproveExecution: async () => true,
+      postValidateAction: async () => undefined,
+      recordPreApproval: () => undefined,
+      resolveApprovalGate: () => undefined,
+    });
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    await promise;
+
+    expect(refreshAuth).toHaveBeenCalledTimes(1);
+    // The retry carried the refreshed token, and the turn completed normally.
+    expect(fetchMock.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh");
+    await expect(stream.result()).resolves.toMatchObject({ stopReason: "stop" });
+  });
+
+  it("gives up when the refresh itself fails", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 401 }));
+
+    await expect(
+      streamEvents({
+        baseUrl: "https://dust.test/api/v1/w/ws-1",
+        conversationSId: "conv-1",
+        agentMsgSId: "msg-1",
+        getAuthHeaders: () => ({ Authorization: "Bearer stale" }),
+        refreshAuth: async () => false,
+        signal: undefined,
+        stream: createEventStream(),
+        model: { id: "agent-1", api: "dust", provider: "dust" },
+        handleToolApproveExecution: async () => true,
+        postValidateAction: async () => undefined,
+        recordPreApproval: () => undefined,
+        resolveApprovalGate: () => undefined,
+      }),
+    ).rejects.toThrow(/session expired/i);
   });
 });

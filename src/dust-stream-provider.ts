@@ -346,6 +346,30 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         const authHeaders = buildAuthHeaders(accessToken);
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+        // A turn can outlive the ~15 minute access token, so the long-lived
+        // event stream re-reads the stored token per request instead of pinning
+        // the one this turn started with.
+        const getAuthHeaders = (): Record<string, string> => {
+          const current = runtime.sessionContext.getAccessToken();
+          return current ? buildAuthHeaders(current) : authHeaders;
+        };
+
+        // Called after a 401: refresh through pi (which persists the rotation)
+        // and fall back to a direct refresh. Returning false means the session
+        // really is dead.
+        const refreshAuth = async (): Promise<boolean> => {
+          const hostToken = await runtime.sessionContext.resolveAccessToken();
+          if (hostToken) return true;
+          try {
+            const refreshed = await refreshToken(runtime.sessionContext.getCredentials() ?? liveCred);
+            runtime.sessionContext.setCredentials(refreshed);
+            return Boolean(refreshed.access);
+          } catch (err) {
+            debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
+            return false;
+          }
+        };
+
         await ensureMcpServer(runtime, baseUrl, authHeaders);
 
         const userText = extractUserText(context);
@@ -397,7 +421,8 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           baseUrl,
           conversationSId,
           agentMsgSId: agentMessageSId,
-          authHeaders,
+          getAuthHeaders,
+          refreshAuth,
           signal,
           stream,
           model,
