@@ -1,0 +1,213 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import type { DustAgent, DustCredentials, Workspace } from "./dust-types.js";
+
+const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+const STATE_FILE = "dust-state.json";
+const AUTH_FILE = "auth.json";
+
+/**
+ * Extension-owned state.
+ *
+ * pi 0.81 removed `AuthStorage` from the extension API, so `auth.json` is now
+ * pi's private store: it owns the OAuth token trio (access/refresh/expires) and
+ * rotates it through the `oauth.refreshToken` hook we register in
+ * `dust-provider.ts`. Everything below is Dust-specific state that pi knows
+ * nothing about, so we persist it ourselves instead of smuggling it into the
+ * credential blob.
+ */
+export interface DustState {
+  workspaceId?: string;
+  workspaces?: Workspace[];
+  agents?: DustAgent[];
+  region?: string;
+  username?: string;
+  conversations?: Record<string, string>;
+  /**
+   * Set when we detect the stored session is dead (refresh rejected, or Dust
+   * answered 401). pi still holds a token-shaped blob in auth.json, so this is
+   * how we force the "logged out" path until the next successful login.
+   */
+  invalidated?: boolean;
+}
+
+const STATE_KEYS = [
+  "workspaceId",
+  "workspaces",
+  "agents",
+  "region",
+  "username",
+  "conversations",
+  "invalidated",
+] as const satisfies readonly (keyof DustState)[];
+
+export function resolveAgentDir(): string {
+  const configuredDir = process.env[PI_AGENT_DIR_ENV];
+  if (configuredDir) {
+    if (configuredDir === "~") {
+      return homedir();
+    }
+    if (configuredDir.startsWith("~/")) {
+      return join(homedir(), configuredDir.slice(2));
+    }
+    return configuredDir;
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+function statePath(): string {
+  return join(resolveAgentDir(), STATE_FILE);
+}
+
+function authPath(): string {
+  return join(resolveAgentDir(), AUTH_FILE);
+}
+
+function readJsonFile(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) {
+    return null;
+  }
+  try {
+    const content = readFileSync(path, "utf8");
+    if (!content.trim()) {
+      return null;
+    }
+    const parsed: unknown = JSON.parse(content);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function pickStateFields(source: Record<string, unknown>): DustState {
+  const state: Record<string, unknown> = {};
+  for (const key of STATE_KEYS) {
+    if (source[key] !== undefined) {
+      state[key] = source[key];
+    }
+  }
+  return state as DustState;
+}
+
+/**
+ * Reads the OAuth credential pi persists for the `dust` provider.
+ *
+ * This is the same lookup as pi's own `readStoredCredential("dust")`; we
+ * reimplement it so the extension keeps working against pi builds that do not
+ * re-export it, and so tests can point `PI_CODING_AGENT_DIR` at a temp dir.
+ */
+export function readAuthCredential(): DustCredentials | null {
+  const parsed = readJsonFile(authPath());
+  const stored = parsed?.dust;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+    return null;
+  }
+  return stored as DustCredentials;
+}
+
+export function readDustState(): DustState {
+  const parsed = readJsonFile(statePath());
+  return parsed ? pickStateFields(parsed) : {};
+}
+
+export function writeDustState(state: DustState): void {
+  const path = statePath();
+  const dir = dirname(path);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+
+  // Write-then-rename so a crash mid-write cannot truncate existing state.
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(pickStateFields(state as Record<string, unknown>), null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  renameSync(tmp, path);
+}
+
+export function patchDustState(patch: DustState): DustState {
+  const next = { ...readDustState(), ...patch };
+  writeDustState(next);
+  return next;
+}
+
+/**
+ * One-time carry-over for installs that predate the split.
+ *
+ * Older builds stored agents/workspaces/conversations inside the auth.json
+ * credential. If we have no state file yet but that legacy state is present,
+ * seed the state file from it. auth.json is left untouched — pi owns it, and
+ * the stale extra keys there are harmless.
+ */
+export function migrateLegacyState(): DustState {
+  const existing = readDustState();
+  if (Object.keys(existing).length > 0) {
+    return existing;
+  }
+
+  const legacy = readAuthCredential();
+  if (!legacy) {
+    return existing;
+  }
+
+  const seeded = pickStateFields(legacy as unknown as Record<string, unknown>);
+  if (Object.keys(seeded).length === 0) {
+    return existing;
+  }
+
+  writeDustState(seeded);
+  return seeded;
+}
+
+/**
+ * The merged view the rest of the extension consumes: tokens from pi, Dust
+ * state from us. Returns null when pi has no `dust` credential at all.
+ */
+export function getStoredCredentials(): DustCredentials | null {
+  const auth = readAuthCredential();
+  if (!auth) {
+    return null;
+  }
+
+  const state = readDustState();
+  const merged: DustCredentials = {
+    ...state,
+    type: "oauth",
+    access: auth.access ?? "",
+    refresh: auth.refresh ?? "",
+    expires: auth.expires ?? 0,
+  };
+
+  if (state.invalidated) {
+    return { ...merged, access: "", refresh: "", expires: 0 };
+  }
+  return merged;
+}
+
+/**
+ * Persists only the Dust-specific half of a credential object. Token fields are
+ * deliberately dropped: pi rotates and stores those itself.
+ */
+export function persistCredentialState(credentials: DustCredentials): void {
+  const state = pickStateFields(credentials as unknown as Record<string, unknown>);
+  patchDustState(state);
+}
+
+export function markInvalidated(): void {
+  patchDustState({ invalidated: true });
+}
+
+export function clearInvalidated(): void {
+  patchDustState({ invalidated: false });
+}
+
+export function saveConversationId(sessionFile: string, conversationId: string): void {
+  const state = readDustState();
+  patchDustState({
+    conversations: { ...(state.conversations ?? {}), [sessionFile]: conversationId },
+  });
+}
