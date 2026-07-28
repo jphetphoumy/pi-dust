@@ -44,7 +44,7 @@
     "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^10.8.0",
     "git-cliff": "^2.13.1",
-    "globals": "^17.4.0",
+    "globals": "^17.8.0",
     "simple-git-hooks": "^2.13.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10"
