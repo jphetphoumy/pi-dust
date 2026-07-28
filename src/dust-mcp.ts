@@ -1,8 +1,8 @@
-import { DUST_MCP_PROTOCOL_VERSION, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { DUST_MCP_PROTOCOL_VERSION, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
-import { MCP_TOOLS, type McpToolResult } from "./dust-tools.js";
+import { type McpToolResult } from "./dust-tools.js";
 
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
@@ -29,7 +29,7 @@ export async function registerMcpServer(
   const res = await fetch(`${baseUrl}/mcp/register`, {
     method: "POST",
     headers: { ...authHeaders, "Content-Type": "application/json" },
-    body: JSON.stringify({ serverName: "pi-dust-extension" }),
+    body: JSON.stringify({ serverName: MCP_SERVER_NAME }),
   });
   if (!res.ok) {
     debugLog("dust:mcp", "MCP register failed", { status: res.status });
@@ -68,7 +68,8 @@ interface ListenMcpRequestsOptions {
   serverId: string;
   abortController: AbortController;
   buildConfirmMessage: (toolName: string, args: JsonObject) => string;
-  executeMcpTool: (name: string, args: JsonObject) => McpToolResult;
+  getTools: () => Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
+  executeMcpTool: (name: string, args: JsonObject) => Promise<McpToolResult>;
   getConfirmFn: () => (title: string, message: string) => Promise<boolean>;
   getPendingApprovalPromise: () => Promise<void> | null;
   preApprovedActions: Map<string, boolean>;
@@ -80,6 +81,7 @@ export async function listenMcpRequests({
   serverId,
   abortController,
   buildConfirmMessage,
+  getTools,
   executeMcpTool,
   getConfirmFn,
   getPendingApprovalPromise,
@@ -149,21 +151,30 @@ export async function listenMcpRequests({
 
           for (const frame of frames) {
             for (const line of frame.split("\n")) {
-              if (line.startsWith("id:")) {
-                lastEventId = line.slice(3).trim();
-              }
-            }
-
-            for (const line of frame.split("\n")) {
               if (!line.startsWith("data:")) continue;
               const json = line.slice(5).trim();
               if (!json) continue;
+
+              // Dust closes each stream with a plain `data: done` sentinel after
+              // its 5 minute server-side timeout. It is not JSON.
+              if (json === "done") {
+                debugLog("dust:mcp", "MCP SSE received done sentinel, reconnecting");
+                continue;
+              }
 
               let parsed: unknown;
               try {
                 parsed = JSON.parse(json);
               } catch {
                 continue;
+              }
+
+              // Dust never emits SSE `id:` lines — the cursor rides inside the
+              // JSON envelope as `eventId`. Reading `id:` lines left lastEventId
+              // null forever, so every reconnect replayed the Redis stream from
+              // the beginning and re-delivered past tools/call requests.
+              if (isRecord(parsed) && typeof parsed.eventId === "string") {
+                lastEventId = parsed.eventId;
               }
 
               const request = parseMcpRequest(parsed);
@@ -177,7 +188,7 @@ export async function listenMcpRequests({
                   result: {
                     protocolVersion: DUST_MCP_PROTOCOL_VERSION,
                     capabilities: { tools: {} },
-                    serverInfo: { name: "pi-dust-extension", version: "0.1.0" },
+                    serverInfo: { name: MCP_SERVER_NAME, version: "0.1.0" },
                   },
                 };
                 await fetch(`${baseUrl}/mcp/results`, {
@@ -190,14 +201,14 @@ export async function listenMcpRequests({
                 const responseMsg = {
                   jsonrpc: "2.0",
                   id: request.id,
-                  result: { tools: MCP_TOOLS },
+                  result: { tools: getTools() },
                 };
                 await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
                   headers: { ...authHeaders, "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
                 }).catch((error) => { console.error(`[dust:mcp] results POST error: ${error}`); });
-                debugLog("dust:mcp", "Posted tools/list result", { toolCount: MCP_TOOLS.length });
+                debugLog("dust:mcp", "Posted tools/list result", { toolCount: getTools().length });
               } else if (request.method === "tools/call") {
                 const toolName = typeof request.params?.name === "string" ? request.params.name : "";
                 const toolArgs = isRecord(request.params?.arguments) ? request.params.arguments : {};
@@ -227,7 +238,7 @@ export async function listenMcpRequests({
                 }
 
                 const toolResult = allowed
-                  ? executeMcpTool(toolName, toolArgs)
+                  ? await executeMcpTool(toolName, toolArgs)
                   : { content: [{ type: "text", text: "Tool execution denied by user." }], isError: true };
 
                 const responseMsg = {

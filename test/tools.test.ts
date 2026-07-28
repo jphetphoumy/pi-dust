@@ -1,152 +1,123 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import path, { join } from "path";
-import { afterEach, describe, expect, it } from "vitest";
-import { buildConfirmMessage, executeMcpTool } from "../src/dust-tools.js";
-
-const ORIGINAL_ALLOWED_PATHS = process.env.PI_DUST_ALLOWED_PATHS;
+import { join } from "path";
+import { describe, expect, it } from "vitest";
+import { buildConfirmMessage, executeMcpTool, getMcpTools } from "../src/dust-tools.js";
 
 function makeTempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-function setAllowedPaths(...paths: string[]): void {
-  process.env.PI_DUST_ALLOWED_PATHS = paths.join(path.delimiter);
+/**
+ * pi's tool implementations take the ExtensionContext as their final execute()
+ * argument. The file tools only read `cwd`; bash additionally reads
+ * `sessionManager.getSessionId()`, `model` and `thinkingLevel` to populate
+ * PI_SESSION_ID and friends for the spawned command.
+ */
+function makeCtx(cwd: string): any {
+  return {
+    cwd,
+    // `input` matters: read consults it to decide whether images can be
+    // returned. Our registered Dust models declare ["text"] the same way.
+    model: { id: "test-model", provider: "dust", input: ["text"] },
+    thinkingLevel: "off",
+    sessionManager: {
+      getSessionId: () => "test-session",
+      getSessionFile: () => undefined,
+      getEntries: () => [],
+    },
+  };
 }
 
-afterEach(() => {
-  if (ORIGINAL_ALLOWED_PATHS === undefined) {
-    delete process.env.PI_DUST_ALLOWED_PATHS;
-  } else {
-    process.env.PI_DUST_ALLOWED_PATHS = ORIGINAL_ALLOWED_PATHS;
-  }
-});
-
 describe("dust local tools", () => {
-  it("reads files inside allowed directories", () => {
-    const allowedDir = makeTempDir("pi-dust-allowed-");
-    const filePath = join(allowedDir, "sample.txt");
+  it("advertises pi's own built-in tools, not reimplementations", () => {
+    const tools = getMcpTools(makeCtx(process.cwd()));
+    const names = tools.map((t) => t.name);
 
-    try {
-      writeFileSync(filePath, "line-1\nline-2\nline-3", "utf8");
-      setAllowedPaths(allowedDir);
+    // pi's default built-ins plus its search tools, all sourced from pi itself.
+    expect(names).toEqual(expect.arrayContaining(["bash", "read", "write", "edit"]));
+    expect(names).toEqual(expect.arrayContaining(["grep", "find", "ls"]));
+  });
 
-      const result = executeMcpTool("read", { path: filePath, offset: 2, limit: 1 });
-
-      expect(result.isError).toBe(false);
-      expect(result.content[0].text).toBe("line-2");
-    } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
+  it("exposes a description and JSON schema for every tool", () => {
+    for (const tool of getMcpTools(makeCtx(process.cwd()))) {
+      expect(tool.description, `${tool.name} description`).toBeTruthy();
+      // TypeBox schemas are already JSON Schema, so they pass through to MCP.
+      expect(tool.inputSchema, `${tool.name} schema`).toMatchObject({ type: "object" });
     }
   });
 
-  it("clamps offset: 0 to read from the start of the file", () => {
-    const allowedDir = makeTempDir("pi-dust-offset-");
-    const filePath = join(allowedDir, "sample.txt");
-
+  it("creates a file through pi's write tool", async () => {
+    const dir = makeTempDir("pi-dust-write-");
     try {
-      writeFileSync(filePath, "line-1\nline-2\nline-3", "utf8");
-      setAllowedPaths(allowedDir);
-
-      const result = executeMcpTool("read", { path: filePath, offset: 0, limit: 1 });
+      const result = await executeMcpTool(
+        "write",
+        { path: join(dir, "tasks", "main.yml"), content: "---\n- name: task\n" },
+        makeCtx(dir),
+      );
 
       expect(result.isError).toBe(false);
-      expect(result.content[0].text).toBe("line-1");
+      expect(readFileSync(join(dir, "tasks", "main.yml"), "utf8")).toBe("---\n- name: task\n");
     } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("clamps limit: 0 to return at least one line", () => {
-    const allowedDir = makeTempDir("pi-dust-limit-");
-    const filePath = join(allowedDir, "sample.txt");
-
+  it("reads a file through pi's read tool", async () => {
+    const dir = makeTempDir("pi-dust-read-");
+    const filePath = join(dir, "sample.txt");
     try {
       writeFileSync(filePath, "line-1\nline-2\nline-3", "utf8");
-      setAllowedPaths(allowedDir);
 
-      const result = executeMcpTool("read", { path: filePath, offset: 1, limit: 0 });
+      const result = await executeMcpTool("read", { path: filePath }, makeCtx(dir));
 
       expect(result.isError).toBe(false);
-      expect(result.content[0].text).toBe("line-1");
+      expect(result.content[0].text).toContain("line-2");
     } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("blocks reads outside allowed directories", () => {
-    const allowedDir = makeTempDir("pi-dust-allowed-");
-    const blockedDir = makeTempDir("pi-dust-blocked-");
-    const blockedFile = join(blockedDir, "secret.txt");
-
+  it("reports an error instead of throwing when a tool fails", async () => {
+    const dir = makeTempDir("pi-dust-fail-");
     try {
-      writeFileSync(blockedFile, "secret", "utf8");
-      setAllowedPaths(allowedDir);
-
-      const result = executeMcpTool("read", { path: blockedFile });
+      const result = await executeMcpTool(
+        "read",
+        { path: join(dir, "does-not-exist.txt") },
+        makeCtx(dir),
+      );
 
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("outside allowed directories");
+      expect(result.content[0].text.length).toBeGreaterThan(0);
     } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
-      rmSync(blockedDir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("edits files with literal replacement text", () => {
-    const allowedDir = makeTempDir("pi-dust-edit-");
-    const filePath = join(allowedDir, "edit.txt");
+  it("runs a command through pi's bash tool", async () => {
+    const result = await executeMcpTool(
+      "bash",
+      { command: "echo hello-from-bash" },
+      makeCtx(process.cwd()),
+    );
 
-    try {
-      writeFileSync(filePath, "before TOKEN after", "utf8");
-      setAllowedPaths(allowedDir);
-
-      const result = executeMcpTool("edit", { path: filePath, oldText: "TOKEN", newText: "$&/$1" });
-
-      expect(result.isError).toBe(false);
-      expect(readFileSync(filePath, "utf8")).toBe("before $&/$1 after");
-    } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
-    }
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toContain("hello-from-bash");
   });
 
-  it("rejects edits with an empty oldText", () => {
-    const allowedDir = makeTempDir("pi-dust-edit-empty-");
-    const filePath = join(allowedDir, "edit.txt");
-
-    try {
-      writeFileSync(filePath, "content", "utf8");
-      setAllowedPaths(allowedDir);
-
-      const result = executeMcpTool("edit", { path: filePath, oldText: "", newText: "replacement" });
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("oldText must not be empty");
-    } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
-    }
-  });
-
-  it("shows the resolved path in confirmation messages", () => {
-    const allowedDir = makeTempDir("pi-dust-confirm-");
-
-    try {
-      const readMessage = buildConfirmMessage("read", { path: join(allowedDir, "file.txt"), offset: 2, limit: 4 });
-      const editMessage = buildConfirmMessage("edit", { path: join(allowedDir, "file.txt"), oldText: "a", newText: "b" });
-
-      expect(readMessage).toContain(join(allowedDir, "file.txt"));
-      expect(readMessage).toContain("offset: 2");
-      expect(editMessage).toContain(join(allowedDir, "file.txt"));
-    } finally {
-      rmSync(allowedDir, { recursive: true, force: true });
-    }
-  });
-
-  it("fails gracefully when a bash command times out", () => {
-    const result = executeMcpTool("bash", { command: "sleep 1", timeout: 0.01 });
+  it("reports unknown tools", async () => {
+    const result = await executeMcpTool("not-a-tool", {}, makeCtx(process.cwd()));
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text.length).toBeGreaterThan(0);
+    expect(result.content[0].text).toContain("Unknown tool");
+  });
+
+  it("summarises tool arguments for the approval prompt", () => {
+    expect(buildConfirmMessage("bash", { command: "ls -la" })).toBe("ls -la");
+    expect(buildConfirmMessage("write", { path: "/tmp/f.txt", content: "a\nb" }))
+      .toContain("2 lines");
+    expect(buildConfirmMessage("edit", { path: "/tmp/f.txt", oldText: "a", newText: "b" }))
+      .toContain("/tmp/f.txt");
   });
 
   it("falls back to JSON formatting for unknown confirmation messages", () => {

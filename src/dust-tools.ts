@@ -1,201 +1,149 @@
-import { execSync } from "child_process";
-import { readFileSync, realpathSync, writeFileSync } from "fs";
-import { delimiter, isAbsolute, relative, resolve } from "path";
+import {
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { McpToolArgs } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
-
-const ALLOWED_PATHS_ENV = "PI_DUST_ALLOWED_PATHS";
-
-export const MCP_TOOLS = [
-  {
-    name: "bash",
-    description:
-      "Execute a bash command on the user's machine. Returns stdout and stderr. Use for running commands, scripts, and shell operations.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        command: { type: "string", description: "Bash command to execute" },
-        timeout: { type: "number", description: "Timeout in seconds (optional)" },
-      },
-      required: ["command"],
-    },
-  },
-  {
-    name: "read",
-    description:
-      "Read the contents of a file on the user's machine. Supports offset and limit for large files.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        path: { type: "string", description: "Path to the file to read (relative or absolute)" },
-        offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read" },
-      },
-      required: ["path"],
-    },
-  },
-  {
-    name: "edit",
-    description:
-      "Edit a file on the user's machine by replacing an exact string. Fails if oldText is not found.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        path: { type: "string", description: "Path to the file to edit (relative or absolute)" },
-        oldText: { type: "string", description: "Exact text to find and replace" },
-        newText: { type: "string", description: "New text to replace the old text with" },
-      },
-      required: ["path", "oldText", "newText"],
-    },
-  },
-];
 
 export interface McpToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError: boolean;
 }
 
-interface CommandExecutionError extends Error {
-  stdout?: string;
-  stderr?: string;
+export interface McpToolSpec {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
 }
 
-function configuredAllowedPaths(): string[] {
-  const rawValue = typeof process !== "undefined" ? process.env[ALLOWED_PATHS_ENV] : undefined;
-  const configured = rawValue
-    ?.split(delimiter)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+/**
+ * The tools Dust may call are pi's own built-in tools, not reimplementations.
+ *
+ * pi exports its tool definitions as factories, each returning the same
+ * `ToolDefinition` the pi agent uses itself: description, TypeBox `parameters`
+ * (already JSON Schema, so it drops straight into MCP `inputSchema`), and
+ * `execute`. Wrapping them means Dust sees exactly what pi offers, behaviour
+ * cannot drift from pi's, and we inherit pi's path handling, truncation and
+ * output limits for free.
+ */
+const TOOL_FACTORIES = [
+  createBashToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
+  createEditToolDefinition,
+  createGrepToolDefinition,
+  createFindToolDefinition,
+  createLsToolDefinition,
+] as const;
 
-  const candidates = configured && configured.length > 0 ? configured : [process.cwd()];
-  return [...new Set(candidates.map((entry) => realpathSync(resolve(entry))))];
+type AnyToolDefinition = ToolDefinition<never, unknown, unknown>;
+
+let cachedCwd: string | null = null;
+let cachedDefinitions: AnyToolDefinition[] = [];
+
+function toolDefinitions(cwd: string): AnyToolDefinition[] {
+  if (cachedCwd !== cwd) {
+    cachedDefinitions = TOOL_FACTORIES.map(
+      (factory) => factory(cwd) as unknown as AnyToolDefinition,
+    );
+    cachedCwd = cwd;
+  }
+  return cachedDefinitions;
 }
 
-function isPathAllowed(targetPath: string, basePath: string): boolean {
-  const relativePath = relative(basePath, targetPath);
-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+function currentCwd(ctx?: ExtensionContext): string {
+  return ctx?.cwd ?? process.cwd();
 }
 
-function resolveToolPath(filePath: string): string {
-  const normalizedPath = filePath.trim();
-  if (normalizedPath.length === 0) {
-    throw new Error("Path is required");
+/** Tool catalogue advertised to Dust in response to `tools/list`. */
+export function getMcpTools(ctx?: ExtensionContext): McpToolSpec[] {
+  return toolDefinitions(currentCwd(ctx)).map((definition) => ({
+    name: definition.name,
+    description: definition.description,
+    inputSchema: definition.parameters as unknown as Record<string, unknown>,
+  }));
+}
+
+function findDefinition(name: string, ctx?: ExtensionContext): AnyToolDefinition | undefined {
+  return toolDefinitions(currentCwd(ctx)).find((definition) => definition.name === name);
+}
+
+/** pi's definition for a tool, used to reuse its native TUI renderers. */
+export function getToolDefinition(name: string, cwd: string): AnyToolDefinition | undefined {
+  return toolDefinitions(cwd).find((definition) => definition.name === name);
+}
+
+/**
+ * Runs a Dust tool call through pi's own tool implementation.
+ *
+ * pi tools signal failure by throwing, and return content blocks that may
+ * include images; MCP results here are text, so non-text blocks are dropped.
+ */
+export async function executeMcpTool(
+  name: string,
+  args: McpToolArgs,
+  ctx: ExtensionContext,
+  signal?: AbortSignal,
+): Promise<McpToolResult> {
+  const definition = findDefinition(name, ctx);
+  if (!definition) {
+    return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
   }
 
-  const resolvedPath = realpathSync(resolve(normalizedPath));
-  const allowedPaths = configuredAllowedPaths();
-
-  if (!allowedPaths.some((basePath) => isPathAllowed(resolvedPath, basePath))) {
-    throw new Error(`Path '${filePath}' is outside allowed directories`);
-  }
-
-  return resolvedPath;
-}
-
-function displayPath(filePath: string): string {
-  const normalizedPath = filePath.trim();
-  if (normalizedPath.length === 0) return normalizedPath;
   try {
-    return realpathSync(normalizedPath);
-  } catch {
-    return resolve(normalizedPath);
-  }
-}
+    const result = await definition.execute(
+      `dust-${name}-${Date.now()}`,
+      args as never,
+      signal,
+      undefined,
+      ctx,
+    );
 
-function executeBash(args: McpToolArgs): McpToolResult {
-  const command = String(args.command ?? "");
-  const timeoutSecs = typeof args.timeout === "number" ? args.timeout : undefined;
-  try {
-    const stdout = execSync(command, {
-      timeout: timeoutSecs !== undefined ? timeoutSecs * 1000 : undefined,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    return { content: [{ type: "text", text: stdout }], isError: false };
+    const text = (result.content ?? [])
+      .filter((block): block is { type: "text"; text: string } => block?.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+
+    return { content: [{ type: "text", text }], isError: false };
   } catch (err: unknown) {
-    const execError = err as CommandExecutionError;
-    const output = [execError.stdout, execError.stderr].filter(Boolean).join("\n") || errorMessage(err);
-    return { content: [{ type: "text", text: output }], isError: true };
+    return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
   }
 }
 
-function executeRead(args: McpToolArgs): McpToolResult {
-  const filePath = String(args.path ?? "");
-  try {
-    const resolvedPath = resolveToolPath(filePath);
-    const content = readFileSync(resolvedPath, "utf8");
-    const lines = content.split("\n");
-    const offset = typeof args.offset === "number" ? Math.max(0, args.offset - 1) : 0;
-    const limit = typeof args.limit === "number" ? Math.max(1, args.limit) : undefined;
-    const sliced = limit !== undefined ? lines.slice(offset, offset + limit) : lines.slice(offset);
-    return { content: [{ type: "text", text: sliced.join("\n") }], isError: false };
-  } catch (err: unknown) {
-    return { content: [{ type: "text", text: `Error reading file: ${errorMessage(err)}` }], isError: true };
-  }
-}
-
-function executeEdit(args: McpToolArgs): McpToolResult {
-  const filePath = String(args.path ?? "");
-  const oldText = String(args.oldText ?? "");
-  const newText = String(args.newText ?? "");
-  try {
-    if (oldText.length === 0) {
-      return {
-        content: [{ type: "text", text: "Error editing file: oldText must not be empty" }],
-        isError: true,
-      };
-    }
-
-    const resolvedPath = resolveToolPath(filePath);
-    const content = readFileSync(resolvedPath, "utf8");
-    if (!content.includes(oldText)) {
-      return {
-        content: [{ type: "text", text: `Error: oldText not found in ${resolvedPath}` }],
-        isError: true,
-      };
-    }
-    const matchIndex = content.indexOf(oldText);
-    const updated = content.slice(0, matchIndex) + newText + content.slice(matchIndex + oldText.length);
-    writeFileSync(resolvedPath, updated, "utf8");
-    return { content: [{ type: "text", text: `Successfully edited ${resolvedPath}` }], isError: false };
-  } catch (err: unknown) {
-    return { content: [{ type: "text", text: `Error editing file: ${errorMessage(err)}` }], isError: true };
-  }
-}
-
-export function executeMcpTool(name: string, args: McpToolArgs): McpToolResult {
-  switch (name) {
-    case "bash":
-      return executeBash(args);
-    case "read":
-      return executeRead(args);
-    case "edit":
-      return executeEdit(args);
-    default:
-      return {
-        content: [{ type: "text", text: `Unknown tool: ${name}` }],
-        isError: true,
-      };
-  }
-}
-
+/**
+ * Approval prompt body. pi renders tool calls with `renderCall`, but that
+ * produces a TUI Component and the Dust approval gate is a plain confirm
+ * dialog, so the most useful arguments are summarised as text instead.
+ */
 export function buildConfirmMessage(toolName: string, args: McpToolArgs): string {
+  const preview = (value: unknown, max = 200): string => {
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    if (text === undefined) return "";
+    return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+  };
+
   switch (toolName) {
     case "bash":
       return String(args.command ?? "");
-    case "read": {
-      const parts = [displayPath(String(args.path ?? ""))];
-      if (args.offset != null) parts.push(`offset: ${args.offset}`);
-      if (args.limit != null) parts.push(`limit: ${args.limit}`);
-      return parts.join("  ");
+    case "read":
+    case "ls":
+      return preview(args.path ?? args.dir ?? "");
+    case "write": {
+      const content = String(args.content ?? "");
+      const lineCount = content === "" ? 0 : content.split("\n").length;
+      return `${String(args.path ?? "")}  (${lineCount} lines, ${content.length} bytes)\n${preview(content)}`;
     }
-    case "edit": {
-      const path = displayPath(String(args.path ?? ""));
-      const oldText = String(args.oldText ?? "");
-      const newText = String(args.newText ?? "");
-      const preview = (value: string) => value.length > 80 ? value.slice(0, 77) + "..." : value;
-      return `${path}\n- ${preview(oldText)}\n+ ${preview(newText)}`;
-    }
+    case "edit":
+      return `${String(args.path ?? "")}\n- ${preview(args.oldText ?? args.old_text, 80)}\n+ ${preview(args.newText ?? args.new_text, 80)}`;
+    case "grep":
+    case "find":
+      return preview(args.pattern ?? args.query ?? JSON.stringify(args));
     default:
       return JSON.stringify(args);
   }
