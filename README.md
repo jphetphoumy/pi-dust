@@ -41,20 +41,22 @@ npm run prepare
 npm run check
 ```
 
-Or, with the justfile shortcuts:
+Or, with the justfile shortcuts (see `justfile` for the full recipe list):
 
 ```bash
 just setup-dev
 just check
 ```
 
-If you use Nix, the repository also provides a dev shell:
+If you use Nix, the repository also provides a dev shell (`flake.nix`, currently `nodejs_22`; it runs `npm install` automatically on first entry when `node_modules/` is missing):
 
 ```bash
 nix develop
 just setup-dev
 just check
 ```
+
+## Debugging
 
 For verbose development:
 
@@ -63,21 +65,20 @@ pi --verbose
 tail -f /tmp/pi-dust.log
 ```
 
+See [`docs/debugging.md`](docs/debugging.md) for log locations, redaction rules, and common troubleshooting cases.
+
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [Getting started](docs/getting-started.md)
-- [Architecture](docs/architecture.md)
-- [Development guide](docs/development.md)
+- [`CLAUDE.md`](CLAUDE.md) — architecture and module reference
 - [Debugging guide](docs/debugging.md)
 - [Release and maintenance](docs/release.md)
-- [Historical specs](docs/specs/README.md)
+- [Historical specs](docs/specs/README.md) — reverse-engineered Dust protocol behaviour (SSE cursor semantics, the approval handshake, etc.)
 
 ## Repository layout
 
 ```text
 .
-├── docs/        Project documentation and historical specs
+├── docs/        Debugging guide, release notes, and historical specs
 ├── src/         Extension source code
 ├── test/        Domain-focused test suites
 └── .github/     CI, release and repository automation
@@ -91,3 +92,5 @@ npm run coverage
 npm run changelog
 npm run prepush
 ```
+
+See [`CLAUDE.md`](CLAUDE.md) for the full command reference (including `just` shortcuts) and the module-by-module architecture.

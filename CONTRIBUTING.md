@@ -4,9 +4,8 @@ Thanks for contributing to `pi-dust`.
 
 ## Before you start
 
-- read [`README.md`](README.md) for the project overview
-- read [`docs/development.md`](docs/development.md) for the local workflow
-- read [`docs/architecture.md`](docs/architecture.md) if your change touches core behavior
+- read [`README.md`](README.md) for the project overview and quick start
+- read [`CLAUDE.md`](CLAUDE.md) for the architecture and module reference if your change touches core behavior
 
 ## Setup
 

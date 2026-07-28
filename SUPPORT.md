@@ -12,7 +12,7 @@ Please use GitHub Issues for:
 ## Before opening an issue
 
 - read [`README.md`](README.md)
-- check the guides in [`docs/`](docs/README.md)
+- check [`CLAUDE.md`](CLAUDE.md) and the guides in [`docs/`](docs/)
 - review existing open and closed issues
 
 ## Security issues
