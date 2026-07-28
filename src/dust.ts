@@ -7,6 +7,7 @@ import { registerDustSessionEvents } from "./dust-session-events.js";
 import { clearInvalidated, persistCredentialState } from "./dust-state.js";
 import { createDustStreamHandler } from "./dust-stream-provider.js";
 import type { DustCredentials, ExtensionAPIWithEvents } from "./dust-types.js";
+import { registerDustApprovalMode } from "./dust-approval.js";
 import { registerDustToolRenderer } from "./dust-tool-render.js";
 import { registerDustWorkspaceCommand } from "./dust-workspace.js";
 
@@ -38,5 +39,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   registerDustToolRenderer(pi);
+  registerDustApprovalMode(pi, runtime);
   registerDustWorkspaceCommand(pi);
 }

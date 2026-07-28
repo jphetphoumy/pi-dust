@@ -1,6 +1,7 @@
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, fetchAgents, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
+import { refreshApprovalStatus } from "./dust-approval.js";
 import { applyRuntimeContext, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import {
   clearInvalidated,
@@ -103,6 +104,7 @@ export function registerDustSessionEvents(
     const event = _event as { reason?: string };
     debugLog("dust:session", "Handling session_switch", event);
     applyRuntimeContext(runtime, ctx);
+    refreshApprovalStatus(runtime, ctx);
 
     if (event.reason === "resume") {
       const sessionFile = ctx.sessionManager?.getSessionFile?.();
@@ -133,6 +135,7 @@ export function registerDustSessionEvents(
 
     const sessionFile = ctx.sessionManager?.getSessionFile?.();
     applyRuntimeContext(runtime, ctx);
+    refreshApprovalStatus(runtime, ctx);
 
     const existingEntries = ctx.sessionManager?.getEntries?.() ?? [];
     runtime.conversationId = existingEntries.length > 0 && sessionFile

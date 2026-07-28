@@ -43,6 +43,11 @@ export class DustSessionRuntime {
   mcpRequestsAbortController: AbortController | null = null;
   sessionContext: SessionContextController = NOOP_SESSION_CONTEXT;
   confirmFn: (title: string, message: string) => Promise<boolean> = NOOP_CONFIRM;
+  /**
+   * When true, tool calls run without prompting. Session-scoped and off by
+   * default, so a fresh session never silently executes tools.
+   */
+  autoApprove = false;
   preApprovedActions = new Map<string, boolean>();
   pendingApprovalPromise: Promise<void> | null = null;
   private resolveApprovalGateFn: (() => void) | null = null;
@@ -136,7 +141,14 @@ export function applyRuntimeContext(runtime: DustSessionRuntime, ctx: PiRuntimeC
   // session controller.
   runtime.extensionContext = ctx;
   runtime.sessionContext = buildSessionContext(ctx);
-  runtime.confirmFn = ctx.ui?.confirm
-    ? (title: string, message: string) => ctx.ui!.confirm!(title, message)
-    : NOOP_CONFIRM;
+  // Single choke point for both approval paths: Dust's server-side
+  // tool_approve_execution gate and the local tools/call gate both land here.
+  const confirm = ctx.ui?.confirm;
+  runtime.confirmFn = async (title: string, message: string) => {
+    if (runtime.autoApprove) {
+      debugLog("dust:approval", "Auto-approved without prompting", { title });
+      return true;
+    }
+    return confirm ? confirm(title, message) : NOOP_CONFIRM();
+  };
 }
