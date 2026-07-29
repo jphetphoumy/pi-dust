@@ -91,8 +91,11 @@ export interface PendingAttachment {
   bytes: Uint8Array<ArrayBuffer>;
   /** Content hash, used to skip re-uploading the same file in one conversation. */
   hash: string;
-  /** The exact marker text to replace once the file is attached. */
+  /** The exact text — an inlined `<file>` block or an `@` mention — this replaces. */
   marker: string;
+  /** Where `marker` sits in the message, so rewriting one never hits another. */
+  start: number;
+  end: number;
 }
 
 export interface ParsedUserMessage {

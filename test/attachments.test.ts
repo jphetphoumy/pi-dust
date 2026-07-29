@@ -34,7 +34,7 @@ afterAll(() => {
 
 describe("parseUserMessage", () => {
   it("returns plain text untouched when there is no attachment marker", () => {
-    const parsed = parseUserMessage({ role: "user", content: "just a question" });
+    const parsed = parseUserMessage({ role: "user", content: "just a question" }, dir);
     expect(parsed).toEqual({ text: "just a question", attachments: [] });
   });
 
@@ -45,7 +45,7 @@ describe("parseUserMessage", () => {
         { type: "text", text: "hello " },
         { type: "text", text: "world" },
       ],
-    });
+    }, dir);
     expect(parsed.text).toBe("hello world");
   });
 
@@ -53,7 +53,7 @@ describe("parseUserMessage", () => {
     const { path, content } = writeLargeFile("big.ts");
     const text = `${textMarker(path, content)}explain this`;
 
-    const parsed = parseUserMessage({ role: "user", content: text });
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
     expect(parsed.text).toBe(text);
     expect(parsed.attachments).toHaveLength(1);
@@ -67,7 +67,7 @@ describe("parseUserMessage", () => {
 
   it("falls back to text/plain for unknown extensions", () => {
     const { path, content } = writeLargeFile("notes.unknownext");
-    const parsed = parseUserMessage({ role: "user", content: textMarker(path, content) });
+    const parsed = parseUserMessage({ role: "user", content: textMarker(path, content) }, dir);
     expect(parsed.attachments[0].contentType).toBe("text/plain");
   });
 
@@ -76,7 +76,7 @@ describe("parseUserMessage", () => {
     const content = "const a = 1;";
     writeFileSync(path, content, "utf8");
 
-    const parsed = parseUserMessage({ role: "user", content: textMarker(path, content) });
+    const parsed = parseUserMessage({ role: "user", content: textMarker(path, content) }, dir);
 
     expect(parsed.attachments).toEqual([]);
   });
@@ -87,7 +87,7 @@ describe("parseUserMessage", () => {
     writeFileSync(path, content, "utf8");
 
     const text = `${textMarker(path, content)}what is this`;
-    const parsed = parseUserMessage({ role: "user", content: text });
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
     expect(parsed.attachments).toHaveLength(1);
     expect(Buffer.from(parsed.attachments[0].bytes).toString("utf8")).toBe(content);
@@ -99,7 +99,7 @@ describe("parseUserMessage", () => {
     const parsed = parseUserMessage({
       role: "user",
       content: textMarker(path, `${content}-stale`),
-    });
+    }, dir);
     expect(parsed.attachments).toEqual([]);
   });
 
@@ -107,7 +107,7 @@ describe("parseUserMessage", () => {
     const parsed = parseUserMessage({
       role: "user",
       content: textMarker(join(dir, "ghost.ts"), "x".repeat(ATTACHMENT_MIN_TEXT_BYTES + 10)),
-    });
+    }, dir);
     expect(parsed.attachments).toEqual([]);
   });
 
@@ -115,7 +115,7 @@ describe("parseUserMessage", () => {
     const { path, content } = writeLargeFile("prefix.ts");
     const text = `look at ${textMarker(path, content)}`;
 
-    const parsed = parseUserMessage({ role: "user", content: text });
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
     expect(parsed.attachments).toEqual([]);
   });
@@ -131,7 +131,7 @@ describe("parseUserMessage", () => {
         { type: "text", text: `<file name="${path}"></file>\nwhat is on screen` },
         { type: "image", mimeType: "image/png", data },
       ],
-    });
+    }, dir);
 
     expect(parsed.attachments).toHaveLength(1);
     const [attachment] = parsed.attachments;
@@ -150,7 +150,7 @@ describe("parseUserMessage", () => {
         { type: "text", text: `<file name="${path}"></file>\n` },
         { type: "image", mimeType: "image/png", data: Buffer.from("x").toString("base64") },
       ],
-    });
+    }, dir);
     expect(parsed.attachments).toHaveLength(1);
   });
 
@@ -163,7 +163,7 @@ describe("parseUserMessage", () => {
         { type: "text", text: `<file name="${path}">resized from 4000x3000</file>\n` },
         { type: "image", mimeType: "image/jpeg", data: Buffer.from("jpeg-bytes").toString("base64") },
       ],
-    });
+    }, dir);
 
     expect(parsed.attachments).toHaveLength(1);
     expect(Buffer.from(parsed.attachments[0].bytes).toString("utf8")).toBe("jpeg-bytes");
@@ -176,7 +176,7 @@ describe("parseUserMessage", () => {
     const parsed = parseUserMessage({
       role: "user",
       content: `<file name="${path}">Image too large to process</file>\n`,
-    });
+    }, dir);
     expect(parsed.attachments).toEqual([]);
   });
 
@@ -194,7 +194,7 @@ describe("parseUserMessage", () => {
         },
         { type: "image", mimeType: "image/png", data: Buffer.from("png").toString("base64") },
       ],
-    });
+    }, dir);
 
     expect(parsed.attachments.map((a) => a.fileName)).toEqual(["both.ts", "both.png"]);
   });
@@ -204,7 +204,7 @@ describe("parseUserMessage", () => {
     const parsed = parseUserMessage({
       role: "user",
       content: `${textMarker(path, content)}${textMarker(path, content)}`,
-    });
+    }, dir);
 
     expect(parsed.attachments).toHaveLength(2);
     expect(parsed.attachments[0].hash).toBe(parsed.attachments[1].hash);
@@ -214,7 +214,7 @@ describe("parseUserMessage", () => {
     const { path, content } = writeLargeFile("second.ts");
     const text = `${textMarker(join(dir, "ghost.ts"), "body")}${textMarker(path, content)}`;
 
-    const parsed = parseUserMessage({ role: "user", content: text });
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
     expect(parsed.attachments).toEqual([]);
   });
@@ -224,7 +224,7 @@ describe("applyAttachmentPointers", () => {
   it("replaces the inlined body with a pointer carrying the local path and file id", () => {
     const { path, content } = writeLargeFile("pointer.ts");
     const text = `${textMarker(path, content)}explain`;
-    const parsed = parseUserMessage({ role: "user", content: text });
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
     const rewritten = applyAttachmentPointers(text, [attached(parsed.attachments[0], "fil_123")]);
 
@@ -238,15 +238,127 @@ describe("applyAttachmentPointers", () => {
     expect(applyAttachmentPointers(text, [])).toBe(text);
   });
 
-  it("replaces every occurrence of a repeated marker", () => {
+  it("rewrites each occurrence of a repeated file at its own position", () => {
     const { path, content } = writeLargeFile("repeat.ts");
     const text = `${textMarker(path, content)}${textMarker(path, content)}`;
-    const parsed = parseUserMessage({ role: "user", content: text });
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
-    const rewritten = applyAttachmentPointers(text, [attached(parsed.attachments[0], "fil_9")]);
+    const rewritten = applyAttachmentPointers(
+      text,
+      parsed.attachments.map((attachment) => attached(attachment, "fil_9")),
+    );
 
     expect(rewritten).toBe(
       `<file name="${path}" attached="fil_9" />\n<file name="${path}" attached="fil_9" />\n`,
     );
+  });
+
+  // A mention is bare text, so replacing it by string match would also hit
+  // `@big.ts.bak`, which is a different file.
+  it("rewrites a mention without touching a longer path that starts the same way", () => {
+    writeLargeFile("prefix-collide.ts");
+    writeLargeFile("prefix-collide.ts.bak");
+    const text = "@prefix-collide.ts and @prefix-collide.ts.bak";
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
+
+    const rewritten = applyAttachmentPointers(text, [attached(parsed.attachments[0], "fil_a")]);
+
+    expect(rewritten).toBe(
+      `<file name="${join(dir, "prefix-collide.ts")}" attached="fil_a" /> and @prefix-collide.ts.bak`,
+    );
+  });
+});
+
+describe("parseUserMessage: @ mentions typed in the TUI", () => {
+  it("attaches a file mentioned by a relative path", () => {
+    writeLargeFile("mentioned.ts");
+    const parsed = parseUserMessage({ role: "user", content: "@mentioned.ts explain this" }, dir);
+
+    expect(parsed.attachments).toHaveLength(1);
+    const [attachment] = parsed.attachments;
+    expect(attachment.path).toBe(join(dir, "mentioned.ts"));
+    expect(attachment.fileName).toBe("mentioned.ts");
+    expect(attachment.contentType).toBe("text/typescript");
+    expect(attachment.marker).toBe("@mentioned.ts");
+  });
+
+  it("attaches a file mentioned by an absolute path", () => {
+    const { path } = writeLargeFile("absolute.ts");
+    const parsed = parseUserMessage({ role: "user", content: `look at @${path}` }, dir);
+
+    expect(parsed.attachments[0].path).toBe(path);
+  });
+
+  it("attaches a quoted path containing spaces", () => {
+    writeLargeFile("with space.ts");
+    const parsed = parseUserMessage({ role: "user", content: '@"with space.ts" please' }, dir);
+
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].fileName).toBe("with space.ts");
+    expect(parsed.attachments[0].marker).toBe('@"with space.ts"');
+  });
+
+  it("uploads a mentioned image, which the agent could not read otherwise", () => {
+    const path = join(dir, "mention.png");
+    writeFileSync(path, "png-bytes");
+    const parsed = parseUserMessage({ role: "user", content: "@mention.png what is this" }, dir);
+
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].contentType).toBe("image/png");
+    expect(Buffer.from(parsed.attachments[0].bytes).toString("utf8")).toBe("png-bytes");
+  });
+
+  it("leaves a small mentioned file to the local read tool", () => {
+    writeFileSync(join(dir, "mention-small.ts"), "const a = 1;", "utf8");
+    const parsed = parseUserMessage({ role: "user", content: "@mention-small.ts" }, dir);
+
+    expect(parsed.attachments).toEqual([]);
+  });
+
+  it("ignores a mention that does not name an existing file", () => {
+    const parsed = parseUserMessage({ role: "user", content: "@nope.ts and @also/missing" }, dir);
+    expect(parsed.attachments).toEqual([]);
+  });
+
+  it("ignores a mention that names a directory", () => {
+    const parsed = parseUserMessage({ role: "user", content: "@." }, dir);
+    expect(parsed.attachments).toEqual([]);
+  });
+
+  it("ignores an @ that is not a mention", () => {
+    writeLargeFile("inbox.ts");
+    const parsed = parseUserMessage(
+      { role: "user", content: "mail dev@inbox.ts about the @Component decorator" },
+      dir,
+    );
+    expect(parsed.attachments).toEqual([]);
+  });
+
+  it("attaches every mention in one message", () => {
+    writeLargeFile("first-mention.ts");
+    writeLargeFile("second-mention.ts");
+    const parsed = parseUserMessage(
+      { role: "user", content: "compare @first-mention.ts with @second-mention.ts" },
+      dir,
+    );
+
+    expect(parsed.attachments.map((a) => a.fileName)).toEqual([
+      "first-mention.ts",
+      "second-mention.ts",
+    ]);
+  });
+
+  it("reads mentions that follow pi's inlined markers", () => {
+    const { path, content } = writeLargeFile("inlined-too.ts");
+    writeLargeFile("after-marker.ts");
+    const parsed = parseUserMessage(
+      { role: "user", content: `${textMarker(path, content)}also @after-marker.ts` },
+      dir,
+    );
+
+    expect(parsed.attachments.map((a) => a.fileName)).toEqual([
+      "inlined-too.ts",
+      "after-marker.ts",
+    ]);
   });
 });

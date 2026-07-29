@@ -12,6 +12,8 @@ function makeAttachment(overrides: Partial<PendingAttachment> = {}): PendingAtta
     bytes: Buffer.from("const answer = 42;"),
     hash: "hash-1",
     marker: '<file name="/home/dev/app/src/big.ts">\nconst answer = 42;\n</file>\n',
+    start: 0,
+    end: 60,
     ...overrides,
   };
 }

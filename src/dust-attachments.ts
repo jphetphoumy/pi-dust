@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { readFileSync, statSync } from "fs";
-import { basename, extname } from "path";
+import { basename, extname, resolve } from "path";
 import {
   ATTACHMENT_MAX_IMAGE_BYTES,
   ATTACHMENT_MAX_TEXT_BYTES,
@@ -85,9 +85,20 @@ function makeAttachment(
   path: string,
   contentType: string,
   bytes: Uint8Array<ArrayBuffer>,
-  marker: string,
+  text: string,
+  start: number,
+  end: number,
 ): PendingAttachment {
-  return { path, fileName: basename(path), contentType, bytes, hash: hashBytes(bytes), marker };
+  return {
+    path,
+    fileName: basename(path),
+    contentType,
+    bytes,
+    hash: hashBytes(bytes),
+    marker: text.slice(start, end),
+    start,
+    end,
+  };
 }
 
 function collectContent(message: ChatMessageLike): { text: string; images: MessageContentBlock[] } {
@@ -118,23 +129,81 @@ function readTextFile(path: string): string | null {
 }
 
 /**
- * Splits pi's `@file` inlining back out of a user message.
- *
- * pi's CLI file processor prefixes the message with one `<file name="...">`
- * marker per `@`-mentioned file — the whole body for a text file, an empty tag
- * (or processing hints) for an image, whose bytes ride along as an `image`
- * content block. The text ones are billed as prompt tokens on every later turn
- * of the conversation and the image ones were dropped outright, so both are
- * pulled out here to be uploaded to Dust instead.
- *
- * Markers are only recognised as a prefix run, and a text marker only counts
- * when its body still matches the file on disk byte for byte. That keeps a
- * `<file name="...">` the user typed themselves — or one quoted inside an
- * attached file — from being mistaken for an attachment. The first marker that
- * fails to verify ends the scan: the ones after it can no longer be located
- * reliably, so they stay inline, which is the current behaviour anyway.
+ * Reads a file an `@` mention names, or `null` when the mention does not point
+ * at one — a directory, a path that does not exist, or an `@` that was never a
+ * mention at all (`dev@example.com`, a `@Component` decorator).
  */
-export function parseUserMessage(message: ChatMessageLike): ParsedUserMessage {
+function readMentionedFile(path: string): Uint8Array<ArrayBuffer> | null {
+  try {
+    const stats = statSync(path);
+    if (!stats.isFile()) {
+      return null;
+    }
+    const limit = isImagePath(path) ? ATTACHMENT_MAX_IMAGE_BYTES : ATTACHMENT_MAX_TEXT_BYTES;
+    if (stats.size > limit) {
+      return null;
+    }
+    return readFileSync(path);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Scans the message for pi's `@path` mentions.
+ *
+ * The interactive editor's `@` is only a path autocomplete: it writes the path
+ * into the message as plain text and leaves reading it to the agent. So unlike
+ * the CLI's inliner there is nothing to undo here — the point is that a
+ * mentioned file reaches Dust at all, which for an image is the difference
+ * between the model seeing it and the agent staring at a path it cannot read.
+ *
+ * A mention has to start the message or follow whitespace, and has to name a
+ * file that exists; everything else is left alone.
+ */
+function parseMentions(text: string, from: number, cwd: string): PendingAttachment[] {
+  const attachments: PendingAttachment[] = [];
+  const mention = /(^|\s)@("[^"]+"|\S+)/g;
+  mention.lastIndex = from;
+
+  for (let match = mention.exec(text); match !== null; match = mention.exec(text)) {
+    const start = match.index + match[1].length;
+    const end = start + 1 + match[2].length;
+    const quoted = match[2].startsWith('"');
+    const path = resolve(cwd, quoted ? match[2].slice(1, -1) : match[2]);
+
+    const bytes = readMentionedFile(path);
+    if (!bytes) continue;
+    if (!isImagePath(path) && bytes.byteLength < ATTACHMENT_MIN_TEXT_BYTES) continue;
+
+    attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, start, end));
+  }
+
+  return attachments;
+}
+
+/**
+ * Finds the files a user attached with `@`, in either form pi produces.
+ *
+ * The CLI (`pi @foo.ts "..."`) inlines: it prefixes the message with one
+ * `<file name="...">` marker per file — the whole body for a text file, an
+ * empty tag (or processing hints) for an image whose bytes ride along as an
+ * `image` content block. The text bodies are billed as prompt tokens on every
+ * later turn of the conversation and the image blocks never reached Dust at
+ * all, so both are pulled back out here.
+ *
+ * The interactive editor does not inline: its `@` is a path autocomplete that
+ * leaves `@path` in the message as plain text. Those are picked up too — see
+ * `parseMentions`.
+ *
+ * Inlined markers are only recognised as a prefix run, and a text marker only
+ * counts when its body still matches the file on disk byte for byte. That
+ * keeps a `<file name="...">` the user typed themselves — or one quoted inside
+ * an attached file — from being mistaken for an attachment. The first marker
+ * that fails to verify ends that scan: the ones after it can no longer be
+ * located reliably, so they stay inline, which is the current behaviour anyway.
+ */
+export function parseUserMessage(message: ChatMessageLike, cwd: string): ParsedUserMessage {
   const { text, images } = collectContent(message);
   const attachments: PendingAttachment[] = [];
   let position = 0;
@@ -164,7 +233,6 @@ export function parseUserMessage(message: ChatMessageLike): ParsedUserMessage {
 
     let markerEnd = closeAt + MARKER_CLOSE.length;
     if (text.startsWith("\n", markerEnd)) markerEnd += 1;
-    const marker = text.slice(position, markerEnd);
 
     if (image) {
       // pi resizes images before attaching them, so the block's bytes — not the
@@ -174,30 +242,46 @@ export function parseUserMessage(message: ChatMessageLike): ParsedUserMessage {
       nextImage += 1;
       const bytes = Buffer.from(block.data, "base64");
       if (bytes.byteLength <= ATTACHMENT_MAX_IMAGE_BYTES) {
-        attachments.push(makeAttachment(path, block.mimeType ?? contentTypeForPath(path), bytes, marker));
+        const contentType = block.mimeType ?? contentTypeForPath(path);
+        attachments.push(makeAttachment(path, contentType, bytes, text, position, markerEnd));
       }
     } else {
       const bytes = Buffer.from(diskContent as string, "utf8");
       if (bytes.byteLength >= ATTACHMENT_MIN_TEXT_BYTES) {
-        attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, marker));
+        attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, position, markerEnd));
       }
     }
 
     position = markerEnd;
   }
 
+  attachments.push(...parseMentions(text, position, cwd));
   return { text, attachments };
 }
 
 /**
- * Swaps each uploaded file's inlined body for a pointer to the conversation
+ * Swaps each uploaded file's marker for a pointer to the conversation
  * attachment. The local path stays in the pointer: the copy in the conversation
  * is a read-only snapshot, and edits still have to target the file on disk.
+ *
+ * Rewriting happens by position rather than by string match, so one mention
+ * never rewrites another that merely starts the same way (`@a.ts` inside
+ * `@a.ts.bak`).
  */
 export function applyAttachmentPointers(text: string, attached: AttachedFile[]): string {
-  return attached.reduce((current, { attachment, fileId }) => {
+  const ordered = [...attached].sort((a, b) => a.attachment.start - b.attachment.start);
+  let rewritten = "";
+  let position = 0;
+
+  for (const { attachment, fileId } of ordered) {
+    // A file attached twice yields two markers; a stale span would mean the
+    // caller passed spans from a different text.
+    if (attachment.start < position) continue;
     const pointer = `<file name="${attachment.path}" attached="${fileId}" />`;
-    const replacement = attachment.marker.endsWith("\n") ? `${pointer}\n` : pointer;
-    return current.split(attachment.marker).join(replacement);
-  }, text);
+    rewritten += text.slice(position, attachment.start);
+    rewritten += attachment.marker.endsWith("\n") ? `${pointer}\n` : pointer;
+    position = attachment.end;
+  }
+
+  return rewritten + text.slice(position);
 }

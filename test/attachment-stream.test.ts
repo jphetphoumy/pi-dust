@@ -58,6 +58,8 @@ async function setup() {
   await sessionStartHandler!({}, {
     modelRegistry: {},
     ...piToolContextFields(),
+    // `@` mentions are resolved against the session's working directory.
+    cwd: dir,
     sessionManager: {
       getSessionFile: vi.fn().mockReturnValue("/sessions/attach.json"),
       getEntries: vi.fn().mockReturnValue([]),
@@ -295,6 +297,21 @@ describe("@file attachments in a turn", () => {
     });
     const create = bodyOf(fetchMock, (url) => url.endsWith("/assistant/conversations"));
     expect(create.contentFragments).toEqual([{ title: "shot.png", fileId: "fil_1" }]);
+  });
+
+  // The interactive editor does not inline: `@big.ts` reaches the extension as
+  // plain text, which is the form most users actually send.
+  it("uploads a file mentioned as @path in the interactive prompt", async () => {
+    const streamSimple = await setup();
+    const fetchMock = makeTurnFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await runTurn(streamSimple, "@big.ts explain this");
+
+    expect(bodyOf(fetchMock, (url) => url.endsWith("/files"))).toMatchObject({ fileName: "big.ts" });
+    const create = bodyOf(fetchMock, (url) => url.endsWith("/assistant/conversations"));
+    expect(create.contentFragments).toEqual([{ title: "big.ts", fileId: "fil_1" }]);
+    expect(create.message.content).toContain(`<file name="${filePath}" attached="fil_1" /> explain this`);
   });
 
   it("leaves a message with no attachment untouched", async () => {

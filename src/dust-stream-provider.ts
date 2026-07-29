@@ -37,10 +37,10 @@ function buildAuthHeaders(accessToken: string): Record<string, string> {
   };
 }
 
-function extractUserMessage(context: StreamContextLike): ParsedUserMessage {
+function extractUserMessage(context: StreamContextLike, cwd: string): ParsedUserMessage {
   const messages = context?.messages ?? [];
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-  return lastUserMessage ? parseUserMessage(lastUserMessage) : { text: "", attachments: [] };
+  return lastUserMessage ? parseUserMessage(lastUserMessage, cwd) : { text: "", attachments: [] };
 }
 
 function extractSystemPrompt(context: StreamContextLike): string {
@@ -601,8 +601,8 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
 
         await ensureMcpServer(runtime, baseUrl, resolveAuthHeaders(), refreshAuth);
 
-        const { text: inlinedUserText, attachments } = extractUserMessage(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
+        const { text: inlinedUserText, attachments } = extractUserMessage(context, cwd);
         const systemPrompt = [extractSystemPrompt(context), buildToolGuidance(cwd)]
           .filter((part) => part.length > 0)
           .join("\n\n");
