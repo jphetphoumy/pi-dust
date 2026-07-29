@@ -308,9 +308,21 @@ describe("parseUserMessage: @ mentions typed in the TUI", () => {
     expect(Buffer.from(parsed.attachments[0].bytes).toString("utf8")).toBe("png-bytes");
   });
 
-  it("leaves a small mentioned file to the local read tool", () => {
+  // The size floor only makes sense for the CLI's inlined form, where leaving
+  // the file inline is the cheaper alternative. Typing `@` is an explicit
+  // request, and silently ignoring it for small files — most source files are
+  // small — just looks broken.
+  it("attaches a mentioned file however small it is", () => {
     writeFileSync(join(dir, "mention-small.ts"), "const a = 1;", "utf8");
     const parsed = parseUserMessage({ role: "user", content: "@mention-small.ts" }, dir);
+
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].fileName).toBe("mention-small.ts");
+  });
+
+  it("ignores an empty mentioned file, which Dust rejects", () => {
+    writeFileSync(join(dir, "mention-empty.ts"), "", "utf8");
+    const parsed = parseUserMessage({ role: "user", content: "@mention-empty.ts" }, dir);
 
     expect(parsed.attachments).toEqual([]);
   });

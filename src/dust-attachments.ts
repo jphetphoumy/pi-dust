@@ -172,9 +172,12 @@ function parseMentions(text: string, from: number, cwd: string): PendingAttachme
     const quoted = match[2].startsWith('"');
     const path = resolve(cwd, quoted ? match[2].slice(1, -1) : match[2]);
 
+    // No size floor here, unlike the inlined form: there is no cheaper
+    // alternative to fall back to, and silently ignoring `@small-file.ts` —
+    // most source files are small — reads as the feature being broken.
+    // Dust rejects a zero-byte upload, so those are left alone.
     const bytes = readMentionedFile(path);
-    if (!bytes) continue;
-    if (!isImagePath(path) && bytes.byteLength < ATTACHMENT_MIN_TEXT_BYTES) continue;
+    if (!bytes || bytes.byteLength === 0) continue;
 
     attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, start, end));
   }
@@ -256,6 +259,22 @@ export function parseUserMessage(message: ChatMessageLike, cwd: string): ParsedU
   }
 
   attachments.push(...parseMentions(text, position, cwd));
+
+  // Logged even when nothing matched: "my `@file` was not uploaded" is
+  // otherwise indistinguishable from "the upload failed", and the two have
+  // nothing in common to investigate.
+  debugLog("dust:files", "Scanned the user message for attachments", {
+    cwd,
+    inlinedMarkers: position > 0,
+    imageBlocks: images.length,
+    attachments: attachments.map((attachment) => ({
+      path: attachment.path,
+      contentType: attachment.contentType,
+      fileSize: attachment.bytes.byteLength,
+      marker: attachment.marker.slice(0, 80),
+    })),
+  });
+
   return { text, attachments };
 }
 
