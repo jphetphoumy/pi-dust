@@ -191,9 +191,17 @@ export function getStoredCredentials(): DustCredentials | null {
 /**
  * Persists only the Dust-specific half of a credential object. Token fields are
  * deliberately dropped: pi rotates and stores those itself.
+ *
+ * `conversations` is dropped too. Callers hold a credential snapshot read at
+ * the top of a handler and write it back much later, by which time a session
+ * may have attached to or created a conversation; writing the snapshot's map
+ * back would silently undo that. The map is written only by
+ * `saveConversationId` and `forgetConversationId`, never as part of a
+ * credential.
  */
 export function persistCredentialState(credentials: DustCredentials): void {
-  const state = pickStateFields(credentials as unknown as Record<string, unknown>);
+  const { conversations: _conversations, ...rest } = credentials;
+  const state = pickStateFields(rest as unknown as Record<string, unknown>);
   patchDustState(state);
 }
 
@@ -203,6 +211,18 @@ export function markInvalidated(): void {
 
 export function clearInvalidated(): void {
   patchDustState({ invalidated: false });
+}
+
+/**
+ * Forgets a session's conversation, for when Dust says it is gone. Left in
+ * place it would be re-checked and re-reported on every later start of that
+ * session, until some message happened to overwrite it.
+ */
+export function forgetConversationId(sessionFile: string): void {
+  const conversations = { ...(readDustState().conversations ?? {}) };
+  if (!(sessionFile in conversations)) return;
+  delete conversations[sessionFile];
+  patchDustState({ conversations });
 }
 
 export function saveConversationId(sessionFile: string, conversationId: string): void {

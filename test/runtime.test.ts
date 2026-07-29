@@ -7,7 +7,8 @@ import {
   invalidateRuntimeCredentials,
   shouldRefreshAccessToken,
 } from "../src/dust-runtime.js";
-import { makeCredentials, readState, seedLoggedIn, useTempAgentDir } from "./helpers/dust-fixtures.js";
+import { persistCredentialState } from "../src/dust-state.js";
+import { makeCredentials, readState, seedLoggedIn, sessionPath, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust runtime", () => {
   useTempAgentDir();
@@ -44,10 +45,12 @@ describe("dust runtime", () => {
   });
 
   it("buildSessionContext persists conversation ids in extension state", () => {
-    seedLoggedIn(makeCredentials({ conversations: { old: "conv-old" } }));
+    const old = sessionPath("old.jsonl");
+    const current = sessionPath("session-a.jsonl");
+    seedLoggedIn(makeCredentials({ conversations: { [old]: "conv-old" } }));
     const ctx = {
       modelRegistry: {},
-      sessionManager: { getSessionFile: vi.fn().mockReturnValue("session-a") },
+      sessionManager: { getSessionFile: vi.fn().mockReturnValue(current) },
     } as any;
 
     const sessionContext = buildSessionContext(ctx);
@@ -55,9 +58,30 @@ describe("dust runtime", () => {
 
     expect(readState()).toMatchObject({
       conversations: {
-        old: "conv-old",
-        "session-a": "conv-123",
+        [old]: "conv-old",
+        [current]: "conv-123",
       },
+    });
+  });
+
+  it("persisting a stale credential snapshot leaves the conversation map alone", () => {
+    // Handlers read a credential at the top and write it back much later. If
+    // that write carried the snapshot's conversation map, a conversation
+    // attached or created in between would be silently dropped.
+    const first = sessionPath("session-a.jsonl");
+    const second = sessionPath("session-b.jsonl");
+    const stale = makeCredentials({ conversations: { [first]: "conv-old" } });
+    seedLoggedIn(stale);
+    const ctx = {
+      modelRegistry: {},
+      sessionManager: { getSessionFile: vi.fn().mockReturnValue(second) },
+    } as any;
+
+    buildSessionContext(ctx).saveConversationId("conv-new");
+    persistCredentialState({ ...stale, agents: [{ sId: "a1", name: "a1", description: "" }] });
+
+    expect(readState()).toMatchObject({
+      conversations: { [first]: "conv-old", [second]: "conv-new" },
     });
   });
 
