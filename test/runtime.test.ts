@@ -65,6 +65,44 @@ describe("dust runtime", () => {
     expect(runtime.pendingApprovalPromise).toBeNull();
   });
 
+  it("clearMcpState cancels an active turn — registration lost mid-turn, not just between turns", async () => {
+    // The merge of the resilience fix (clearMcpState() re-registers on a lost
+    // registration) with the cancel feature (clearMcpState() also cancels
+    // whatever turn is in flight) created this interaction, and nothing
+    // exercised it: mcp.test.ts's heartbeat-403 case fires clearMcpState()
+    // between turns, when activeTurn is already null, so cancelActiveTurn()
+    // there is a no-op. A registration lost *during* a turn is the case that
+    // actually has local tool work to stop.
+    const runtime = new DustSessionRuntime();
+    runtime.mcpServerId = "mcp-1";
+    runtime.mcpRequestsAbortController = new AbortController();
+    runtime.preApprovedActions.set("action-1", true);
+    runtime.createApprovalGate();
+    const gate = runtime.pendingApprovalPromise;
+
+    const turn = runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
+    expect(turn.cancelled).toBe(false);
+    expect(turn.toolAbortController.signal.aborted).toBe(false);
+
+    runtime.clearMcpState();
+
+    // cancelActiveTurn()'s effects: the turn is marked cancelled, its local
+    // tool work is aborted, and pre-approvals collected for it are dropped
+    // (a tool call refused for being cancelled never consumes its entry, so
+    // leaving the queue in place would auto-approve an unrelated tool call in
+    // a later turn).
+    expect(turn.cancelled).toBe(true);
+    expect(turn.toolAbortController.signal.aborted).toBe(true);
+    expect(runtime.preApprovedActions.size).toBe(0);
+    expect(runtime.isTurnCancelled()).toBe(true);
+    expect(runtime.activeTurn).toBeNull();
+
+    // And the approval gate is still resolved (not left hanging), same as
+    // the no-active-turn case above.
+    await expect(gate).resolves.toBeUndefined();
+    expect(runtime.pendingApprovalPromise).toBeNull();
+  });
+
   it("buildSessionContext persists conversation ids in extension state", () => {
     const old = sessionPath("old.jsonl");
     const current = sessionPath("session-a.jsonl");
