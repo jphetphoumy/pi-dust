@@ -1,4 +1,4 @@
-import { CANCELLED_MESSAGE, CANCELLED_TOOL_MESSAGE, DUST_HEADERS, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { CANCELLED_MESSAGE, CANCELLED_TOOL_MESSAGE, DUST_HEADERS, MCP_REGISTRATION_LOST_MESSAGE, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
@@ -7,7 +7,7 @@ import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.j
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
-import { invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
+import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
@@ -22,6 +22,10 @@ async function waitBeforeRetry(): Promise<true> {
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
+}
+
+function isRegistrationLostError(error: unknown): boolean {
+  return error instanceof Error && error.message === MCP_REGISTRATION_LOST_MESSAGE;
 }
 
 function buildAuthHeaders(accessToken: string): Record<string, string> {
@@ -83,6 +87,7 @@ async function ensureMcpServer(
   runtime: DustSessionRuntime,
   baseUrl: string,
   authHeaders: Record<string, string>,
+  refreshAuth: () => Promise<boolean>,
 ): Promise<void> {
   if (runtime.mcpServerId) {
     return;
@@ -92,15 +97,36 @@ async function ensureMcpServer(
   runtime.mcpServerId = serverId;
 
   // The listener and heartbeat outlive the access token that registered the
-  // server, so they must not close over the headers used above. Re-read the
-  // stored credential each time and fall back to those headers only if nothing
-  // is stored yet.
+  // server, so they must not close over the headers used above. Go through
+  // the single `currentAccessToken()` accessor (prefers a freshly refreshed
+  // in-memory token, with its own expiry, over storage — see its doc on
+  // DustSessionRuntime) and fall back to those headers only if nothing is
+  // available at all.
   const getAuthHeaders = (): Record<string, string> => {
-    const access = runtime.sessionContext.getCredentials()?.access;
+    const access = runtime.currentAccessToken();
     return access ? buildAuthHeaders(access) : authHeaders;
   };
 
-  runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, getAuthHeaders, serverId);
+  // Registration lapsed server-side (heartbeat got a 403/404, or the listener
+  // reconnect did): nothing left to talk to. Clear the runtime's MCP state so
+  // the next turn's ensureMcpServer call re-registers and reconnects, instead
+  // of short-circuiting on a dead `mcpServerId` forever.
+  //
+  // This callback is bound to `serverId` from this specific registration. A
+  // stale beat can still be in flight after a newer registration replaced
+  // this one (heartbeat A's fetch resolves after listener A already lost its
+  // registration and a fresh B took over) — without the identity check, A's
+  // late callback would tear down B's live server mid-turn.
+  const onRegistrationLost = (): void => {
+    if (runtime.mcpServerId !== serverId) {
+      debugLog("dust:mcp", "Ignoring registration-lost signal from a superseded MCP heartbeat", { serverId });
+      return;
+    }
+    debugLog("dust:mcp", "MCP registration lost, clearing runtime state for re-registration");
+    runtime.clearMcpState();
+  };
+
+  runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, getAuthHeaders, serverId, refreshAuth, onRegistrationLost);
   runtime.createApprovalGate();
 
   const abortController = new AbortController();
@@ -108,6 +134,7 @@ async function ensureMcpServer(
   listenMcpRequests({
     baseUrl,
     getAuthHeaders,
+    refreshAuth,
     serverId,
     abortController,
     buildConfirmMessage,
@@ -151,17 +178,43 @@ async function ensureMcpServer(
       debugLog("dust:mcp", "MCP listener stopped by abort");
       return;
     }
+    // This listener is bound to `serverId` from its own registration. A later
+    // turn's registration may have already superseded it (its own SSE 404
+    // fired and cleared state, and a fresh one started) before this rejection
+    // was handled — acting on a stale failure here would tear down the fresh
+    // registration or invalidate still-valid credentials that belong to it.
+    if (runtime.mcpServerId !== serverId) {
+      debugLog("dust:mcp", "Ignoring failure from a superseded MCP listener", { serverId, error: String(err) });
+      return;
+    }
+
+    if (isRegistrationLostError(err)) {
+      // Self-healing: the next turn's ensureMcpServer re-registers, so this
+      // is not a "fatal" condition worth logging as an error.
+      debugLog("dust:mcp", "MCP registration lost, clearing runtime state for re-registration", { serverId });
+      runtime.clearMcpState();
+      return;
+    }
+
     console.error(`[dust:mcp] listenMcpRequests fatal: ${err}`);
-    // If session expired, invalidate credentials so that the next stream attempt will trigger a re-login
+    // Session expired means the refresh attempted inside listenMcpRequests
+    // already failed — only now is it safe to invalidate credentials and
+    // force a re-login. invalidateRuntimeCredentials also clears MCP state.
     if (isSessionExpiredError(err)) {
       const credentials = runtime.sessionContext.getCredentials();
       if (credentials) {
-        debugLog("dust:session", "MCP session expired, invalidating credentials in runtime context");
+        debugLog("dust:session", "MCP session expired after failed refresh, invalidating credentials in runtime context");
         invalidateRuntimeCredentials(runtime, credentials);
       } else {
-        debugLog("dust:session", "Session expired but no credentials found in runtime context — nothing to invalidate");
+        debugLog("dust:session", "Session expired but no credentials found in runtime context — clearing MCP state only");
+        runtime.clearMcpState();
       }
+      return;
     }
+    // Any other unexpected terminal exit must not leave a dead
+    // mcpServerId/heartbeat/abort controller behind — clear them so the next
+    // turn re-registers instead of running toolless.
+    runtime.clearMcpState();
   });
 }
 
@@ -175,11 +228,18 @@ async function postValidateAction(
 ): Promise<void> {
   const url = `${baseUrl}/assistant/conversations/${conversationId}/messages/${messageId}/validate-action`;
   debugLog("dust:session", "Posting validate-action", { conversationId, messageId, actionId, approved, url });
-  await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
     headers: { ...authHeaders, "Content-Type": "application/json" },
     body: JSON.stringify({ actionId, approved: approved ? "approved" : "rejected" }),
   });
+  if (!res.ok) {
+    // A long approval wait can outlive the access token, and this can 401 —
+    // surfaced here rather than left silent, though there is nothing useful
+    // to retry with: the approval decision has already been made and Dust's
+    // side of it is what failed to record.
+    debugLog("dust:session", "Post validate-action failed", { status: res.status, conversationId, messageId, actionId });
+  }
 }
 
 /**
@@ -467,11 +527,21 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           const hostToken = await runtime.sessionContext.resolveAccessToken();
           if (hostToken) {
             liveCred = { ...(runtime.sessionContext.getCredentials() ?? liveCred), access: hostToken };
+            runtime.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
             debugLog("dust:session", "Pre-stream token refresh delegated to host");
           } else {
             try {
               liveCred = await refreshToken(liveCred);
               runtime.sessionContext.setCredentials(liveCred);
+              // setCredentials (persistCredentialState) drops the token trio —
+              // it never reaches auth.json — so without this, every later
+              // getAuthHeaders() would keep reading the old, still-expired
+              // token back out of storage. refreshToken() reports a real
+              // expiry (unlike the host path above), so use it rather than
+              // the assumed TTL.
+              if (liveCred.access) {
+                runtime.setRefreshedAccessToken(liveCred.access, liveCred.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+              }
               debugLog("dust:session", "Pre-stream token refresh succeeded");
             } catch (err) {
               if (isSessionExpiredError(err)) {
@@ -491,34 +561,64 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         const agentSId = model.sId ?? "";
         debugLog("dust:session", "Resolved stream context", { workspaceId, region, baseUrl, agentSId, username });
 
-        const authHeaders = buildAuthHeaders(accessToken);
+        // Last-resort fallback: only reached if nothing is in memory AND
+        // nothing is stored yet (there should always be something by the time
+        // any of these run, but a snapshot beats an empty Authorization header).
+        const fallbackAuthHeaders = buildAuthHeaders(accessToken);
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-        // A turn can outlive the ~15 minute access token, so the long-lived
-        // event stream re-reads the stored token per request instead of pinning
-        // the one this turn started with.
-        const getAuthHeaders = (): Record<string, string> => {
-          const current = runtime.sessionContext.getAccessToken();
-          return current ? buildAuthHeaders(current) : authHeaders;
+        // The single accessor every call site below goes through, instead of
+        // each hand-rolling its own priority chain — see
+        // `DustSessionRuntime#currentAccessToken()`'s doc. A turn can outlive
+        // the ~15 minute access token, so this is called fresh at each site
+        // rather than pinning one snapshot for the whole turn.
+        const resolveAuthHeaders = (): Record<string, string> => {
+          const current = runtime.currentAccessToken();
+          return current ? buildAuthHeaders(current) : fallbackAuthHeaders;
         };
+        const getAuthHeaders = resolveAuthHeaders;
 
         // Called after a 401: refresh through pi (which persists the rotation)
         // and fall back to a direct refresh. Returning false means the session
         // really is dead.
-        const refreshAuth = async (): Promise<boolean> => {
-          const hostToken = await runtime.sessionContext.resolveAccessToken();
-          if (hostToken) return true;
-          try {
-            const refreshed = await refreshToken(runtime.sessionContext.getCredentials() ?? liveCred);
-            runtime.sessionContext.setCredentials(refreshed);
-            return Boolean(refreshed.access);
-          } catch (err) {
-            debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
-            return false;
-          }
+        //
+        // Single-flighted on the runtime: streamEvents, the MCP listener, and
+        // the MCP heartbeat all call this, and can all hit a 401 in the same
+        // window. Two concurrent direct refreshes would race the same
+        // rotating refresh token — WorkOS honors one and answers
+        // `invalid_grant` to the other — so every caller while one is already
+        // in flight awaits that same attempt instead of starting its own.
+        const refreshAuth = (): Promise<boolean> => {
+          runtime.refreshInFlight ??= (async (): Promise<boolean> => {
+            const hostToken = await runtime.sessionContext.resolveAccessToken();
+            if (hostToken) {
+              runtime.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+              return true;
+            }
+            try {
+              const refreshed = await refreshToken(runtime.sessionContext.getCredentials() ?? liveCred);
+              runtime.sessionContext.setCredentials(refreshed);
+              // persistCredentialState drops access/refresh/expires (auth.json
+              // is pi-owned, we can no longer write it), so the rotated token
+              // would otherwise vanish the instant it's "saved": every later
+              // getAuthHeaders() call — ours and the MCP listener/heartbeat's —
+              // would keep re-reading the same expired token from storage and
+              // loop straight back into the same 401.
+              if (refreshed.access) {
+                runtime.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+              }
+              return Boolean(refreshed.access);
+            } catch (err) {
+              debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
+              return false;
+            }
+          })().finally(() => {
+            runtime.refreshInFlight = null;
+          });
+          return runtime.refreshInFlight;
         };
 
-        await ensureMcpServer(runtime, baseUrl, authHeaders);
+        await ensureMcpServer(runtime, baseUrl, resolveAuthHeaders(), refreshAuth);
 
         const userText = extractUserText(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
@@ -585,7 +685,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         if (!runtime.conversationId) {
           ({ conversationSId, userMessageSId, agentMessageSId } = await createConversation(
             baseUrl,
-            authHeaders,
+            resolveAuthHeaders(),
             signal,
             runtime,
             agentSId,
@@ -599,7 +699,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           conversationSId = runtime.conversationId;
           userMessageSId = await postMessageToConversation(
             baseUrl,
-            authHeaders,
+            resolveAuthHeaders(),
             signal,
             runtime,
             conversationSId,
@@ -615,7 +715,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           startTurn(turn);
           agentMessageSId = await fetchConversationAgentMessageId(
             baseUrl,
-            authHeaders,
+            resolveAuthHeaders(),
             signal,
             conversationSId,
             userMessageSId,
@@ -636,7 +736,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           model,
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
-            postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
+            postValidateAction(baseUrl, resolveAuthHeaders(), conversationId, messageId, actionId, approved),
           // Approving is two awaits long (the dialog, then validate-action, the
           // latter not tied to the turn's signal), so it can outlive the turn
           // entirely. The check is against *this* turn rather than whichever is

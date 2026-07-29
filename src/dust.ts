@@ -24,6 +24,11 @@ export default function (pi: ExtensionAPI) {
   // earlier "session dead" marker.
   const onLogin = (cred: DustCredentials) => {
     clearInvalidated();
+    // A fresh login can be a different account or workspace entirely. A
+    // previous account's still-live in-memory token must not go on
+    // outranking the new one — that would send the new session's requests
+    // under someone else's identity until the old holder happened to expire.
+    runtime.clearRefreshedAccessToken();
     persistCredentialState(cred);
     registerProviderForCredentials(cred);
   };

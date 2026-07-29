@@ -83,6 +83,12 @@ Responsibilities:
 - store MCP lifecycle objects
 - manage approval-gate coordination
 - bind session-specific persistence and UI callbacks
+- hold a freshly refreshed access token (with its own expiry) as the single
+  source every auth-header builder in `dust-stream-provider.ts` reads through,
+  since a direct token refresh has nowhere else to persist to
+- single-flight concurrent refresh attempts, so the event stream, the MCP
+  listener and the MCP heartbeat hitting a 401 in the same window share one
+  refresh instead of racing the rotating refresh token
 
 ### `src/dust-session-events.ts`
 
@@ -234,6 +240,11 @@ Responsibilities:
 - keep it alive with heartbeats
 - listen for MCP requests
 - post MCP results back to Dust
+- refresh the access token and retry once on a 401 (SSE connect or heartbeat)
+  before treating the session as dead
+- recognize a lost registration (403/404) as distinct from a dead session, and
+  signal it so the runtime clears state for `dust-stream-provider.ts` to
+  re-register on the next turn instead of running toolless
 
 ### `src/dust-tools.ts`
 
@@ -290,9 +301,14 @@ That container tracks:
 - MCP heartbeat timer
 - MCP request listener abort controller
 - approval state shared between Dust SSE and MCP execution
+- a freshly refreshed access token (with expiry), read ahead of persisted
+  storage by every auth-header builder
+- an in-flight refresh promise, shared so concurrent 401s single-flight
 
 This runtime state is reset when sessions switch, credentials are invalidated,
-or the extension needs to clear MCP state.
+or the extension needs to clear MCP state — which also happens when the MCP
+server's registration is lost server-side, so the next turn re-registers
+instead of advertising a server nothing is listening behind.
 
 ## Approval model
 
