@@ -43,29 +43,35 @@ type CustomUi = <T>(
 ) => Promise<T>;
 
 /**
- * Resolves the panel's target, and — despite the name — is not purely a
- * resolver: it lazily wires `runtime.sessionContext` in place the first time
- * `/status` runs before any `session_start` has done so (see the comment on
- * that assignment below). Idempotent and safe to call more than once per
- * command, which is what both callers below do.
+ * Ensures `runtime.sessionContext` is wired before anything reads through it.
+ *
+ * The command can run before any turn has wired the runtime up (no
+ * session_start yet), in which case `runtime.sessionContext` is still the
+ * no-op default. Wire it from the command's own context in place — every
+ * credit fetch below reads through `runtime`, so it needs a working
+ * `sessionContext` on the same instance, not a free-floating one only this
+ * call would see.
+ */
+function ensureSessionContext(runtime: DustSessionRuntime, ctx: PiRuntimeContext): void {
+  if (!runtime.sessionContext.getCredentials()) {
+    runtime.sessionContext = buildSessionContext(ctx);
+  }
+}
+
+/**
+ * Resolves the panel's target. Also ensures `runtime.sessionContext` is wired
+ * (see `ensureSessionContext`). Idempotent and safe to call more than once
+ * per command, which is what both callers below do.
  */
 export function resolveStatusTarget(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,
 ): StatusTarget | { error: string } {
+  ensureSessionContext(runtime, ctx);
+
   const cred = getStoredCredentials();
   if (!cred?.access) return { error: NOT_LOGGED_IN };
   if (!cred.workspaceId) return { error: NO_WORKSPACE };
-
-  // The command can run before any turn has wired the runtime up (no
-  // session_start yet), in which case `runtime.sessionContext` is still the
-  // no-op default. Wire it from the command's own context in place — every
-  // credit fetch below reads through `runtime`, so it needs a working
-  // `sessionContext` on the same instance, not a free-floating one only this
-  // call would see.
-  if (!runtime.sessionContext.getCredentials()) {
-    runtime.sessionContext = buildSessionContext(ctx);
-  }
 
   const region = cred.region ?? "us-central1";
   return {
@@ -77,6 +83,8 @@ export function resolveStatusTarget(
 }
 
 /**
+ * Assembles the panel's data.
+ *
  * Live figures (seat balance, spend cap, reset date) are refetched whenever the
  * session has advanced since the last read — a user who just ran a few turns
  * must see those turns reflected, so caching them is only ever an optimisation

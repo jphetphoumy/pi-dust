@@ -84,11 +84,13 @@ Responsibilities:
 - manage approval-gate coordination
 - bind session-specific persistence and UI callbacks
 - hold a freshly refreshed access token (with its own expiry) as the single
-  source every auth-header builder in `dust-stream-provider.ts` reads through,
-  since a direct token refresh has nowhere else to persist to
+  source every auth-header builder in `dust-stream-provider.ts`, and
+  `dust-credits.ts`'s `fetchCreditsJson`, read through, since a direct token
+  refresh has nowhere else to persist to
 - single-flight concurrent refresh attempts, so the event stream, the MCP
-  listener and the MCP heartbeat hitting a 401 in the same window share one
-  refresh instead of racing the rotating refresh token
+  listener, the MCP heartbeat and `/status` credit fetches (`dust-credits.ts`)
+  hitting a 401 in the same window share one refresh instead of racing the
+  rotating refresh token
 
 ### `src/dust-session-events.ts`
 
@@ -188,7 +190,8 @@ Responsibilities:
 - resolve the `/api/w/:wId` base URL for the credential's region
 - fetch seat usage, fair-use allowance, the 30-day breakdown and top conversations
 - fetch the month/week/day credit totals as `groupBy`-less time series
-- refresh the access token and retry once on 401
+- on 401, delegate to the shared `runtime.refreshAccessToken()` single-flight
+  and retry once, rather than refreshing the token itself
 
 Period windows are sized so the *last* bucket of each series is a complete
 current period: Dust buckets on a `calendar_interval` over a trailing
@@ -302,8 +305,11 @@ That container tracks:
 - MCP request listener abort controller
 - approval state shared between Dust SSE and MCP execution
 - a freshly refreshed access token (with expiry), read ahead of persisted
-  storage by every auth-header builder
-- an in-flight refresh promise, shared so concurrent 401s single-flight
+  storage by every auth-header builder, including `dust-credits.ts`'s
+  `fetchCreditsJson`
+- an in-flight refresh promise, shared so concurrent 401s from the event
+  stream, the MCP listener, the MCP heartbeat and `/status` credit fetches
+  single-flight
 
 This runtime state is reset when sessions switch, credentials are invalidated,
 or the extension needs to clear MCP state — which also happens when the MCP

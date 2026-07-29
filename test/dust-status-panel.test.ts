@@ -30,8 +30,9 @@ const SESSION_CONTEXT = makeSessionContext();
 // StatusLoader reads through a runtime (so credit fetches share the in-memory
 // refreshed-token holder and single-flight guard with the rest of the
 // extension), not a bare session controller — wire one up via the factory's
-// plain defaults. The loader under test only ever reads `baseUrl` off the
-// runtime, never a credential or a refresh, so no override is needed here.
+// plain defaults. The loader's fetches read `runtime.currentAccessToken()`,
+// so the runtime needs a session context that yields a token; the factory's
+// plain "tok" default is all any test here needs.
 // Rebuilt fresh in `beforeEach` below so mutable runtime state (a held
 // refreshed token, an in-flight refresh) never leaks from one test into the
 // next.

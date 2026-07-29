@@ -302,7 +302,7 @@ describe("dust runtime", () => {
         getAccessToken: () => "",
       });
 
-      await expect(runtime.refreshAccessToken(fallback as never)).resolves.toBe(true);
+      await expect(runtime.refreshAccessToken(fallback)).resolves.toBe(true);
       expect(runtime.currentAccessToken()).toBe("direct-token");
     });
 
@@ -399,7 +399,7 @@ describe("dust runtime", () => {
       // Credits call site.
       const creditsPromise = fetchCreditsJson(runtime, "https://x/api/w/w1/credits/my-usage");
       // Stream-provider call site, closing over its own `liveCred` fallback.
-      const streamPromise = runtime.refreshAccessToken(makeCredentials({ access: "other" }) as never);
+      const streamPromise = runtime.refreshAccessToken(makeCredentials({ access: "other" }));
 
       // Wait for both call sites to have actually joined the flight — not
       // just for the first to have started it — before letting the host
