@@ -72,6 +72,31 @@ describe("dust tool rendering", () => {
     expect(typeof (component as { render?: unknown }).render).toBe("function");
   });
 
+  it("renders a subagent call, which has no pi tool definition behind it", () => {
+    const { api, renderers } = makeApi();
+    registerDustToolRenderer(api);
+
+    // `subagent` is ours, not one of pi's factories, so getToolDefinition
+    // returns undefined here. pi's generic tool row must still cope.
+    const component = renderers.get(DUST_TOOL_ENTRY)!(
+      {
+        data: {
+          toolName: "subagent",
+          args: { agent: "scout", task: "find auth" },
+          text: "auth lives in src/auth.ts",
+          isError: false,
+          durationMs: 1200,
+          cwd: process.cwd(),
+        },
+      },
+      { expanded: false },
+      theme,
+    );
+
+    expect(component).toBeDefined();
+    expect(typeof (component as { render?: unknown }).render).toBe("function");
+  });
+
   it("degrades to a component instead of throwing on unusable entry data", () => {
     const { api, renderers } = makeApi();
     registerDustToolRenderer(api);

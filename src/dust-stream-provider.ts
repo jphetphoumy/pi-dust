@@ -3,7 +3,7 @@ import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
 import { createEventStream, findAgentMessageSId, isMissingAgentMessageError, makeEmptyMessage, streamEvents } from "./dust-stream.js";
-import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
+import { buildConfirmMessage, executeMcpTool, getMcpTools, requiresApproval } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
@@ -60,18 +60,46 @@ function extractSystemPrompt(context: StreamContextLike): string {
  * download link instead of a file on disk. Those run server-side and never reach
  * our MCP server, and the message API exposes no way to disable or redirect
  * them, so the only lever is telling the agent which tool to reach for.
+ *
+ * The tool list is built from the catalogue actually advertised, never
+ * hardcoded: a subagent's `tools:` allowlist narrows that catalogue, and naming
+ * a tool the agent does not have sends it hunting for a tool that is not there
+ * and then giving up instead of using what it does have.
  */
-function buildToolGuidance(cwd: string): string {
-  return [
+const TOOL_PURPOSE: Record<string, string> = {
+  bash: "run commands",
+  read: "read a file",
+  write: "create or overwrite a file",
+  edit: "modify a file",
+  grep: "search file contents",
+  find: "find files by glob",
+  ls: "list a directory",
+  subagent: "delegate a task to another agent",
+};
+
+function buildToolGuidance(cwd: string, toolNames: string[]): string {
+  const listed = toolNames.map(
+    (name) => `  \`${MCP_TOOL_PREFIX}__${name}\` to ${TOOL_PURPOSE[name] ?? `use ${name}`}.`,
+  );
+
+  const lines = [
     "Tool usage rules for this session:",
     `- You are driving a CLI on the user's own machine, working directory: ${cwd}.`,
-    `- Files the user asks for are LOCAL files. Always use the \`${MCP_TOOL_PREFIX}__*\` tools:`,
-    `  \`${MCP_TOOL_PREFIX}__write\` to create or overwrite, \`${MCP_TOOL_PREFIX}__edit\` to modify,`,
-    `  \`${MCP_TOOL_PREFIX}__read\` to read, \`${MCP_TOOL_PREFIX}__bash\` to run commands.`,
+    `- Files the user asks for are LOCAL files. Always use the \`${MCP_TOOL_PREFIX}__*\` tools.`,
+    "- These are the ONLY tools you have. Do not look for or invent any other tool:",
+    ...listed,
     "- NEVER use `files__create`, `files__edit` or any other `files__*` tool for the user's files:",
     "  those write to Dust conversation storage, not to the user's machine, and the user cannot use them.",
-    "- Do not create files with bash heredocs; use the write tool.",
-  ].join("\n");
+  ];
+
+  if (toolNames.includes("write")) {
+    lines.push("- Do not create files with bash heredocs; use the write tool.");
+  }
+  if (!toolNames.includes("bash")) {
+    lines.push("- You have NO shell. Do not try to run shell commands, and do not ask the user to.");
+  }
+
+  return lines.join("\n");
 }
 
 function buildConversationContext(username: string, timezone: string, runtime: DustSessionRuntime) {
@@ -491,6 +519,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
     }
     const toolName = event.metadata?.toolName ?? "unknown";
     const inputs = event.inputs ?? {};
+    if (!requiresApproval(toolName)) return true;
     return runtime.confirmFn(`Allow tool: ${toolName}`, buildConfirmMessage(toolName, inputs));
   }
 
@@ -622,7 +651,8 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
 
         const userText = extractUserText(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
-        const systemPrompt = [extractSystemPrompt(context), buildToolGuidance(cwd)]
+        const availableTools = getMcpTools(runtime.extensionContext as never).map((tool) => tool.name);
+        const systemPrompt = [extractSystemPrompt(context), buildToolGuidance(cwd, availableTools)]
           .filter((part) => part.length > 0)
           .join("\n\n");
         debugLog("dust:session", "Prepared user message", { userText, systemPrompt, currentConversationId: runtime.conversationId });

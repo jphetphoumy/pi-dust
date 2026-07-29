@@ -6,6 +6,7 @@ This directory contains the project documentation for `pi-dust`.
 
 - [Getting started](getting-started.md)
 - [Architecture](architecture.md)
+- [Subagents](subagents.md)
 - [Development guide](development.md)
 - [Debugging guide](debugging.md)
 - [Release and maintenance](release.md)

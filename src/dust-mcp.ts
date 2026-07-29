@@ -1,4 +1,5 @@
 import { CANCELLED_TOOL_MESSAGE, DUST_MCP_PROTOCOL_VERSION, MCP_REGISTRATION_LOST_MESSAGE, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { requiresApproval } from "./dust-tools.js";
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
@@ -343,6 +344,8 @@ export async function listenMcpRequests({
                 if (cancelled) {
                   debugLog("dust:mcp", "Refusing tool call from a cancelled turn", { toolName });
                   allowed = false;
+                } else if (!requiresApproval(toolName)) {
+                  allowed = true;
                 } else if (preApprovedActions.size > 0) {
                   const firstEntry = preApprovedActions.entries().next();
                   if (firstEntry.done) {

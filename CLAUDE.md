@@ -27,7 +27,7 @@ npx vitest run test/dust-auth.test.ts
 
 ## Architecture
 
-The project is organized as 27 TypeScript modules in `src/`, each with a single responsibility:
+The project is organized as 29 TypeScript modules in `src/`, each with a single responsibility:
 
 | Module | Role |
 |--------|------|
@@ -52,7 +52,9 @@ The project is organized as 27 TypeScript modules in `src/`, each with a single 
 | `dust-auth.ts` | OAuth token flow, token refresh, workspace discovery, agent retrieval |
 | `dust-stream.ts` | Parses Dust SSE events and emits Pi stream chunks |
 | `dust-mcp.ts` | Client-side MCP server integration |
-| `dust-tools.ts` | Local tool catalog (bash, read, edit) with user approval |
+| `dust-tools.ts` | Local tool catalog (bash, read, edit, subagent) with user approval |
+| `dust-subagent.ts` | Delegates a task to another Dust agent in a child `pi` process |
+| `dust-subagent-agents.ts` | Subagent definition discovery and Dust model resolution |
 | `dust-validation.ts` | Runtime validation of external API payloads |
 | `dust-debug.ts` | Debug logging with token/credential redaction |
 | `dust-types.ts` | Shared TypeScript type contracts (excluded from test coverage) |
@@ -63,6 +65,7 @@ The project is organized as 27 TypeScript modules in `src/`, each with a single 
 - **Auth:** `dust-auth.ts` handles OAuth device flow → token storage → workspace/agent discovery
 - **Conversation:** `dust-stream-provider.ts` coordinates Dust event stream + MCP request stream with dual approval logic
 - **Tool approval:** `dust-tools.ts` intercepts MCP tool calls and gates them on local user approval
+- **Subagents:** Dust calls the `subagent` tool → `dust-subagent.ts` spawns `pi --mode json -p --no-session --model dust/<slug>` per task and returns only the child's final answer. Children are marked with `PI_DUST_SUBAGENT_DEPTH` (no recursion) and `PI_DUST_SUBAGENT_TOOLS` (MCP tool allowlist), both enforced in `getMcpTools`
 - **State:** `dust-runtime.ts` holds ephemeral session state; reset on session switch or credential invalidation
 - **Resume:** every session transition (startup, `/new`, `/resume`, `/fork`) arrives as one `session_start` carrying a `reason`; `dust-conversation.ts` maps the session file — or, for a fork, its parent — back to a Dust conversation and checks it still exists before reattaching
 

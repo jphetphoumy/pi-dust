@@ -16,6 +16,8 @@ tool bridge (`bash`, `read`, `edit`) with local approval.
 - Dust agents exposed as Pi models
 - Conversation reuse across turns
 - SSE streaming with tool approval support
+- Subagents — delegate a task to another Dust agent in its own context window,
+  singly, in parallel, or chained ([guide](docs/subagents.md))
 - `/status` credit panel — a tabbed, keyboard-driven overlay:
   - **Overview**: session usage, plus month / week / day gauges
   - **Agents · Type · Source · API key**: credit breakdowns, with `d`/`w`/`m` to
@@ -75,6 +77,7 @@ tail -f /tmp/pi-dust.log
 - [Documentation index](docs/README.md)
 - [Getting started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
+- [Subagents](docs/subagents.md)
 - [Development guide](docs/development.md)
 - [Debugging guide](docs/debugging.md)
 - [Release and maintenance](docs/release.md)
@@ -85,6 +88,7 @@ tail -f /tmp/pi-dust.log
 ```text
 .
 ├── docs/        Project documentation and historical specs
+├── examples/    Sample subagent definitions and workflow prompts
 ├── src/         Extension source code
 ├── test/        Domain-focused test suites
 └── .github/     CI, release and repository automation

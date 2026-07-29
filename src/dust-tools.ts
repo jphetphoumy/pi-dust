@@ -8,12 +8,23 @@ import {
   createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  SUBAGENT_TOOL_NAME,
+  allowedSubagentTools,
+  buildSubagentConfirmMessage,
+  buildSubagentSpec,
+  executeSubagent,
+  isSubagentChild,
+} from "./dust-subagent.js";
+import { buildSubagentToolDefinition } from "./dust-subagent-render.js";
 import type { McpToolArgs } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
 
 export interface McpToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError: boolean;
+  /** Structured payload for tools that render more than plain text. */
+  details?: unknown;
 }
 
 export interface McpToolSpec {
@@ -61,13 +72,27 @@ function currentCwd(ctx?: ExtensionContext): string {
   return ctx?.cwd ?? process.cwd();
 }
 
-/** Tool catalogue advertised to Dust in response to `tools/list`. */
+/**
+ * Tool catalogue advertised to Dust in response to `tools/list`.
+ *
+ * Two subagent-driven restrictions apply here rather than at call time, so the
+ * child model never sees a tool it would only be refused:
+ * `subagent` is withheld from a subagent (no recursion), and an agent file's
+ * `tools:` list narrows the catalogue to what that agent was granted.
+ */
 export function getMcpTools(ctx?: ExtensionContext): McpToolSpec[] {
-  return toolDefinitions(currentCwd(ctx)).map((definition) => ({
+  const specs: McpToolSpec[] = toolDefinitions(currentCwd(ctx)).map((definition) => ({
     name: definition.name,
     description: definition.description,
     inputSchema: definition.parameters as unknown as Record<string, unknown>,
   }));
+
+  // Rebuilt per call, not cached with the factories: the description embeds the
+  // discovered agent list, and agent files may be edited mid-session.
+  if (!isSubagentChild()) specs.push(buildSubagentSpec(ctx));
+
+  const allowed = allowedSubagentTools();
+  return allowed ? specs.filter((spec) => allowed.has(spec.name)) : specs;
 }
 
 function findDefinition(name: string, ctx?: ExtensionContext): AnyToolDefinition | undefined {
@@ -76,6 +101,10 @@ function findDefinition(name: string, ctx?: ExtensionContext): AnyToolDefinition
 
 /** pi's definition for a tool, used to reuse its native TUI renderers. */
 export function getToolDefinition(name: string, cwd: string): AnyToolDefinition | undefined {
+  // subagent is ours, not one of pi's factories, so it brings its own renderers.
+  if (name === SUBAGENT_TOOL_NAME) {
+    return buildSubagentToolDefinition() as unknown as AnyToolDefinition;
+  }
   return toolDefinitions(cwd).find((definition) => definition.name === name);
 }
 
@@ -91,6 +120,26 @@ export async function executeMcpTool(
   ctx: ExtensionContext,
   signal?: AbortSignal,
 ): Promise<McpToolResult> {
+  // Re-checked here and not only in `getMcpTools`: Dust may call a name it
+  // learned from an earlier, wider catalogue.
+  const allowed = allowedSubagentTools();
+  if (allowed && !allowed.has(name)) {
+    return {
+      content: [{ type: "text", text: `Tool "${name}" is not available to this subagent.` }],
+      isError: true,
+    };
+  }
+
+  if (name === SUBAGENT_TOOL_NAME) {
+    if (isSubagentChild()) {
+      return {
+        content: [{ type: "text", text: "Subagents cannot spawn further subagents." }],
+        isError: true,
+      };
+    }
+    return executeSubagent(args, ctx, signal);
+  }
+
   const definition = findDefinition(name, ctx);
   if (!definition) {
     return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
@@ -114,6 +163,17 @@ export async function executeMcpTool(
   } catch (err: unknown) {
     return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
   }
+}
+
+/**
+ * Whether a tool call needs the user's confirmation.
+ *
+ * `subagent` is exempt: it does no work itself, and everything the child can
+ * reach is already bounded by the agent file's `tools:` allowlist and the
+ * no-recursion depth guard. Prompting for it only interrupts the delegation.
+ */
+export function requiresApproval(toolName: string): boolean {
+  return toolName !== SUBAGENT_TOOL_NAME;
 }
 
 /**
@@ -144,6 +204,8 @@ export function buildConfirmMessage(toolName: string, args: McpToolArgs): string
     case "grep":
     case "find":
       return preview(args.pattern ?? args.query ?? JSON.stringify(args));
+    case SUBAGENT_TOOL_NAME:
+      return buildSubagentConfirmMessage(args);
     default:
       return JSON.stringify(args);
   }

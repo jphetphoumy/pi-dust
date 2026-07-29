@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./dust-debug.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
+import { SUBAGENT_TOOLS_ENV, isSubagentChild } from "./dust-subagent.js";
 import type { PiRuntimeContext } from "./dust-types.js";
 
 /** Footer slot showing the current approval mode. */
@@ -55,6 +56,19 @@ function setMode(runtime: DustSessionRuntime, autoApprove: boolean, ctx?: PiRunt
  * local `tools/call` gate.
  */
 export function registerDustApprovalMode(pi: ExtensionAPI, runtime: DustSessionRuntime): void {
+  // A subagent runs headless, where `ctx.ui.confirm` cannot prompt anyone and
+  // answers `false`. Left alone, every tool call in a subagent is denied and
+  // the agent reports it has no tools. Nobody is there to approve, so the
+  // decision has to have been made already — and it was, twice over: the user
+  // approved the parent's `subagent` call, and the child's catalogue is
+  // limited to the tools its agent file granted.
+  if (isSubagentChild()) {
+    runtime.autoApprove = true;
+    debugLog("dust:approval", "Subagent child: approving tools without prompting", {
+      tools: process.env[SUBAGENT_TOOLS_ENV] ?? "(all)",
+    });
+  }
+
   pi.registerCommand("auto", {
     description: "Toggle auto-approval of Dust tool calls (no confirmation prompts)",
     handler: async (args, ctx) => {

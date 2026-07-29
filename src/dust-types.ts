@@ -326,3 +326,43 @@ export interface LoginCallbacks {
   onPrompt: (params: { message: string; placeholder?: string }) => Promise<string>;
   signal?: AbortSignal;
 }
+
+/** One tool call made by a subagent, as seen in its JSON stream. */
+export interface SubagentToolCall {
+  tool: string;
+  args: string;
+  status: "running" | "done";
+}
+
+export interface SubagentUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  contextTokens: number;
+  turns: number;
+}
+
+/** A single subagent invocation, live or finished. */
+export interface SubagentRun {
+  agent: string;
+  task: string;
+  model?: string;
+  status: "pending" | "running" | "ok" | "failed";
+  tools: SubagentToolCall[];
+  /** Latest assistant prose, shown as the agent's current "thinking" line. */
+  lastMessage: string;
+  output: string;
+  usage: SubagentUsage;
+  durationMs: number;
+  contextWindow?: number;
+  /** 1-based position in a chain. */
+  step?: number;
+}
+
+/** Payload the transcript row and the progress widget both render from. */
+export interface SubagentDetails {
+  mode: "single" | "parallel" | "chain";
+  runs: SubagentRun[];
+}

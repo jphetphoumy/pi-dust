@@ -14,6 +14,8 @@ export interface DustToolEntryData {
   isError: boolean;
   durationMs: number;
   cwd: string;
+  /** Structured payload for tools whose renderer needs more than text. */
+  details?: unknown;
 }
 
 function isEntryData(value: unknown): value is DustToolEntryData {
@@ -62,6 +64,7 @@ export function registerDustToolRenderer(pi: ExtensionAPI): void {
       component.updateResult({
         content: [{ type: "text", text: data.text }],
         isError: data.isError,
+        details: data.details,
       });
       component.setExpanded(options?.expanded ?? false);
 
@@ -90,6 +93,7 @@ export function appendToolEntry(
     isError: result.isError,
     durationMs,
     cwd,
+    details: result.details,
   };
   try {
     pi.appendEntry(DUST_TOOL_ENTRY, data as unknown as Record<string, unknown>);

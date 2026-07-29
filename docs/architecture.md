@@ -256,9 +256,44 @@ Provided tools:
 - `read`
 - `write` (create or overwrite — `edit` is substitution-only and cannot create)
 - `edit`
+- `subagent` (see [`src/dust-subagent.ts`](#srcdust-subagentts))
 
 The module also formats the confirmation message shown to the user before a
 tool runs.
+
+Two subagent-driven restrictions are applied when the catalogue is built, so a
+subagent child never sees a tool it would only be refused: `subagent` itself is
+withheld from a subagent, and an agent file's `tools:` list narrows the
+catalogue to what that agent was granted.
+
+### `src/dust-subagent.ts`
+
+Delegation of a task to another Dust agent in its own process.
+
+Responsibilities:
+
+- build the `subagent` entry advertised to Dust, with the discovered agent list
+  embedded in its description
+- spawn `pi --mode json -p --no-session --model dust/<slug>` per subagent and
+  fold its NDJSON output back into a final answer plus usage totals
+- run the single, parallel (max 8, 4 concurrent) and chain (`{previous}`
+  substitution) modes
+- propagate abort to children as `SIGTERM`, then `SIGKILL`
+- mark children with `PI_DUST_SUBAGENT_DEPTH` and `PI_DUST_SUBAGENT_TOOLS`, the
+  two guards `dust-tools.ts` reads
+
+### `src/dust-subagent-agents.ts`
+
+Subagent definitions and model resolution.
+
+Responsibilities:
+
+- discover `*.md` agent files from `~/.pi/agent/agents` (user) and `.pi/agents`
+  (project, opt-in), fresh on every call so files can be edited mid-session
+- resolve an agent file's `model:` to a `dust/<slug>` provider spec, falling
+  back to the parent session's Dust agent
+
+See the [subagents guide](subagents.md) for the user-facing view.
 
 ### `src/dust-validation.ts`
 
@@ -343,6 +378,8 @@ src/
   dust-status-tabs.ts
   dust-stream.ts
   dust-stream-provider.ts
+  dust-subagent.ts
+  dust-subagent-agents.ts
   dust-tools.ts
   dust-types.ts
   dust-validation.ts
