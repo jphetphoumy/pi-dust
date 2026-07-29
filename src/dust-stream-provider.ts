@@ -8,7 +8,7 @@ import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
 import { invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
-import type { DustSessionRuntime } from "./dust-runtime.js";
+import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
 const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
@@ -434,11 +434,12 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
   ) {
     const stream = createEventStream();
     let liveCred: DustCredentials = runtime.sessionContext.getCredentials() ?? cred;
-    let cancelTurnOnAbort: (() => void) | null = null;
-    let abortListenerSignal: AbortSignal | null = null;
-    let endTurn: (() => void) | null = null;
-    /** Set once a user message is posted but the turn has not started yet. */
-    let cancelPendingSetup: (() => void) | null = null;
+    /** Filled in once the turn is armed; drained in `finally`. */
+    const turnCleanup: {
+      abortSignal: AbortSignal | null;
+      onAbort: (() => void) | null;
+      endTurn: (() => void) | null;
+    } = { abortSignal: null, onAbort: null, endTurn: null };
 
     (async () => {
       try {
@@ -522,6 +523,49 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         let conversationSId: string;
         let userMessageSId: string;
 
+        /**
+         * Arms cancellation for this turn. Called as soon as the user message is
+         * accepted, because that POST is what starts the agent loop: from here
+         * on escape has something real to stop, whether or not the agent message
+         * id is known yet.
+         */
+        const startTurn = (turn: ActiveDustTurn): void => {
+          const onAbort = () => {
+            const cancelled = runtime.cancelActiveTurn();
+            if (!cancelled) return;
+            if (cancelled.agentMessageSId) {
+              void cancelMessageGeneration(
+                baseUrl,
+                getAuthHeaders,
+                cancelled.conversationSId,
+                [cancelled.agentMessageSId],
+                refreshAuth,
+              );
+            } else {
+              // Cancelled before the lookup resolved: find the message first.
+              void cancelPendingAgentMessage(
+                baseUrl,
+                getAuthHeaders,
+                cancelled.conversationSId,
+                cancelled.userMessageSId,
+                refreshAuth,
+              );
+            }
+          };
+          turnCleanup.onAbort = onAbort;
+          if (signal) {
+            // The turn may already have been cancelled while we were setting the
+            // conversation up; addEventListener alone would never fire then.
+            if (signal.aborted) {
+              onAbort();
+            } else {
+              turnCleanup.abortSignal = signal;
+              signal.addEventListener("abort", onAbort, { once: true });
+            }
+          }
+          turnCleanup.endTurn = () => runtime.endTurn(turn);
+        };
+
         if (!runtime.conversationId) {
           ({ conversationSId, userMessageSId, agentMessageSId } = await createConversation(
             baseUrl,
@@ -534,6 +578,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             timezone,
             systemPrompt || undefined,
           ));
+          startTurn(runtime.beginTurn(conversationSId, userMessageSId, agentMessageSId));
         } else {
           conversationSId = runtime.conversationId;
           userMessageSId = await postMessageToConversation(
@@ -547,21 +592,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             username,
             timezone,
           );
-          // The user message is posted, so Dust has already spawned the agent
-          // message and started its loop. Cancelling before we learn that id
-          // still has to stop it — otherwise escaping in this window leaves the
-          // orphaned loop this whole change exists to prevent.
-          const pendingConversationSId = conversationSId;
-          const pendingUserMessageSId = userMessageSId;
-          cancelPendingSetup = () => {
-            void cancelPendingAgentMessage(
-              baseUrl,
-              getAuthHeaders,
-              pendingConversationSId,
-              pendingUserMessageSId,
-              refreshAuth,
-            );
-          };
+          // Posting the user message is what starts the agent loop, so the turn
+          // begins here rather than after the lookup below: escaping during that
+          // lookup has to count as a cancellation, not as a turn that never was.
+          const turn = runtime.beginTurn(conversationSId, userMessageSId);
+          startTurn(turn);
           agentMessageSId = await fetchConversationAgentMessageId(
             baseUrl,
             authHeaders,
@@ -569,34 +604,8 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             conversationSId,
             userMessageSId,
           );
+          turn.agentMessageSId = agentMessageSId;
         }
-
-        // From here on there is a Dust agent loop to stop, so escape becomes a
-        // real cancellation rather than a client-side disconnect.
-        cancelPendingSetup = null;
-        const turn = runtime.beginTurn(conversationSId, agentMessageSId);
-        cancelTurnOnAbort = () => {
-          const cancelled = runtime.cancelActiveTurn();
-          if (!cancelled) return;
-          void cancelMessageGeneration(
-            baseUrl,
-            getAuthHeaders,
-            cancelled.conversationSId,
-            [cancelled.agentMessageSId],
-            refreshAuth,
-          );
-        };
-        if (signal) {
-          // The turn may already have been cancelled while we were setting the
-          // conversation up; addEventListener alone would never fire then.
-          if (signal.aborted) {
-            cancelTurnOnAbort();
-          } else {
-            abortListenerSignal = signal;
-            signal.addEventListener("abort", cancelTurnOnAbort, { once: true });
-          }
-        }
-        endTurn = () => runtime.endTurn(turn);
 
         await streamEvents({
           baseUrl,
@@ -621,9 +630,6 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         // a rejected fetch. That is the user cancelling, not a failure.
         const aborted = options?.signal?.aborted === true;
         debugLog("dust:session", aborted ? "Dust stream aborted" : "Dust stream failed", { error: errorMessage(error) });
-        if (aborted) {
-          cancelPendingSetup?.();
-        }
         if (!aborted && isSessionExpiredError(error)) {
           invalidateRuntimeCredentials(runtime, liveCred);
         }
@@ -634,8 +640,9 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         stream.end();
       } finally {
         runtime.resolveApprovalGate();
-        if (abortListenerSignal && cancelTurnOnAbort) {
-          abortListenerSignal.removeEventListener("abort", cancelTurnOnAbort);
+        const { abortSignal, onAbort, endTurn } = turnCleanup;
+        if (abortSignal && onAbort) {
+          abortSignal.removeEventListener("abort", onAbort);
         }
         endTurn?.();
       }

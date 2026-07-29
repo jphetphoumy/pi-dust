@@ -47,7 +47,13 @@ const NOOP_CONFIRM = async () => true;
  */
 export interface ActiveDustTurn {
   conversationSId: string;
-  agentMessageSId: string;
+  userMessageSId: string;
+  /**
+   * Null until the lookup that follows the user message resolves. Posting that
+   * message is what starts the agent loop, so a turn exists — and can be
+   * cancelled — before its agent message is known.
+   */
+  agentMessageSId: string | null;
   /** Aborted when the user cancels, so in-flight local tools stop too. */
   toolAbortController: AbortController;
   cancelled: boolean;
@@ -81,10 +87,15 @@ export class DustSessionRuntime {
    */
   private lastTurnCancelled = false;
 
-  beginTurn(conversationSId: string, agentMessageSId: string): ActiveDustTurn {
+  beginTurn(
+    conversationSId: string,
+    userMessageSId: string,
+    agentMessageSId: string | null = null,
+  ): ActiveDustTurn {
     this.lastTurnCancelled = false;
     const turn: ActiveDustTurn = {
       conversationSId,
+      userMessageSId,
       agentMessageSId,
       toolAbortController: new AbortController(),
       cancelled: false,
@@ -112,6 +123,10 @@ export class DustSessionRuntime {
     turn.cancelled = true;
     this.lastTurnCancelled = true;
     turn.toolAbortController.abort();
+    // Pre-approvals belong to the turn that collected them. A tool call refused
+    // for being cancelled never consumes its entry, so leaving the queue in
+    // place would auto-approve an unrelated tool call in a later turn.
+    this.preApprovedActions.clear();
     // A tool waiting on approval must not block the MCP listener forever once
     // the turn it belonged to is gone.
     this.resolveApprovalGate();

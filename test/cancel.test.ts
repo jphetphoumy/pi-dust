@@ -217,7 +217,7 @@ describe("cancellation", () => {
   describe("runtime turn state", () => {
     it("aborts local tool work and marks the turn cancelled", () => {
       const runtime = new DustSessionRuntime();
-      const turn = runtime.beginTurn("conv-1", "amsg-1");
+      const turn = runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
 
       expect(runtime.isTurnCancelled()).toBe(false);
       const cancelled = runtime.cancelActiveTurn();
@@ -227,9 +227,22 @@ describe("cancellation", () => {
       expect(runtime.isTurnCancelled()).toBe(true);
     });
 
+    // A refused tool call never consumes its pre-approval entry, and the queue
+    // is positional: a leftover would silently approve an unrelated tool call
+    // in the next turn.
+    it("discards pre-approvals collected by the cancelled turn", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
+      runtime.preApprovedActions.set("action-1", true);
+
+      runtime.cancelActiveTurn();
+
+      expect(runtime.preApprovedActions.size).toBe(0);
+    });
+
     it("cancels a turn only once", () => {
       const runtime = new DustSessionRuntime();
-      runtime.beginTurn("conv-1", "amsg-1");
+      runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
 
       expect(runtime.cancelActiveTurn()).not.toBeNull();
       expect(runtime.cancelActiveTurn()).toBeNull();
@@ -239,7 +252,7 @@ describe("cancellation", () => {
       const runtime = new DustSessionRuntime();
       runtime.createApprovalGate();
       const gate = runtime.pendingApprovalPromise;
-      runtime.beginTurn("conv-1", "amsg-1");
+      runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
 
       runtime.cancelActiveTurn();
 
@@ -250,20 +263,20 @@ describe("cancellation", () => {
     // has to stay visible until the next turn starts.
     it("keeps reporting a cancelled turn once it has ended", () => {
       const runtime = new DustSessionRuntime();
-      const turn = runtime.beginTurn("conv-1", "amsg-1");
+      const turn = runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
       runtime.cancelActiveTurn();
       runtime.endTurn(turn);
 
       expect(runtime.isTurnCancelled()).toBe(true);
 
-      runtime.beginTurn("conv-1", "amsg-2");
+      runtime.beginTurn("conv-1", "umsg-2", "amsg-2");
       expect(runtime.isTurnCancelled()).toBe(false);
     });
 
     it("does not clear a newer turn when an older one ends", () => {
       const runtime = new DustSessionRuntime();
-      const first = runtime.beginTurn("conv-1", "amsg-1");
-      const second = runtime.beginTurn("conv-1", "amsg-2");
+      const first = runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
+      const second = runtime.beginTurn("conv-1", "umsg-2", "amsg-2");
 
       runtime.endTurn(first);
 
@@ -272,7 +285,7 @@ describe("cancellation", () => {
 
     it("ends any live turn when the session state is cleared", () => {
       const runtime = new DustSessionRuntime();
-      const turn = runtime.beginTurn("conv-1", "amsg-1");
+      const turn = runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
 
       runtime.resetSessionState();
 
@@ -479,7 +492,10 @@ describe("cancellation", () => {
     it("cancels an agent loop started before the turn could begin", async () => {
       const streamSimple = await makeStreamSimpleFn();
       const controller = new AbortController();
+      const encoder = new TextEncoder();
       let conversationFetches = 0;
+      let mcpController!: ReadableStreamDefaultController<Uint8Array>;
+      const mcpBody = new ReadableStream<Uint8Array>({ start(c) { mcpController = c; } });
 
       const fetchMock = vi.fn(async (url: string, init?: { method?: string }) => {
         const target = String(url);
@@ -487,7 +503,7 @@ describe("cancellation", () => {
           return { ok: true, json: () => Promise.resolve({ serverId: "mcp-cancel-4", expiresAt: new Date(Date.now() + 300_000).toISOString() }) };
         }
         if (target.includes("/mcp/requests")) {
-          return { ok: true, body: makePendingSseStream() };
+          return { ok: true, body: mcpBody };
         }
         // Turn one: create the conversation and finish, so turn two follows the
         // post-message path where the agent message id is fetched separately.
@@ -525,6 +541,21 @@ describe("cancellation", () => {
         "the cancel request",
       );
       expect(JSON.parse(cancelCall[1].body!)).toEqual({ messageIds: ["amsg-cancel-5"] });
+
+      // The loop cancelled above may already have issued a tool call. Escaping
+      // in this window has to refuse it like any other cancelled turn, not run
+      // it because the turn had not formally started.
+      const request = {
+        jsonrpc: "2.0",
+        id: "req-mid-setup",
+        method: "tools/call",
+        params: { name: "bash", arguments: { command: "touch /tmp/pi-dust-should-not-exist" } },
+      };
+      mcpController.enqueue(encoder.encode(`data: ${JSON.stringify({ eventId: "mcp-e0", data: request })}\n\n`));
+
+      const posted = await waitForMcpResult(fetchMock, "req-mid-setup");
+      expect(posted.result.result.isError).toBe(true);
+      expect(posted.result.result.content[0].text).toBe("Tool execution cancelled by user.");
     });
 
     // A tool call that arrives mid-turn parks on the approval gate. Cancelling
