@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
 import { registerDustSessionEvents } from "../src/dust-session-events.js";
-import { collectStatusData } from "../src/dust-status.js";
+import { collectStatusData, resolveStatusTarget } from "../src/dust-status.js";
 import {
   currentBucket,
   formatBucketRange,
@@ -385,6 +385,23 @@ describe("dust /status", () => {
       ) as DustStatusData;
 
       expect(data.agentName).toBeNull();
+    });
+
+    it("leaves runtime.sessionContext untouched when not logged in", async () => {
+      // Regression test: ensureSessionContext(runtime, ctx) must run AFTER the
+      // login/workspace guards, not before. Otherwise resolveStatusTarget would
+      // overwrite a correctly-wired sessionContext (set up at session_start via
+      // applyRuntimeContext) with one built from the command's own ctx — which
+      // may have no sessionManager at all — turning saveConversationId into a
+      // permanent no-op for the rest of the session.
+      seedAuth(null);
+      const runtime = new DustSessionRuntime();
+      const sentinel = runtime.sessionContext;
+
+      const result = resolveStatusTarget(runtime, makeCtx() as never);
+
+      expect(result).toEqual({ error: expect.stringMatching(/log.?in/i) });
+      expect(runtime.sessionContext).toBe(sentinel);
     });
   });
 

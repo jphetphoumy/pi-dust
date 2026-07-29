@@ -47,10 +47,10 @@ type CustomUi = <T>(
  *
  * The command can run before any turn has wired the runtime up (no
  * session_start yet), in which case `runtime.sessionContext` is still the
- * no-op default. Wire it from the command's own context in place — every
- * credit fetch below reads through `runtime`, so it needs a working
- * `sessionContext` on the same instance, not a free-floating one only this
- * call would see.
+ * no-op default. Wire it from the caller's own context in place — the
+ * credit fetches in `collectStatusData` read through `runtime`, so it needs a
+ * working `sessionContext` on the same instance, not a free-floating one
+ * only the caller would see.
  */
 function ensureSessionContext(runtime: DustSessionRuntime, ctx: PiRuntimeContext): void {
   if (!runtime.sessionContext.getCredentials()) {
@@ -67,11 +67,11 @@ export function resolveStatusTarget(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,
 ): StatusTarget | { error: string } {
-  ensureSessionContext(runtime, ctx);
-
   const cred = getStoredCredentials();
   if (!cred?.access) return { error: NOT_LOGGED_IN };
   if (!cred.workspaceId) return { error: NO_WORKSPACE };
+
+  ensureSessionContext(runtime, ctx);
 
   const region = cred.region ?? "us-central1";
   return {

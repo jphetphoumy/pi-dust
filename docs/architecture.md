@@ -243,8 +243,8 @@ Responsibilities:
 - keep it alive with heartbeats
 - listen for MCP requests
 - post MCP results back to Dust
-- refresh the access token and retry once on a 401 (SSE connect or heartbeat)
-  before treating the session as dead
+- on a 401 (SSE connect or heartbeat), delegate to the shared refresh and
+  retry once before treating the session as dead
 - recognize a lost registration (403/404) as distinct from a dead session, and
   signal it so the runtime clears state for `dust-stream-provider.ts` to
   re-register on the next turn instead of running toolless

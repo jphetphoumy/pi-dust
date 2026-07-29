@@ -68,8 +68,8 @@ function notifyReloginRequired(ctx: PiRuntimeContext): void {
  * refresh, which still yields a usable in-memory token for this session.
  *
  * Either success path also publishes into `runtime.refreshedAccessToken` — the
- * in-memory holder that both `getAuthHeaders()` in dust-stream-provider.ts and
- * `dust-credits.ts`'s `fetchCreditsJson` prefer over storage. Without that,
+ * in-memory holder that every `getAuthHeaders()` in dust-stream-provider.ts,
+ * and `dust-credits.ts`'s `fetchCreditsJson`, prefer over storage. Without that,
  * this refresh and the holder could diverge: storage picks up the fresh token
  * immediately, but the holder (if still live from an earlier direct refresh
  * elsewhere in the same session) would keep outranking it with something
