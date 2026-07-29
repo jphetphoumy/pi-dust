@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, vi } from "vitest";
 import dustExtension from "../../src/dust.js";
+import type { SessionContextController } from "../../src/dust-runtime.js";
 
 const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 
@@ -143,6 +144,25 @@ export function makeCredentials(overrides: Record<string, unknown> = {}) {
     ] as DustAgent[],
     region: "us-central1",
     username: "janedoe",
+    ...overrides,
+  };
+}
+
+/**
+ * A `SessionContextController` stub with sensible defaults, so tests that
+ * only care about one or two custom behaviors (a controllable
+ * `resolveAccessToken`, a spy on `setCredentials`, ...) don't have to restate
+ * the whole shape every time. Pass `overrides` for the fields a test needs to
+ * customize.
+ */
+export function makeSessionContext(overrides: Partial<SessionContextController> = {}): SessionContextController {
+  return {
+    getSessionFile: () => undefined,
+    saveConversationId: () => {},
+    getCredentials: () => makeCredentials(),
+    setCredentials: () => {},
+    resolveAccessToken: async () => "tok",
+    getAccessToken: () => "tok",
     ...overrides,
   };
 }

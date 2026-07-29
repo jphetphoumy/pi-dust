@@ -1,4 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { refreshToken } from "./dust-auth.js";
+import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import {
   getStoredCredentials,
@@ -16,7 +18,7 @@ import type {
   TopConversations,
   UsageAnalytics,
 } from "./dust-types.js";
-import { agentMessageIdFromMcpRequestId } from "./dust-validation.js";
+import { agentMessageIdFromMcpRequestId, errorMessage } from "./dust-validation.js";
 
 export interface SessionContextController {
   getSessionFile: () => string | undefined;
@@ -183,15 +185,18 @@ export class DustSessionRuntime {
    * The most recently refreshed access token, held in memory with an expiry.
    *
    * Invariants:
-   * - **Written by**: `refreshAuth`'s two branches (dust-stream-provider.ts,
-   *   shared single-flight via `refreshInFlight` below), the pre-stream
-   *   refresh block in `dustRealStream`, and `refreshExpiredToken` at
-   *   session_start (dust-session-events.ts) — every place that resolves a
-   *   token outside of pi's own persisted storage.
+   * - **Written by**: `refreshAccessToken()` below (its own two branches;
+   *   `refreshAuth` in dust-stream-provider.ts is now a one-line delegate to
+   *   it), the pre-stream refresh block in `dustRealStream`
+   *   (dust-stream-provider.ts), and `refreshExpiredToken` at session_start
+   *   (dust-session-events.ts) — every place that resolves a token outside of
+   *   pi's own persisted storage. The latter two still hand-roll their own
+   *   refresh body rather than calling `refreshAccessToken()`; see that
+   *   method's doc for why they're out of scope here.
    * - **Read by**: `DustSessionRuntime#currentAccessToken()`, the single
-   *   accessor every `getAuthHeaders()`/auth-header builder in
-   *   dust-stream-provider.ts must go through — never read this field
-   *   directly.
+   *   accessor every auth-header builder in dust-stream-provider.ts and
+   *   `dust-credits.ts`'s `fetchCreditsJson` must go through — never read
+   *   this field directly.
    * - **Expires**: entries carry their own `expiresAt` and are ignored (and
    *   dropped) once past it, falling through to storage instead. This is
    *   what makes it safe for it to unconditionally win otherwise: a stale
@@ -212,13 +217,14 @@ export class DustSessionRuntime {
    */
   refreshedAccessToken: HeldAccessToken | null = null;
   /**
-   * Single-flight guard for `refreshAuth`. The event stream, the MCP
-   * listener, and the MCP heartbeat can all hit a 401 in the same window and
-   * each call `refreshAuth` — without memoizing the in-flight attempt here,
-   * two concurrent direct refreshes would race the same rotating refresh
-   * token: WorkOS honors the first and answers `invalid_grant` to the
-   * second, which would then report a false refresh failure and invalidate a
-   * session that had, in fact, just been refreshed successfully.
+   * Single-flight guard for `refreshAccessToken()`. The event stream, the MCP
+   * listener, the MCP heartbeat, and `/status` credit fetches can all hit a
+   * 401 in the same window and each call `refreshAccessToken()` — without
+   * memoizing the in-flight attempt here, two concurrent direct refreshes
+   * would race the same rotating refresh token: WorkOS honors the first and
+   * answers `invalid_grant` to the second, which would then report a false
+   * refresh failure and invalidate a session that had, in fact, just been
+   * refreshed successfully.
    */
   refreshInFlight: Promise<boolean> | null = null;
   confirmFn: (title: string, message: string) => Promise<boolean> = NOOP_CONFIRM;
@@ -338,12 +344,13 @@ export class DustSessionRuntime {
   }
 
   /**
-   * The single accessor every auth-header builder in dust-stream-provider.ts
-   * must go through, instead of each hand-rolling its own `||` chain over
-   * `refreshedAccessToken` and storage. Prefers the in-memory holder while it
-   * is still within its assumed lifetime — since storage cannot carry a
-   * directly-refreshed token at all (see `refreshedAccessToken`'s doc) — and
-   * otherwise falls through to whatever is currently persisted.
+   * The single accessor every auth-header builder in dust-stream-provider.ts,
+   * and `dust-credits.ts`'s credit fetches, must go through — instead of each
+   * hand-rolling its own `||` chain over `refreshedAccessToken` and storage.
+   * Prefers the in-memory holder while it is still within its assumed
+   * lifetime — since storage cannot carry a directly-refreshed token at all
+   * (see `refreshedAccessToken`'s doc) — and otherwise falls through to
+   * whatever is currently persisted.
    */
   currentAccessToken(): string {
     const held = this.refreshedAccessToken;
@@ -357,6 +364,83 @@ export class DustSessionRuntime {
       this.refreshedAccessToken = null;
     }
     return this.sessionContext.getAccessToken();
+  }
+
+  /**
+   * Refreshes the access token, single-flighted on `refreshInFlight`.
+   *
+   * Scope: this is the single implementation for 401-recovery refreshes.
+   * Every 401-recovery caller — the event stream, the MCP listener/heartbeat
+   * (dust-stream-provider.ts, via the one-line `refreshAuth` delegate), and
+   * `/status` credit fetches (dust-credits.ts) — hits this same method
+   * instead of each rolling its own refresh body, so a 401 concurrent with
+   * another caller's refresh awaits that one attempt instead of racing it
+   * with a second direct refresh against the same (now-rotated) refresh
+   * token.
+   *
+   * Out of scope: two other refresh bodies predate this method and are *not*
+   * merged into it — the proactive pre-stream refresh block in
+   * `dustRealStream` (dust-stream-provider.ts, gated on
+   * `shouldRefreshAccessToken`) and `refreshExpiredToken` at session_start
+   * (dust-session-events.ts). Both still hand-roll their own host-token-then-
+   * direct-refresh body and do not go through `refreshInFlight`, so a turn
+   * starting (which runs the pre-stream refresh) while `/status` triggers a
+   * credits refresh can still race two direct refreshes against the same
+   * rotating refresh token. Folding those two into this method is a real
+   * behavior change (careful handling of `liveCred` updates and
+   * `isSessionExpiredError` needed) and is intentionally left for later work.
+   *
+   * Prefers pi's own `resolveAccessToken` host path, which persists the
+   * rotation to auth.json itself; falls back to a direct WorkOS refresh
+   * (`fallbackCredentials` is the caller's own best snapshot of the current
+   * credentials, used only if `sessionContext` itself has none — e.g. a
+   * turn's `liveCred` closed over before this call).
+   *
+   * `fallbackCredentials` only matters for whichever call *starts* the
+   * flight — a second, concurrent caller just awaits `refreshInFlight` and
+   * never gets its own fallback considered. This can't bite in practice
+   * (every caller's `sessionContext.getCredentials()` reads the same stored
+   * credential, so the fallback is only ever reached when that read is
+   * already null for everyone), but it's the shape of the divergent-bodies
+   * defect this method exists to prevent, so don't reintroduce a per-caller
+   * refresh body to "fix" it.
+   */
+  async refreshAccessToken(fallbackCredentials?: DustCredentials): Promise<boolean> {
+    this.refreshInFlight ??= (async (): Promise<boolean> => {
+      const hostToken = await this.sessionContext.resolveAccessToken();
+      if (hostToken) {
+        this.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+        return true;
+      }
+
+      const credentials = this.sessionContext.getCredentials() ?? fallbackCredentials ?? null;
+      if (!credentials) return false;
+
+      try {
+        const refreshed = await refreshToken(credentials);
+        this.sessionContext.setCredentials(refreshed);
+        // persistCredentialState drops access/refresh/expires (auth.json is
+        // pi-owned, we can no longer write it), so the rotated token would
+        // otherwise vanish the instant it's "saved": every later
+        // currentAccessToken() read — ours and every other caller's — would
+        // keep re-reading the same expired token from storage and loop
+        // straight back into the same 401.
+        if (refreshed.access) {
+          this.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+        }
+        return Boolean(refreshed.access);
+      } catch (err) {
+        debugLog("dust:session", "Refresh after 401 failed", {
+          expired: errorMessage(err) === SESSION_EXPIRED_MESSAGE,
+          error: errorMessage(err),
+        });
+        return false;
+      }
+    })().finally(() => {
+      this.refreshInFlight = null;
+    });
+
+    return this.refreshInFlight;
   }
 
   createApprovalGate(): void {

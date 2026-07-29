@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
 import { registerDustSessionEvents } from "../src/dust-session-events.js";
-import { collectStatusData } from "../src/dust-status.js";
+import { collectStatusData, resolveStatusTarget } from "../src/dust-status.js";
 import {
   currentBucket,
   formatBucketRange,
@@ -388,6 +388,25 @@ describe("dust /status", () => {
     });
   });
 
+  describe("resolveStatusTarget", () => {
+    it("leaves runtime.sessionContext untouched when not logged in", () => {
+      // Regression test: ensureSessionContext(runtime, ctx) must run AFTER the
+      // login/workspace guards, not before. Otherwise resolveStatusTarget would
+      // overwrite a correctly-wired sessionContext (set up at session_start via
+      // applyRuntimeContext) with one built from the command's own ctx — which
+      // may have no sessionManager at all — turning saveConversationId into a
+      // permanent no-op for the rest of the session.
+      seedAuth(null);
+      const runtime = new DustSessionRuntime();
+      const sentinel = runtime.sessionContext;
+
+      const result = resolveStatusTarget(runtime, makeCtx() as never);
+
+      expect(result).toEqual({ error: expect.stringMatching(/log.?in/i) });
+      expect(runtime.sessionContext).toBe(sentinel);
+    });
+  });
+
   describe("credit fetching", () => {
     it("falls back to a direct token refresh when the host cannot resolve auth", async () => {
       seedLoggedIn(makeCredentials());
@@ -430,6 +449,28 @@ describe("dust /status", () => {
       const data = await collectStatusData(new DustSessionRuntime(), makeCtx()) as DustStatusData;
       expect(data.usage).toBeNull();
       expect(data.analytics).toBeNull();
+    });
+
+    it("single-flights a 401 hit by several concurrent credit fetches into one refresh", async () => {
+      // collectStatusData fires several credit endpoints concurrently (usage,
+      // fair-use, and three analytics granularities via Promise.all). Without
+      // a shared single-flight, each of their 401s would trigger its own
+      // refresh attempt against the same rotating refresh token.
+      seedLoggedIn(makeCredentials());
+      const fetchMock = vi.fn((_url: string, init?: { headers: Record<string, string> }) =>
+        Promise.resolve(
+          init?.headers.Authorization === "Bearer fresh-token"
+            ? jsonResponse({ member: FULL_MEMBER })
+            : jsonResponse({}, 401),
+        ));
+      globalThis.fetch = fetchMock as never;
+
+      const getProviderAuth = vi.fn().mockResolvedValue({ auth: { apiKey: "fresh-token" } });
+      const runtime = new DustSessionRuntime();
+      await collectStatusData(runtime, makeCtx({ modelRegistry: { getProviderAuth } }));
+
+      expect(getProviderAuth).toHaveBeenCalledTimes(1);
+      expect(runtime.currentAccessToken()).toBe("fresh-token");
     });
 
     it("makes no request at all when the stored access token is blank", async () => {

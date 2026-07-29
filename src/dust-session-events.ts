@@ -67,12 +67,13 @@ function notifyReloginRequired(ctx: PiRuntimeContext): void {
  * Older pi builds have no `getProviderAuth`; there we fall back to a direct
  * refresh, which still yields a usable in-memory token for this session.
  *
- * Either success path also publishes into `runtime.refreshedAccessToken` —
- * the in-memory holder every `getAuthHeaders()` in dust-stream-provider.ts
- * prefers over storage. Without that, this refresh and the holder could
- * diverge: storage picks up the fresh token immediately, but the holder (if
- * still live from an earlier direct refresh elsewhere in the same session)
- * would keep outranking it with something older until it happened to expire.
+ * Either success path also publishes into `runtime.refreshedAccessToken` — the
+ * in-memory holder that every `getAuthHeaders()` in dust-stream-provider.ts,
+ * and `dust-credits.ts`'s `fetchCreditsJson`, prefer over storage. Without that,
+ * this refresh and the holder could diverge: storage picks up the fresh token
+ * immediately, but the holder (if still live from an earlier direct refresh
+ * elsewhere in the same session) would keep outranking it with something
+ * older until it happened to expire.
  */
 async function refreshExpiredToken(
   ctx: PiRuntimeContext,

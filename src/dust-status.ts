@@ -10,7 +10,7 @@ import {
   fetchUsageBreakdown,
 } from "./dust-credits.js";
 import { debugLog } from "./dust-debug.js";
-import { buildSessionContext, type DustSessionRuntime, type SessionContextController } from "./dust-runtime.js";
+import { buildSessionContext, type DustSessionRuntime } from "./dust-runtime.js";
 import { getStoredCredentials } from "./dust-state.js";
 import { StatusLoader } from "./dust-status-loader.js";
 import { DustStatusPanel, panelHeight } from "./dust-status-panel.js";
@@ -30,7 +30,6 @@ export interface StatusTarget {
   workspaceId: string;
   region: string;
   baseUrl: string;
-  session: SessionContextController;
 }
 
 type CustomUi = <T>(
@@ -44,13 +43,25 @@ type CustomUi = <T>(
 ) => Promise<T>;
 
 /**
- * Assembles the panel's data.
+ * Ensures `runtime.sessionContext` is wired once the target has resolved.
  *
- * Live figures (seat balance, spend cap, reset date) are refetched whenever the
- * session has advanced since the last read — a user who just ran a few turns
- * must see those turns reflected, so caching them is only ever an optimisation
- * for a session that has not moved. The 30-day breakdowns are cached outright:
- * they are month-scale aggregates that cannot shift within one session.
+ * The command can run before any turn has wired the runtime up (no
+ * session_start yet), in which case `runtime.sessionContext` is still the
+ * no-op default. Wire it from the caller's own context in place — the
+ * credit fetches in `collectStatusData` read through `runtime`, so it needs a
+ * working `sessionContext` on the same instance, not a free-floating one
+ * only the caller would see.
+ */
+function ensureSessionContext(runtime: DustSessionRuntime, ctx: PiRuntimeContext): void {
+  if (!runtime.sessionContext.getCredentials()) {
+    runtime.sessionContext = buildSessionContext(ctx);
+  }
+}
+
+/**
+ * Resolves the panel's target. Also ensures `runtime.sessionContext` is wired
+ * (see `ensureSessionContext`). Idempotent and safe to call more than once
+ * per command, which is what both callers below do.
  */
 export function resolveStatusTarget(
   runtime: DustSessionRuntime,
@@ -60,20 +71,28 @@ export function resolveStatusTarget(
   if (!cred?.access) return { error: NOT_LOGGED_IN };
   if (!cred.workspaceId) return { error: NO_WORKSPACE };
 
+  // After the guards, deliberately: a logged-out run must not replace a
+  // correctly-wired sessionContext with one built from the command's ctx.
+  ensureSessionContext(runtime, ctx);
+
   const region = cred.region ?? "us-central1";
   return {
     cred,
     workspaceId: cred.workspaceId,
     region,
     baseUrl: creditsBaseUrl(region, cred.workspaceId),
-    // The command can run before any turn has wired the runtime up, so derive a
-    // session controller from the command context when there is none yet.
-    session: runtime.sessionContext.getCredentials()
-      ? runtime.sessionContext
-      : buildSessionContext(ctx),
   };
 }
 
+/**
+ * Assembles the panel's data.
+ *
+ * Live figures (seat balance, spend cap, reset date) are refetched whenever the
+ * session has advanced since the last read — a user who just ran a few turns
+ * must see those turns reflected, so caching them is only ever an optimisation
+ * for a session that has not moved. The 30-day breakdowns are cached outright:
+ * they are month-scale aggregates that cannot shift within one session.
+ */
 export async function collectStatusData(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,
@@ -82,17 +101,17 @@ export async function collectStatusData(
   const target = resolveStatusTarget(runtime, ctx);
   if ("error" in target) return target;
 
-  const { cred, workspaceId, region, baseUrl, session } = target;
+  const { cred, workspaceId, region, baseUrl } = target;
   const tracker = runtime.credits;
 
   const needsLiveRead = tracker.dirty || tracker.lastConsumedCredits === null;
   const [usage, fairUse, totals] = needsLiveRead
     ? await Promise.all([
-        fetchMemberUsage(session, baseUrl, signal),
-        fetchFairUseCredits(session, baseUrl, signal),
+        fetchMemberUsage(runtime, baseUrl, signal),
+        fetchFairUseCredits(runtime, baseUrl, signal),
         // The period totals are the headline figures, so they follow the live
         // rule too — a user who just ran turns must see them move.
-        fetchCreditTotals(session, baseUrl, signal),
+        fetchCreditTotals(runtime, baseUrl, signal),
       ])
     : [tracker.cachedUsage, tracker.cachedFairUse, tracker.cachedTotals];
 
@@ -109,10 +128,10 @@ export async function collectStatusData(
     : tracker.sessionDelta();
 
   if (tracker.analytics === null) {
-    tracker.analytics = await fetchUsageBreakdown(session, baseUrl, "agent", OVERVIEW_BREAKDOWN_DAYS, signal);
+    tracker.analytics = await fetchUsageBreakdown(runtime, baseUrl, "agent", OVERVIEW_BREAKDOWN_DAYS, signal);
   }
   if (tracker.topConversations === null) {
-    tracker.topConversations = await fetchTopConversations(session, baseUrl, signal);
+    tracker.topConversations = await fetchTopConversations(runtime, baseUrl, signal);
   }
 
   const workspace = cred.workspaces?.find((candidate) => candidate.sId === workspaceId);
@@ -189,7 +208,7 @@ export function registerDustStatusCommand(pi: ExtensionAPI, runtime: DustSession
         return;
       }
 
-      const opened = await openStatusPanel(runtime, runtimeCtx, target, signal);
+      const opened = await openStatusPanel(runtime, runtimeCtx, target.baseUrl, signal);
       if (opened) return;
 
       // No interactive UI (headless, RPC, or a pi without ui.custom): fall back
@@ -221,7 +240,7 @@ export function registerDustStatusCommand(pi: ExtensionAPI, runtime: DustSession
 async function openStatusPanel(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,
-  target: StatusTarget,
+  baseUrl: string,
   signal?: AbortSignal,
 ): Promise<boolean> {
   const custom = (ctx.ui as { custom?: CustomUi } | undefined)?.custom;
@@ -239,8 +258,8 @@ async function openStatusPanel(
 
   await custom<undefined>((tui, theme, _keybindings, done) => {
     loader = new StatusLoader(
-      target.session,
-      target.baseUrl,
+      runtime,
+      baseUrl,
       () => tui.requestRender(),
       signal,
       tracker.dirty ? null : tracker.lastOverview,
