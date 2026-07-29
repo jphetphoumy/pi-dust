@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { DustAgent, DustCredentials, Workspace } from "./dust-types.js";
@@ -214,6 +214,38 @@ export function clearInvalidated(): void {
 }
 
 /**
+ * Drops mappings whose session file is gone — deleted from `/resume`, or living
+ * under a scratch directory that no longer exists. The map is append-only
+ * otherwise, so without this it grows for the life of the install.
+ *
+ * Only a missing file counts. Anything we cannot answer (a permission error, a
+ * transient stat failure) keeps its entry: losing a live mapping costs the user
+ * a conversation, while keeping a dead one costs a line of JSON.
+ *
+ * pi creates a session file on its first assistant message, so a session that
+ * has attached to a conversation but not yet been answered is briefly missing
+ * from disk. A concurrent pi could sweep it away in that window; it would then
+ * start a fresh conversation on its next resume, which is the same outcome as
+ * before any of this existed.
+ */
+function pruneMissingSessions(conversations: Record<string, string>): Record<string, string> {
+  const kept: Record<string, string> = {};
+  for (const [sessionFile, conversationId] of Object.entries(conversations)) {
+    try {
+      // Not `existsSync`: it answers false for a file it merely cannot reach,
+      // so an unreadable or briefly unmounted sessions directory would read as
+      // "every session deleted". `statSync` tells the two apart — undefined for
+      // a missing file, a throw for anything else.
+      if (statSync(sessionFile, { throwIfNoEntry: false }) === undefined) continue;
+    } catch {
+      // Undecidable, so not evidence the session is gone.
+    }
+    kept[sessionFile] = conversationId;
+  }
+  return kept;
+}
+
+/**
  * Forgets a session's conversation, for when Dust says it is gone. Left in
  * place it would be re-checked and re-reported on every later start of that
  * session, until some message happened to overwrite it.
@@ -228,6 +260,8 @@ export function forgetConversationId(sessionFile: string): void {
 export function saveConversationId(sessionFile: string, conversationId: string): void {
   const state = readDustState();
   patchDustState({
-    conversations: { ...(state.conversations ?? {}), [sessionFile]: conversationId },
+    // The write is the natural moment to sweep: it already rewrites the map, and
+    // it is rare enough that stat-ing the other entries costs nothing.
+    conversations: { ...pruneMissingSessions(state.conversations ?? {}), [sessionFile]: conversationId },
   });
 }
