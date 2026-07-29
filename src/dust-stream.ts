@@ -1,4 +1,4 @@
-import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { CANCELLED_MESSAGE, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import type {
   AssistantMessageLike,
@@ -46,6 +46,29 @@ export function makeEmptyMessage(model: DustModel): AssistantMessageLike {
     stopReason: "stop",
     timestamp: Date.now(),
   };
+}
+
+/**
+ * Ends the turn as cancelled, keeping whatever the agent had already written.
+ *
+ * pi renders `aborted` as an interrupted turn rather than a failure, so the
+ * transcript shows the partial answer instead of an "operation was aborted"
+ * error.
+ */
+function finishAborted(
+  stream: PiEventStream,
+  model: DustModel,
+  fullText: string,
+  resolveApprovalGate: () => void,
+): void {
+  resolveApprovalGate();
+  const finalMessage = makeEmptyMessage(model);
+  finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+  finalMessage.stopReason = "aborted";
+  finalMessage.errorMessage = CANCELLED_MESSAGE;
+  stream.push({ type: "error", reason: "aborted", error: finalMessage });
+  stream.end();
+  debugLog("dust:stream", "Stream aborted by user", { fullText });
 }
 
 export function createEventStream(): PiEventStream {
@@ -163,6 +186,11 @@ export async function streamEvents({
   let refreshedAfterUnauthorized = false;
 
   reconnect: for (;;) {
+    if (signal?.aborted) {
+      finishAborted(stream, model, fullText, resolveApprovalGate);
+      return;
+    }
+
     const sseUrl = lastEventId
       ? `${baseSseUrl}?lastEventId=${encodeURIComponent(lastEventId)}`
       : baseSseUrl;
@@ -178,7 +206,8 @@ export async function streamEvents({
       });
     } catch (error) {
       if (signal?.aborted) {
-        throw error;
+        finishAborted(stream, model, fullText, resolveApprovalGate);
+        return;
       }
       const delayMs = streamRetryDelay(reconnectAttempt);
       debugLog("dust:stream", "SSE request threw, retrying", {
@@ -344,6 +373,14 @@ export async function streamEvents({
         }
         if (done) break;
       }
+    } catch (error) {
+      // Cancelling the turn aborts the in-flight read; end as cancelled rather
+      // than letting the AbortError surface as a stream failure.
+      if (signal?.aborted) {
+        finishAborted(stream, model, fullText, resolveApprovalGate);
+        return;
+      }
+      throw error;
     } finally {
       reader.releaseLock();
     }

@@ -38,6 +38,21 @@ const NOOP_SESSION_CONTEXT: SessionContextController = {
 
 const NOOP_CONFIRM = async () => true;
 
+/**
+ * The Dust-side half of one pi turn.
+ *
+ * Cancelling a turn needs the agent message the Dust agent loop is running
+ * under, and a way to kill local tool work that the (session-lifetime) MCP
+ * listener started on its behalf.
+ */
+export interface ActiveDustTurn {
+  conversationSId: string;
+  agentMessageSId: string;
+  /** Aborted when the user cancels, so in-flight local tools stop too. */
+  toolAbortController: AbortController;
+  cancelled: boolean;
+}
+
 export class DustSessionRuntime {
   /** Extension API handle, used to append tool-call entries to the transcript. */
   pi: ExtensionAPI | null = null;
@@ -57,6 +72,55 @@ export class DustSessionRuntime {
   preApprovedActions = new Map<string, boolean>();
   pendingApprovalPromise: Promise<void> | null = null;
   private resolveApprovalGateFn: (() => void) | null = null;
+  /** The turn currently streaming, if any. */
+  activeTurn: ActiveDustTurn | null = null;
+  /**
+   * Whether the most recent turn was cancelled. Dust tool calls can arrive
+   * after the stream has already closed, so the verdict has to outlive the turn
+   * itself; the next turn clears it.
+   */
+  private lastTurnCancelled = false;
+
+  beginTurn(conversationSId: string, agentMessageSId: string): ActiveDustTurn {
+    this.lastTurnCancelled = false;
+    const turn: ActiveDustTurn = {
+      conversationSId,
+      agentMessageSId,
+      toolAbortController: new AbortController(),
+      cancelled: false,
+    };
+    this.activeTurn = turn;
+    return turn;
+  }
+
+  /** Clears `activeTurn` only if `turn` is still the current one. */
+  endTurn(turn: ActiveDustTurn): void {
+    if (this.activeTurn === turn) {
+      this.activeTurn = null;
+    }
+  }
+
+  /**
+   * Marks the current turn cancelled and aborts its local tool work. Returns
+   * the turn so the caller can tell Dust to stop it, or null if none is live.
+   */
+  cancelActiveTurn(): ActiveDustTurn | null {
+    const turn = this.activeTurn;
+    if (!turn || turn.cancelled) {
+      return null;
+    }
+    turn.cancelled = true;
+    this.lastTurnCancelled = true;
+    turn.toolAbortController.abort();
+    // A tool waiting on approval must not block the MCP listener forever once
+    // the turn it belonged to is gone.
+    this.resolveApprovalGate();
+    return turn;
+  }
+
+  isTurnCancelled(): boolean {
+    return this.activeTurn ? this.activeTurn.cancelled : this.lastTurnCancelled;
+  }
 
   createApprovalGate(): void {
     this.pendingApprovalPromise = new Promise<void>((resolve) => {
@@ -73,6 +137,10 @@ export class DustSessionRuntime {
   }
 
   clearMcpState(): void {
+    // Switching session or losing credentials ends any turn in flight; its
+    // local tools must not keep running against the old session.
+    this.cancelActiveTurn();
+    this.activeTurn = null;
     if (this.mcpHeartbeatTimer) {
       clearInterval(this.mcpHeartbeatTimer);
       this.mcpHeartbeatTimer = null;

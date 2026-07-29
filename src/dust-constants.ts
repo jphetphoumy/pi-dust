@@ -5,6 +5,10 @@ export const DUST_US_URL = "https://dust.tt";
 export const DUST_EU_URL = "https://eu.dust.tt";
 export const DUST_CLI_VERSION = "0.4.4";
 export const SESSION_EXPIRED_MESSAGE = "Dust session expired — run /logout then /login to re-authenticate.";
+/** Shown when the user interrupts a turn; not an error condition. */
+export const CANCELLED_MESSAGE = "Cancelled by user.";
+/** Returned to Dust for tool calls that arrive after the turn was cancelled. */
+export const CANCELLED_TOOL_MESSAGE = "Tool execution cancelled by user.";
 
 /** Name registered with Dust; tools are exposed as `<slugified name>__<tool>`. */
 export const MCP_SERVER_NAME = "pi-dust-extension";

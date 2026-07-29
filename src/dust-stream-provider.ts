@@ -1,4 +1,4 @@
-import { DUST_HEADERS, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { CANCELLED_MESSAGE, CANCELLED_TOOL_MESSAGE, DUST_HEADERS, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
@@ -11,6 +11,7 @@ import { invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-r
 import type { DustSessionRuntime } from "./dust-runtime.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
+const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
@@ -105,8 +106,20 @@ async function ensureMcpServer(
     buildConfirmMessage,
     getTools: () => getMcpTools(runtime.extensionContext as never),
     executeMcpTool: async (name, args) => {
+      // Second line of defence behind the listener's own check: the turn can be
+      // cancelled while a tool sits at the approval prompt, and running it then
+      // would touch the user's machine for a turn they just stopped.
+      if (runtime.isTurnCancelled()) {
+        debugLog("dust:mcp", "Dropping tool call from a cancelled turn", { name });
+        return { content: [{ type: "text", text: CANCELLED_TOOL_MESSAGE }], isError: true };
+      }
       const startedAt = Date.now();
-      const result = await executeMcpTool(name, args, runtime.extensionContext as never);
+      const result = await executeMcpTool(
+        name,
+        args,
+        runtime.extensionContext as never,
+        runtime.activeTurn?.toolAbortController.signal,
+      );
       // Dust tool calls bypass pi's tool pipeline, so nothing would appear in
       // the transcript. Record the call so it renders like a native one.
       if (runtime.pi) {
@@ -124,6 +137,7 @@ async function ensureMcpServer(
     getConfirmFn: () => runtime.confirmFn,
     getPendingApprovalPromise: () => runtime.pendingApprovalPromise,
     preApprovedActions: runtime.preApprovedActions,
+    isTurnCancelled: () => runtime.isTurnCancelled(),
   }).catch((err) => {
     // Shutting the session down aborts the listener; that is not a failure.
     if (isAbortError(err, abortController.signal)) {
@@ -159,6 +173,43 @@ async function postValidateAction(
     headers: { ...authHeaders, "Content-Type": "application/json" },
     body: JSON.stringify({ actionId, approved: approved ? "approved" : "rejected" }),
   });
+}
+
+/**
+ * Hard-stops the Dust agent loop running under `messageIds`.
+ *
+ * Dust signals the agent's workflow, marks the messages cancelled and publishes
+ * `agent_generation_cancelled`. Without this the loop keeps running server-side
+ * after the user hits escape — still burning tokens and, worse, still asking our
+ * MCP server to run local tools.
+ *
+ * Deliberately not tied to the turn's abort signal: it is sent *because* that
+ * signal fired, so it must outlive it. Failures are logged, never thrown — the
+ * turn is already over and there is nothing the user could do about them.
+ */
+export async function cancelMessageGeneration(
+  baseUrl: string,
+  authHeaders: Record<string, string>,
+  conversationId: string,
+  messageIds: string[],
+): Promise<void> {
+  const url = `${baseUrl}/assistant/conversations/${conversationId}/cancel`;
+  debugLog("dust:session", "Cancelling message generation", { conversationId, messageIds, url });
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ messageIds }),
+      signal: AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      debugLog("dust:session", "Cancel request failed", { status: res.status, conversationId, messageIds });
+      return;
+    }
+    debugLog("dust:session", "Cancel request accepted", { conversationId, messageIds });
+  } catch (error) {
+    debugLog("dust:session", "Cancel request threw", { error: errorMessage(error), conversationId });
+  }
 }
 
 async function createConversation(
@@ -300,6 +351,9 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
   ) {
     const stream = createEventStream();
     let liveCred: DustCredentials = runtime.sessionContext.getCredentials() ?? cred;
+    let cancelTurnOnAbort: (() => void) | null = null;
+    let abortListenerSignal: AbortSignal | null = null;
+    let endTurn: (() => void) | null = null;
 
     (async () => {
       try {
@@ -417,6 +471,31 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           );
         }
 
+        // From here on there is a Dust agent loop to stop, so escape becomes a
+        // real cancellation rather than a client-side disconnect.
+        const turn = runtime.beginTurn(conversationSId, agentMessageSId);
+        cancelTurnOnAbort = () => {
+          const cancelled = runtime.cancelActiveTurn();
+          if (!cancelled) return;
+          void cancelMessageGeneration(
+            baseUrl,
+            getAuthHeaders(),
+            cancelled.conversationSId,
+            [cancelled.agentMessageSId],
+          );
+        };
+        if (signal) {
+          // The turn may already have been cancelled while we were setting the
+          // conversation up; addEventListener alone would never fire then.
+          if (signal.aborted) {
+            cancelTurnOnAbort();
+          } else {
+            abortListenerSignal = signal;
+            signal.addEventListener("abort", cancelTurnOnAbort, { once: true });
+          }
+        }
+        endTurn = () => runtime.endTurn(turn);
+
         await streamEvents({
           baseUrl,
           conversationSId,
@@ -433,17 +512,24 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           resolveApprovalGate: () => runtime.resolveApprovalGate(),
         });
       } catch (error) {
-        debugLog("dust:session", "Dust stream failed", { error: errorMessage(error) });
-        if (isSessionExpiredError(error)) {
+        // Aborting mid-setup (before the SSE stream owns the abort) surfaces as
+        // a rejected fetch. That is the user cancelling, not a failure.
+        const aborted = options?.signal?.aborted === true;
+        debugLog("dust:session", aborted ? "Dust stream aborted" : "Dust stream failed", { error: errorMessage(error) });
+        if (!aborted && isSessionExpiredError(error)) {
           invalidateRuntimeCredentials(runtime, liveCred);
         }
         const message = makeEmptyMessage(model);
-        message.stopReason = "error";
-        message.errorMessage = error instanceof Error ? error.message : String(error);
-        stream.push({ type: "error", reason: "error", error: message });
+        message.stopReason = aborted ? "aborted" : "error";
+        message.errorMessage = aborted ? CANCELLED_MESSAGE : errorMessage(error);
+        stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
         stream.end();
       } finally {
         runtime.resolveApprovalGate();
+        if (abortListenerSignal && cancelTurnOnAbort) {
+          abortListenerSignal.removeEventListener("abort", cancelTurnOnAbort);
+        }
+        endTurn?.();
       }
     })();
 
