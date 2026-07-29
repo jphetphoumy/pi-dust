@@ -3,6 +3,8 @@ import type {
   ConversationCreateResponse,
   ConversationFetchResponse,
   CreditBreakdownEntry,
+  CreditBucket,
+  CreditSeries,
   DeviceCodeResponse,
   DustAgent,
   FairUseCredits,
@@ -323,8 +325,14 @@ function firstString(obj: JsonObject, keys: readonly string[]): string | null {
   return null;
 }
 
-const LABEL_KEYS = ["label", "name", "title", "agentName", "key", "sId", "id"] as const;
+const LABEL_KEYS = ["name", "label", "title", "agentName", "groupKey", "key", "sId", "id"] as const;
 const CREDIT_KEYS = ["credits", "awuCredits", "consumedAwuCredits", "creditsConsumed", "value", "total"] as const;
+/**
+ * Dust returns `{ groupKey, name }` per group and keeps the numbers in the
+ * time series, so `groupKey` is the join key that matters — a group row itself
+ * carries no credits at all.
+ */
+const GROUP_KEY_KEYS = ["groupKey", "key", "id", "sId"] as const;
 
 export function parseMyUsageResponse(value: unknown): MemberUsage | null {
   if (!isRecord(value)) return null;
@@ -387,7 +395,7 @@ function parseBreakdownEntry(value: unknown, points: unknown[]): CreditBreakdown
   const label = firstString(value, LABEL_KEYS);
   if (!label) return null;
 
-  const credits = firstNumber(value, CREDIT_KEYS) ?? sumPointsForGroup(points, firstString(value, ["key", "id", "sId"]));
+  const credits = firstNumber(value, CREDIT_KEYS) ?? sumPointsForGroup(points, firstString(value, GROUP_KEY_KEYS));
   if (credits === null) return null;
 
   return { label, credits };
@@ -405,6 +413,50 @@ export function parseMyUsageAnalyticsResponse(value: unknown): UsageAnalytics | 
       .map((group) => parseBreakdownEntry(group, points))
       .filter((group): group is CreditBreakdownEntry => group !== null),
   };
+}
+
+/**
+ * Reduces a total-series analytics response to one point per bucket.
+ *
+ * Requested without `groupBy`, Dust answers with a single `total` series and
+ * `fillWindow: true`, so buckets are calendar-aligned (UTC) and empty ones are
+ * still emitted. That makes the *last* point the current, in-progress period —
+ * the number `/status` leads with.
+ */
+export function parseCreditSeriesResponse(value: unknown): CreditSeries | null {
+  if (!isRecord(value)) return null;
+  const rawPoints = Array.isArray(value.points) ? value.points : null;
+  if (!rawPoints) return null;
+
+  const granularity = optionalString(value, "granularity");
+  const rawGroups = Array.isArray(value.groups) ? value.groups : [];
+  // Without groupBy the series is keyed "total", but read the key back off the
+  // response rather than assuming it.
+  const seriesKey = rawGroups.length === 1 && isRecord(rawGroups[0])
+    ? firstString(rawGroups[0], GROUP_KEY_KEYS) ?? "total"
+    : "total";
+
+  const buckets: CreditBucket[] = [];
+  for (const point of rawPoints) {
+    if (!isRecord(point)) continue;
+    const startMs = optionalNumber(point, "timestamp");
+    if (startMs === null) continue;
+
+    const values = isRecord(point.values) ? point.values : point;
+    // A grouped response reaching here would carry several series; summing
+    // keeps the bucket total right either way.
+    const credits = optionalNumber(values, seriesKey)
+      ?? Object.values(values).reduce<number>(
+        (sum, entry) => sum + (typeof entry === "number" && Number.isFinite(entry) ? entry : 0),
+        0,
+      );
+
+    buckets.push({ startMs, credits });
+  }
+
+  if (buckets.length === 0) return null;
+  buckets.sort((a, b) => a.startMs - b.startMs);
+  return { granularity, buckets };
 }
 
 export function parseMyTopConversationsResponse(value: unknown): TopConversations | null {

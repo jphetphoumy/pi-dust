@@ -245,6 +245,27 @@ export interface UsageAnalytics {
   groups: CreditBreakdownEntry[];
 }
 
+/** One calendar-aligned (UTC) bucket of the credit time series. */
+export interface CreditBucket {
+  startMs: number;
+  credits: number;
+}
+
+export interface CreditSeries {
+  granularity: string | null;
+  buckets: CreditBucket[];
+}
+
+/**
+ * The three period totals `/status` leads with. Each is the last bucket of its
+ * own series, so it is the current, in-progress calendar period.
+ */
+export interface CreditTotals {
+  month: CreditSeries | null;
+  week: CreditSeries | null;
+  day: CreditSeries | null;
+}
+
 export interface TopConversations {
   conversations: CreditBreakdownEntry[];
 }
@@ -260,6 +281,11 @@ export interface DustStatusData {
   sessionBaselineAt: number | null;
   usage: MemberUsage | null;
   fairUse: FairUseCredits | null;
+  totals: CreditTotals;
+  /** Monthly credit ceiling the gauges are drawn against. */
+  monthlyCeiling: number;
+  /** True when the ceiling is the configured fallback, not one Dust reported. */
+  ceilingIsFallback: boolean;
   analytics: UsageAnalytics | null;
   topConversations: TopConversations | null;
 }

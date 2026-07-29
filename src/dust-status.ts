@@ -1,7 +1,9 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { resolveMonthlyCeiling } from "./dust-ceiling.js";
 import {
   creditsBaseUrl,
+  fetchCreditTotals,
   fetchFairUseCredits,
   fetchMemberUsage,
   fetchTopConversations,
@@ -46,17 +48,23 @@ export async function collectStatusData(
   const tracker = runtime.credits;
 
   const needsLiveRead = tracker.dirty || tracker.lastConsumedCredits === null;
-  const [usage, fairUse] = needsLiveRead
+  const [usage, fairUse, totals] = needsLiveRead
     ? await Promise.all([
         fetchMemberUsage(session, baseUrl, signal),
         fetchFairUseCredits(session, baseUrl, signal),
+        // The period totals are the headline figures, so they follow the live
+        // rule too — a user who just ran turns must see them move.
+        fetchCreditTotals(session, baseUrl, signal),
       ])
-    : [runtime.credits.cachedUsage, runtime.credits.cachedFairUse];
+    : [tracker.cachedUsage, tracker.cachedFairUse, tracker.cachedTotals];
 
   if (needsLiveRead) {
     tracker.cachedUsage = usage;
     tracker.cachedFairUse = fairUse;
+    tracker.cachedTotals = totals;
   }
+
+  const ceiling = resolveMonthlyCeiling(usage);
 
   const sessionCredits = needsLiveRead
     ? tracker.observeConsumedCredits(usage?.consumedAwuCredits ?? null)
@@ -81,6 +89,9 @@ export async function collectStatusData(
     sessionBaselineAt: tracker.baselineAt,
     usage,
     fairUse,
+    totals,
+    monthlyCeiling: ceiling.credits,
+    ceilingIsFallback: ceiling.isFallback,
     analytics: tracker.analytics,
     topConversations: tracker.topConversations,
   };

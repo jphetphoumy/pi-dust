@@ -1,4 +1,7 @@
-import type { CreditBreakdownEntry, DustStatusData, FairUseCredits, MemberUsage } from "./dust-types.js";
+import { proRatedCeiling } from "./dust-ceiling.js";
+import type { CreditBreakdownEntry, CreditSeries, DustStatusData, FairUseCredits, MemberUsage } from "./dust-types.js";
+
+const DAY_MS = 86_400_000;
 
 const GAUGE_WIDTH = 50;
 const LABEL_WIDTH = 22;
@@ -9,7 +12,44 @@ const UNLIMITED = -1;
 const PARTIAL_BLOCKS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
 
 export function formatCredits(value: number): string {
-  return value.toFixed(2);
+  // Thousands separators matter here: monthly ceilings run to four digits.
+  return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function utcMonthDay(date: Date): string {
+  return date.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+/**
+ * Labels a bucket with the dates it actually covers, clamped to today.
+ *
+ * Dust buckets on calendar intervals but queries a trailing window, so the
+ * current bucket always runs from its calendar start to *now*, not to the end
+ * of the week or month. Labelling it "Jul" or "Jul 28 - Aug 3" would imply
+ * complete periods that have not happened yet.
+ */
+export function formatBucketRange(startMs: number, granularity: string | null, now = new Date()): string {
+  const start = new Date(startMs);
+  const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+
+  if (granularity === "day") return utcMonthDay(start);
+
+  const endMs = granularity === "month"
+    ? Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0)
+    : startMs + 6 * DAY_MS;
+  const clampedEnd = new Date(Math.min(endMs, todayMs));
+
+  if (startMs >= clampedEnd.getTime()) return utcMonthDay(start);
+  if (start.getUTCMonth() === clampedEnd.getUTCMonth() && start.getUTCFullYear() === clampedEnd.getUTCFullYear()) {
+    return `${utcMonthDay(start)} - ${clampedEnd.getUTCDate()}`;
+  }
+  return `${utcMonthDay(start)} - ${utcMonthDay(clampedEnd)}`;
+}
+
+/** The in-progress period: the last bucket of a calendar-aligned series. */
+export function currentBucket(series: CreditSeries | null) {
+  if (!series || series.buckets.length === 0) return null;
+  return series.buckets[series.buckets.length - 1];
 }
 
 export function formatDuration(ms: number): string {
@@ -71,6 +111,59 @@ function renderBreakdown(title: string, entries: CreditBreakdownEntry[], labelWi
     `  ${title.padEnd(labelWidth, " ")}${"credits".padStart(9, " ")}`,
     ...entries.map((entry) => `  ${entry.label.padEnd(labelWidth, " ")}${formatCredits(entry.credits).padStart(9, " ")}`),
   ];
+}
+
+/**
+ * The three headline gauges: this month against the ceiling, then this week and
+ * today against their pro-rated shares of it.
+ *
+ * Only the month has a ceiling Dust actually enforces. The week and day targets
+ * are the monthly budget spread evenly across the real length of the current
+ * month, so they answer "am I pacing above or below budget?" — the label says
+ * "pace vs" rather than a limit, because nothing stops you exceeding them.
+ */
+function renderPeriodGauges(data: DustStatusData, now: Date): string[] {
+  const month = currentBucket(data.totals.month);
+  const week = currentBucket(data.totals.week);
+  const day = currentBucket(data.totals.day);
+
+  if (!month && !week && !day) return [];
+
+  const lines: string[] = [];
+  const ceiling = data.monthlyCeiling;
+
+  if (month) {
+    const reset = data.usage?.nextCreditResetAt ? formatResetDate(data.usage.nextCreditResetAt) : null;
+    const detail = `${formatCredits(month.credits)} / ${formatCredits(ceiling)} credits`;
+    lines.push(
+      "",
+      `  Credits this month${data.ceilingIsFallback ? " (ceiling not reported by Dust)" : ""}`,
+      `  ${renderGauge(month.credits, ceiling)}`,
+      `  ${reset ? `${detail} · resets ${reset}` : detail}`,
+    );
+  }
+
+  if (week) {
+    const target = proRatedCeiling(ceiling, 7, now);
+    lines.push(
+      "",
+      `  This week (pace vs ${formatCredits(target)})`,
+      `  ${renderGauge(week.credits, target)}`,
+      `  ${formatCredits(week.credits)} credits · ${formatBucketRange(week.startMs, "week", now)}`,
+    );
+  }
+
+  if (day) {
+    const target = proRatedCeiling(ceiling, 1, now);
+    lines.push(
+      "",
+      `  Today (pace vs ${formatCredits(target)})`,
+      `  ${renderGauge(day.credits, target)}`,
+      `  ${formatCredits(day.credits)} credits · ${formatBucketRange(day.startMs, "day", now)}`,
+    );
+  }
+
+  return lines;
 }
 
 function renderSeatCredits(usage: MemberUsage | null, fairUse: FairUseCredits | null): string[] {
@@ -153,7 +246,7 @@ function renderSessionCredits(data: DustStatusData): string {
 }
 
 /** Builds the whole panel. Sections with no usable data are simply absent. */
-export function renderStatusPanel(data: DustStatusData): string[] {
+export function renderStatusPanel(data: DustStatusData, now = new Date()): string[] {
   const lines = [
     " Dust  Status",
     "",
@@ -168,7 +261,21 @@ export function renderStatusPanel(data: DustStatusData): string[] {
     renderSessionCredits(data),
   );
 
-  lines.push(...renderSeatCredits(data.usage, data.fairUse));
+  const periodGauges = renderPeriodGauges(data, now);
+  lines.push(...periodGauges);
+
+  // Once the month gauge is up, the seat section only earns its space when it
+  // reports an allowance the month gauge is not already drawn against — or a
+  // fair-use ceiling, which is a different number entirely. A seat allocation
+  // equal to the ceiling, or none at all, would just restate the same credits.
+  const seatAllowance = data.usage?.memberUsageLimit;
+  const seatAddsNothing = periodGauges.length > 0
+    && !data.fairUse
+    && (typeof seatAllowance !== "number" || seatAllowance === data.monthlyCeiling);
+  if (!seatAddsNothing) {
+    lines.push(...renderSeatCredits(data.usage, data.fairUse));
+  }
+
   lines.push(...renderSpendCap(data.usage));
   lines.push(...renderWorkspacePool(data.usage));
 
@@ -188,7 +295,7 @@ export function renderStatusPanel(data: DustStatusData): string[] {
     lines.push(...agentBreakdown, ...conversationBreakdown);
   }
 
-  if (!data.usage && !data.fairUse) {
+  if (!data.usage && !data.fairUse && periodGauges.length === 0) {
     lines.push("", "  Credit figures are unavailable right now.");
   }
 

@@ -2,8 +2,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
 import { collectStatusData } from "../src/dust-status.js";
-import { formatDuration, formatCredits, renderGauge, renderStatusPanel } from "../src/dust-status-render.js";
 import {
+  currentBucket,
+  formatBucketRange,
+  formatCredits,
+  formatDuration,
+  renderGauge,
+  renderStatusPanel,
+} from "../src/dust-status-render.js";
+import {
+  DEFAULT_MONTHLY_CREDITS,
+  MONTHLY_CREDITS_ENV,
+  daysInMonth,
+  proRatedCeiling,
+  resolveMonthlyCeiling,
+} from "../src/dust-ceiling.js";
+import {
+  parseCreditSeriesResponse,
   parseFairUseCreditsResponse,
   parseMyTopConversationsResponse,
   parseMyUsageAnalyticsResponse,
@@ -31,10 +46,29 @@ function jsonResponse(body: unknown, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) };
 }
 
+/** A `groupBy`-less total series, the shape Dust returns for the period gauges. */
+function totalSeries(points: [number, number][]) {
+  return {
+    granularity: "day",
+    groups: [{ groupKey: "total", name: "Total usage" }],
+    points: points.map(([timestamp, credits]) => ({ timestamp, values: { total: credits } })),
+  };
+}
+
+const JUL_2026 = Date.UTC(2026, 6, 1);
+
 /** Routes each credit endpoint by URL, so call order never matters. */
 function creditsFetchMock(overrides: Record<string, unknown> = {}) {
   const bodies: Record<string, unknown> = {
-    "credits/my-usage-analytics": { granularity: "day", groups: [{ name: "dust", credits: 18.4 }], points: [] },
+    // Dust keeps the numbers in the time series; a group row carries no credits.
+    "analytics:agent": {
+      granularity: "day",
+      groups: [{ groupKey: "agent-1", name: "@dust" }],
+      points: [{ timestamp: JUL_2026, values: { "agent-1": 18.4 } }],
+    },
+    "analytics:month": totalSeries([[Date.UTC(2026, 5, 1), 900], [JUL_2026, 1924.6]]),
+    "analytics:week": totalSeries([[Date.UTC(2026, 6, 20), 498.3], [Date.UTC(2026, 6, 27), 279.4]]),
+    "analytics:day": totalSeries([[Date.UTC(2026, 6, 28), 181.3], [Date.UTC(2026, 6, 29), 98.1]]),
     "credits/my-usage": { member: FULL_MEMBER },
     "credits/my-top-conversations": { conversations: [{ title: "Refactor MCP bridge", credits: 4.11 }] },
     "fair-use-credits": { fairUseAwuCreditsState: { limit: -1, timeframe: "month", count: 0 } },
@@ -42,11 +76,20 @@ function creditsFetchMock(overrides: Record<string, unknown> = {}) {
   };
 
   return vi.fn((url: string) => {
-    // my-usage-analytics also matches "credits/my-usage", so test longest first.
-    const key = Object.keys(bodies).sort((a, b) => b.length - a.length).find((candidate) => url.includes(candidate));
+    if (url.includes("my-usage-analytics")) {
+      const key = url.includes("groupBy=agent")
+        ? "analytics:agent"
+        : `analytics:${new URL(url).searchParams.get("granularity")}`;
+      return Promise.resolve(key in bodies ? jsonResponse(bodies[key]) : jsonResponse({}, 404));
+    }
+    const key = Object.keys(bodies).find((candidate) => url.includes(candidate));
     return Promise.resolve(key ? jsonResponse(bodies[key]) : jsonResponse({}, 404));
   });
 }
+
+const isBreakdownCall = ([url]: unknown[]) => (url as string).includes("groupBy=agent");
+const isTotalsCall = ([url]: unknown[]) =>
+  (url as string).includes("my-usage-analytics") && !(url as string).includes("groupBy=agent");
 
 function makeCtx(extra: Record<string, unknown> = {}) {
   return {
@@ -273,7 +316,7 @@ describe("dust /status", () => {
       runtime.credits.recordTurnCompleted();
       await collectStatusData(runtime, makeCtx());
 
-      const analyticsCalls = fetchMock.mock.calls.filter(([url]) => (url as string).includes("my-usage-analytics")).length;
+      const analyticsCalls = fetchMock.mock.calls.filter(isBreakdownCall).length;
       const conversationCalls = fetchMock.mock.calls.filter(([url]) => (url as string).includes("my-top-conversations")).length;
       expect(analyticsCalls).toBe(1);
       expect(conversationCalls).toBe(1);
@@ -289,7 +332,7 @@ describe("dust /status", () => {
       runtime.credits.reset();
       await collectStatusData(runtime, makeCtx());
 
-      const analyticsCalls = fetchMock.mock.calls.filter(([url]) => (url as string).includes("my-usage-analytics")).length;
+      const analyticsCalls = fetchMock.mock.calls.filter(isBreakdownCall).length;
       expect(analyticsCalls).toBe(2);
       expect(runtime.credits.baselineAt).not.toBeNull();
     });
@@ -401,6 +444,143 @@ describe("dust /status", () => {
     });
   });
 
+  describe("period totals", () => {
+    it("requests month, week and day windows that fully cover the current period", async () => {
+      seedLoggedIn(makeCredentials());
+      const fetchMock = creditsFetchMock();
+      globalThis.fetch = fetchMock as never;
+
+      await collectStatusData(new DustSessionRuntime(), makeCtx());
+
+      const totalsUrls = fetchMock.mock.calls.filter(isTotalsCall).map(([url]) => url as string);
+      // 32 days always reaches the 1st of the month, 8 days the week's Monday,
+      // so the last bucket of each series is a complete current period.
+      expect(totalsUrls.some((url) => url.includes("days=32&granularity=month"))).toBe(true);
+      expect(totalsUrls.some((url) => url.includes("days=8&granularity=week"))).toBe(true);
+      expect(totalsUrls.some((url) => url.includes("days=7&granularity=day"))).toBe(true);
+      // Totals must not be grouped, or Dust returns a breakdown instead.
+      expect(totalsUrls.every((url) => !url.includes("groupBy"))).toBe(true);
+    });
+
+    it("takes the current period from the last bucket of each series", async () => {
+      seedLoggedIn(makeCredentials());
+      globalThis.fetch = creditsFetchMock() as never;
+
+      const data = await collectStatusData(new DustSessionRuntime(), makeCtx()) as DustStatusData;
+
+      expect(currentBucket(data.totals.month)?.credits).toBe(1924.6);
+      expect(currentBucket(data.totals.week)?.credits).toBe(279.4);
+      expect(currentBucket(data.totals.day)?.credits).toBe(98.1);
+    });
+
+    it("refetches the period totals after a turn", async () => {
+      seedLoggedIn(makeCredentials());
+      const runtime = new DustSessionRuntime();
+      const fetchMock = creditsFetchMock();
+      globalThis.fetch = fetchMock as never;
+
+      await collectStatusData(runtime, makeCtx());
+      expect(fetchMock.mock.calls.filter(isTotalsCall).length).toBe(3);
+
+      runtime.credits.recordTurnCompleted();
+      await collectStatusData(runtime, makeCtx());
+      expect(fetchMock.mock.calls.filter(isTotalsCall).length).toBe(6);
+    });
+
+    it("survives a period series that fails or comes back malformed", async () => {
+      seedLoggedIn(makeCredentials());
+      globalThis.fetch = creditsFetchMock({ "analytics:week": { granularity: "week" } }) as never;
+
+      const data = await collectStatusData(new DustSessionRuntime(), makeCtx()) as DustStatusData;
+
+      expect(data.totals.week).toBeNull();
+      expect(currentBucket(data.totals.month)?.credits).toBe(1924.6);
+    });
+
+    it("parses a total series and orders buckets chronologically", () => {
+      const parsed = parseCreditSeriesResponse({
+        granularity: "month",
+        groups: [{ groupKey: "total", name: "Total usage" }],
+        points: [{ timestamp: 200, values: { total: 5 } }, { timestamp: 100, values: { total: 3 } }],
+      });
+      expect(parsed).toEqual({ granularity: "month", buckets: [{ startMs: 100, credits: 3 }, { startMs: 200, credits: 5 }] });
+    });
+
+    it("sums every series in a bucket when the response turns out to be grouped", () => {
+      const parsed = parseCreditSeriesResponse({
+        granularity: "day",
+        groups: [{ groupKey: "user", name: "User" }, { groupKey: "programmatic", name: "Programmatic" }],
+        points: [{ timestamp: 100, values: { user: 2, programmatic: 3 } }],
+      });
+      expect(parsed?.buckets).toEqual([{ startMs: 100, credits: 5 }]);
+    });
+
+    it("returns null when there are no usable points", () => {
+      expect(parseCreditSeriesResponse({ granularity: "day", points: [] })).toBeNull();
+      expect(parseCreditSeriesResponse({ granularity: "day" })).toBeNull();
+      expect(parseCreditSeriesResponse({ points: [{ values: { total: 1 } }] })).toBeNull();
+    });
+  });
+
+  describe("monthly ceiling", () => {
+    const withEnv = async (value: string | undefined, fn: () => void) => {
+      const previous = process.env[MONTHLY_CREDITS_ENV];
+      if (value === undefined) delete process.env[MONTHLY_CREDITS_ENV];
+      else process.env[MONTHLY_CREDITS_ENV] = value;
+      try { fn(); } finally {
+        if (previous === undefined) delete process.env[MONTHLY_CREDITS_ENV];
+        else process.env[MONTHLY_CREDITS_ENV] = previous;
+      }
+    };
+
+    it("prefers the seat allocation Dust reports", async () => {
+      await withEnv(undefined, () => {
+        expect(resolveMonthlyCeiling(FULL_MEMBER)).toEqual({ credits: 20, isFallback: false });
+      });
+    });
+
+    it("falls back to the spend cap when there is no seat allocation", async () => {
+      await withEnv(undefined, () => {
+        expect(resolveMonthlyCeiling({ ...FULL_MEMBER, memberUsageLimit: null }))
+          .toEqual({ credits: 100, isFallback: false });
+      });
+    });
+
+    it("falls back to 8000 for a pool-based seat with no cap", async () => {
+      await withEnv(undefined, () => {
+        expect(resolveMonthlyCeiling({ ...FULL_MEMBER, memberUsageLimit: null, spendLimitAwuCredits: null }))
+          .toEqual({ credits: DEFAULT_MONTHLY_CREDITS, isFallback: true });
+        expect(resolveMonthlyCeiling(null)).toEqual({ credits: 8000, isFallback: true });
+      });
+    });
+
+    it("lets configuration override everything Dust reports", async () => {
+      await withEnv("12000", () => {
+        expect(resolveMonthlyCeiling(FULL_MEMBER)).toEqual({ credits: 12000, isFallback: false });
+      });
+    });
+
+    it("ignores a non-numeric or non-positive override", async () => {
+      await withEnv("nonsense", () => {
+        expect(resolveMonthlyCeiling(FULL_MEMBER).credits).toBe(20);
+      });
+      await withEnv("0", () => {
+        expect(resolveMonthlyCeiling(FULL_MEMBER).credits).toBe(20);
+      });
+    });
+
+    it("pro-rates against the real length of the current month", () => {
+      const july = new Date(Date.UTC(2026, 6, 29));
+      expect(daysInMonth(july)).toBe(31);
+      expect(proRatedCeiling(8000, 7, july)).toBeCloseTo(1806.45, 2);
+      expect(proRatedCeiling(8000, 1, july)).toBeCloseTo(258.06, 2);
+
+      const february = new Date(Date.UTC(2026, 1, 10));
+      expect(daysInMonth(february)).toBe(28);
+      expect(proRatedCeiling(8000, 1, february)).toBeCloseTo(285.71, 2);
+    });
+  });
+
   describe("validation", () => {
     it("parses a full member usage payload", () => {
       expect(parseMyUsageResponse({ member: FULL_MEMBER })).toMatchObject({
@@ -471,6 +651,9 @@ describe("dust /status", () => {
       sessionBaselineAt: Date.parse("2026-07-29T12:00:00.000Z"),
       usage: FULL_MEMBER,
       fairUse: null,
+      totals: { month: null, week: null, day: null },
+      monthlyCeiling: 8000,
+      ceilingIsFallback: true,
       analytics: { granularity: "day", groups: [{ label: "@dust", credits: 18.4 }, { label: "@sql", credits: 6.02 }] },
       topConversations: { conversations: [{ label: "Refactor MCP bridge", credits: 4.11 }] },
     };
@@ -505,6 +688,101 @@ describe("dust /status", () => {
       expect(panel).toContain("@sql");
       expect(panel).toContain("Top conversations");
       expect(panel).toContain("Refactor MCP bridge");
+    });
+
+    const NOW = new Date(Date.UTC(2026, 6, 29, 15, 0, 0));
+    const withPeriods: DustStatusData = {
+      ...base,
+      monthlyCeiling: 8000,
+      ceilingIsFallback: false,
+      totals: {
+        month: { granularity: "month", buckets: [{ startMs: Date.UTC(2026, 6, 1), credits: 1924.6 }] },
+        week: { granularity: "week", buckets: [{ startMs: Date.UTC(2026, 6, 27), credits: 279.4 }] },
+        day: { granularity: "day", buckets: [{ startMs: Date.UTC(2026, 6, 29), credits: 98.1 }] },
+      },
+    };
+
+    it("renders month, week and day gauges with pro-rated pace targets", () => {
+      const panel = renderStatusPanel(withPeriods, NOW).join("\n");
+
+      expect(panel).toContain("Credits this month");
+      expect(panel).toContain("1,924.60 / 8,000.00 credits · resets");
+      expect(panel).toContain("24% used");
+
+      // July has 31 days: 8000 * 7 / 31 and 8000 / 31.
+      expect(panel).toContain("This week (pace vs 1,806.45)");
+      expect(panel).toContain("279.40 credits · Jul 27 - 29");
+      expect(panel).toContain("Today (pace vs 258.06)");
+      expect(panel).toContain("98.10 credits · Jul 29");
+    });
+
+    it("drops the seat gauge when it would just repeat the month ceiling", () => {
+      const panel = renderStatusPanel({
+        ...withPeriods,
+        monthlyCeiling: 20,
+        usage: { ...FULL_MEMBER, memberUsageLimit: 20 },
+      }, NOW).join("\n");
+
+      expect(panel).toContain("Credits this month");
+      expect(panel).not.toContain("Seat credits");
+    });
+
+    it("drops the seat section entirely when Dust reports no allowance", () => {
+      const panel = renderStatusPanel({
+        ...withPeriods,
+        usage: { ...FULL_MEMBER, memberUsageLimit: null, spendLimitAwuCredits: null, spendLimitSource: "none" },
+      }, NOW).join("\n");
+
+      expect(panel).toContain("Credits this month");
+      expect(panel).not.toContain("Seat credits");
+      expect(panel).not.toContain("not set");
+    });
+
+    it("keeps the fair-use section even alongside the month gauge", () => {
+      const panel = renderStatusPanel({
+        ...withPeriods,
+        usage: { ...FULL_MEMBER, memberUsageLimit: null },
+        fairUse: { limit: -1, timeframe: "month", count: 4.61 },
+      }, NOW).join("\n");
+
+      expect(panel).toContain("Fair-use credits");
+      expect(panel).toContain("unlimited");
+    });
+
+    it("keeps the seat gauge when the ceiling came from somewhere else", () => {
+      const panel = renderStatusPanel(withPeriods, NOW).join("\n");
+      expect(panel).toContain("Seat credits");
+      expect(panel).toContain("4.61 / 20.00 credits");
+    });
+
+    it("flags a ceiling Dust did not report", () => {
+      const panel = renderStatusPanel({ ...withPeriods, ceilingIsFallback: true }, NOW).join("\n");
+      expect(panel).toContain("Credits this month (ceiling not reported by Dust)");
+    });
+
+    it("clamps the current bucket's label to today rather than the calendar period", () => {
+      // The week bucket starts Mon Jul 27; the calendar week runs to Aug 2, but
+      // only Jul 27-29 has happened.
+      expect(formatBucketRange(Date.UTC(2026, 6, 27), "week", NOW)).toBe("Jul 27 - 29");
+      expect(formatBucketRange(Date.UTC(2026, 6, 1), "month", NOW)).toBe("Jul 1 - 29");
+      expect(formatBucketRange(Date.UTC(2026, 6, 29), "day", NOW)).toBe("Jul 29");
+      // A bucket whose first day is today collapses to a single date.
+      expect(formatBucketRange(Date.UTC(2026, 6, 29), "week", NOW)).toBe("Jul 29");
+    });
+
+    it("labels a completed bucket that spans two months", () => {
+      expect(formatBucketRange(Date.UTC(2026, 5, 29), "week", NOW)).toBe("Jun 29 - Jul 5");
+    });
+
+    it("reads the current period off the end of a series", () => {
+      expect(currentBucket(withPeriods.totals.month)?.credits).toBe(1924.6);
+      expect(currentBucket(null)).toBeNull();
+      expect(currentBucket({ granularity: "day", buckets: [] })).toBeNull();
+    });
+
+    it("formats four-digit credit figures with thousands separators", () => {
+      expect(formatCredits(8000)).toBe("8,000.00");
+      expect(formatCredits(1924.6)).toBe("1,924.60");
     });
 
     it("labels the session figure approximate", () => {

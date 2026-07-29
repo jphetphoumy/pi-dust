@@ -27,7 +27,7 @@ npx vitest run test/dust-auth.test.ts
 
 ## Architecture
 
-The project is organized as 21 TypeScript modules in `src/`, each with a single responsibility:
+The project is organized as 22 TypeScript modules in `src/`, each with a single responsibility:
 
 | Module | Role |
 |--------|------|
@@ -39,7 +39,8 @@ The project is organized as 21 TypeScript modules in `src/`, each with a single 
 | `dust-workspace.ts` | `/workspace` command registration |
 | `dust-status.ts` | `/status` credit panel command |
 | `dust-status-render.ts` | ASCII layout for the credit panel |
-| `dust-credits.ts` | Private credit API client (usage, fair-use, breakdowns) |
+| `dust-credits.ts` | Private credit API client (usage, fair-use, period totals, breakdowns) |
+| `dust-ceiling.ts` | Monthly credit ceiling resolution and pro-rating |
 | `dust-auth.ts` | OAuth token flow, token refresh, workspace discovery, agent retrieval |
 | `dust-stream.ts` | Parses Dust SSE events and emits Pi stream chunks |
 | `dust-mcp.ts` | Client-side MCP server integration |

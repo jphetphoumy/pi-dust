@@ -133,7 +133,24 @@ Responsibilities:
 
 - resolve the `/api/w/:wId` base URL for the credential's region
 - fetch seat usage, fair-use allowance, the 30-day breakdown and top conversations
+- fetch the month/week/day credit totals as `groupBy`-less time series
 - refresh the access token and retry once on 401
+
+Period windows are sized so the *last* bucket of each series is a complete
+current period: Dust buckets on a `calendar_interval` over a trailing
+`[now - (days-1), now]` window, so 32 days always spans the 1st of the month and
+8 days always spans the current week's Monday.
+
+### `src/dust-ceiling.ts`
+
+Monthly credit ceiling resolution.
+
+Responsibilities:
+
+- resolve the ceiling the gauges fill against: `PI_DUST_MONTHLY_CREDITS`, then
+  the seat allocation, then the per-user spend cap, then a default of 8000
+- pro-rate that ceiling onto a week or a day, using the real length of the
+  current month
 
 ### `src/dust-auth.ts`
 
@@ -245,6 +262,7 @@ once the action has already been approved.
 src/
   dust.ts
   dust-auth.ts
+  dust-ceiling.ts
   dust-constants.ts
   dust-credits.ts
   dust-debug.ts
