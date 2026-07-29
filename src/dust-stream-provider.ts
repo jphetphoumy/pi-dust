@@ -625,8 +625,9 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             cache: runtime.conversationId
               ? runtime.attachmentCacheFor(runtime.conversationId)
               : pendingAttachments,
+            refreshAuth,
           });
-          userText = applyAttachmentPointers(inlinedUserText, attached);
+          userText = applyAttachmentPointers(inlinedUserText, attached, attachments);
           if (!runtime.conversationId) {
             contentFragments = toContentFragments(attached);
           }

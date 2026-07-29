@@ -25,6 +25,7 @@ const MARKER_CLOSE = "</file>";
  * text by construction, so `text/plain` is the safe fallback.
  */
 const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
+  ".avif": "image/avif",
   ".bmp": "image/bmp",
   ".c": "text/x-c",
   ".css": "text/css",
@@ -35,8 +36,10 @@ const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
   ".go": "text/x-go",
   ".groovy": "text/x-groovy",
   ".h": "text/x-c",
+  ".heic": "image/heic",
   ".htm": "text/html",
   ".html": "text/html",
+  ".ico": "image/vnd.microsoft.icon",
   ".java": "text/x-java-source",
   ".jpeg": "image/jpeg",
   ".jpg": "image/jpeg",
@@ -57,8 +60,17 @@ const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
   ".scala": "text/x-scala",
   ".sh": "text/x-sh",
   ".sql": "text/x-sql",
+  // pi's CLI inliner content-sniffs by magic bytes (`detectSupportedImageMimeType`
+  // in dist/utils/mime.js) and only ever recognises png/jpeg/gif/webp/bmp that
+  // way — an `.svg` is never routed through `processImage` at all and is
+  // inlined as plain text, so the branch decision in `parseUserMessage` below
+  // (`classifyImageBody`) never needs this entry for CLI-inlined markers. It
+  // is still correct, and still used, for the TUI's `@` mention path, which
+  // has no inliner output to sniff and falls back to this extension map.
   ".svg": "image/svg+xml",
   ".swift": "text/x-swift",
+  ".tif": "image/tiff",
+  ".tiff": "image/tiff",
   ".ts": "text/typescript",
   ".tsv": "text/tsv",
   ".tsx": "text/typescript",
@@ -75,6 +87,75 @@ function contentTypeForPath(path: string): string {
 
 function isImagePath(path: string): boolean {
   return contentTypeForPath(path).startsWith("image/");
+}
+
+/**
+ * A content type for a marker pi has already told us is an image (via an
+ * `[Image omitted:` body) but never gave us bytes for, so the real mime type
+ * is unknowable and irrelevant — this is never uploaded. Falls back to a
+ * generic `image/*` marker rather than `contentTypeForPath`'s `text/plain`
+ * default so `applyAttachmentPointers`'s `startsWith("image/")` check (and
+ * `attachFilesToConversation`'s) still recognise it as an image needing a note.
+ */
+function imageContentType(path: string): string {
+  const guess = contentTypeForPath(path);
+  return guess.startsWith("image/") ? guess : "image/unknown";
+}
+
+/**
+ * Every hint line pi's inliner ever writes for an image is one of these three
+ * shapes (`node_modules/@earendil-works/pi-coding-agent/dist/utils/image-process.js`,
+ * `dist/utils/image-resize.js`):
+ *   - `[Image converted from ${from} to ${to}.]` — conversionHint(), for any
+ *     mime `normalizeSupportedImageMimeType()` rejects. In practice this can
+ *     only be BMP: `detectSupportedImageMimeType` (dist/utils/mime.js) — the
+ *     content-sniff that decides whether a `@file` is even routed through
+ *     `processImage` in the first place — only ever recognises png/jpeg/gif
+ *     /webp/bmp, and the first four already pass `normalizeSupportedImageMimeType`
+ *     unconverted. A `.heic`/`.avif`/`.tiff`/`.ico`/`.svg` is never sniffed as
+ *     an image at all and is inlined by pi as plain text instead — those
+ *     `CONTENT_TYPE_BY_EXTENSION` entries exist only for the TUI's `@` mention
+ *     path (`readMentionedFile`/`contentTypeForPath`), not for this shape check.
+ *   - `[Image: original WxH, displayed at WxH. Multiply coordinates by N to
+ *     map to original image.]` — formatDimensionNote(), only when resized.
+ *   - `[Image omitted: could not be converted to a supported inline image
+ *     format.]` / `[Image omitted: could not be resized below the inline
+ *     image size limit.]` — processImage()'s two failure messages.
+ * `processFileArguments` (`dist/cli/file-processor.js:49`) joins multiple
+ * hints with `"\n"`, so a genuine image marker's body can span more than one
+ * line — unlike a stale/mismatched text marker's body, which never matches
+ * this per-line shape at all.
+ */
+const IMAGE_HINT_LINE = /^\[Image[ :].*\]$/;
+/**
+ * `file-processor.js:37-40`: when `processImage` fails, pi writes this
+ * message as the *entire* marker body and — critically — never pushes
+ * anything to its `images` array for it. A marker with this body is still a
+ * real, located image marker (the model just never received the picture), but
+ * it must not consume `images[nextImage]`, which belongs to a later marker.
+ */
+const IMAGE_OMITTED_PREFIX = "[Image omitted:";
+
+type ImageBodyShape = "consumes-block" | "omitted" | "not-image";
+
+/** Classifies an image marker's body by its literal shape — see the two constants above. */
+function classifyImageBody(body: string): ImageBodyShape {
+  if (body === "") return "consumes-block";
+  if (body.startsWith(IMAGE_OMITTED_PREFIX)) return "omitted";
+  return body.split("\n").every((line) => IMAGE_HINT_LINE.test(line)) ? "consumes-block" : "not-image";
+}
+
+/**
+ * Identifies a marker for the debug log without its body: an inlined text
+ * marker's body is the file's own content, and even a short slice of it is
+ * bytes of that file leaking into a log a user might paste into a bug report.
+ * A mention marker (`@path`) carries no file content at all, so it is safe to
+ * log whole.
+ */
+function markerSummary(marker: string): string {
+  if (!marker.startsWith(MARKER_OPEN)) return marker;
+  const nameClose = marker.indexOf(MARKER_NAME_CLOSE);
+  return nameClose < 0 ? MARKER_OPEN : marker.slice(0, nameClose + MARKER_NAME_CLOSE.length);
 }
 
 function hashBytes(bytes: Uint8Array): string {
@@ -117,10 +198,41 @@ function collectContent(message: ChatMessageLike): { text: string; images: Messa
   };
 }
 
-/** Reads the file back to confirm the marker really is pi's inliner output. */
-function readTextFile(path: string): string | null {
+/**
+ * Reads the file back to confirm the marker really is pi's inliner output.
+ *
+ * `remainingLength` — how much of the message is left from the body's start
+ * onward, in UTF-16 code units (a JS string's `.length`) — lets this reject up
+ * front, on nothing more than a `statSync`, every marker the file cannot
+ * possibly match: a verified text marker's body is `\n<content>\n` immediately
+ * followed by `</file>`, so if `diskContent.length + 2 + MARKER_CLOSE.length`
+ * (the actual necessary bound below, once the file is read) cannot fit in
+ * what is left of the message, no amount of reading it will make
+ * `textVerified` true. Without this, an image marker (never a text match)
+ * means reading a multi-megabyte image off disk as UTF-8 and diffing it, per
+ * image marker, per turn, purely to fail.
+ *
+ * `size` from `statSync` is UTF-8 *bytes*, not UTF-16 *units* — comparing it
+ * to `remainingLength` directly (as an earlier version of this check did)
+ * silently drops every attachment whose disk content has any multibyte
+ * character, once the overhead exceeds the suffix after the marker: real
+ * files (accented comments, emoji, non-Latin text) routinely have more UTF-8
+ * bytes than UTF-16 units. What's actually needed is a lower bound on
+ * `diskContent.length` computed from `size` alone. UTF-8 encodes a BMP
+ * character (one UTF-16 unit) in at most 3 bytes, and a non-BMP character (a
+ * surrogate pair, two UTF-16 units) in exactly 4 bytes — i.e. at most 2 bytes
+ * per unit, which is *less* overhead than the BMP case. So 3 bytes per UTF-16
+ * unit is the worst case either way, giving `diskContent.length >=
+ * size / 3`, i.e. `Math.ceil(size / 3)` never overestimates how many units the
+ * file could produce. Rejecting when even that optimistic estimate cannot fit
+ * is therefore still a necessary condition — real matches are never dropped —
+ * while continuing to short-circuit anything that truly cannot verify.
+ */
+function readTextFile(path: string, remainingLength: number): string | null {
   try {
-    if (statSync(path).size > ATTACHMENT_MAX_TEXT_BYTES) {
+    const size = statSync(path).size;
+    const minPossibleStringLength = Math.ceil(size / 3);
+    if (size > ATTACHMENT_MAX_TEXT_BYTES || minPossibleStringLength + 2 + MARKER_CLOSE.length > remainingLength) {
       return null;
     }
     return readFileSync(path, "utf8");
@@ -160,7 +272,7 @@ function readMentionedFile(path: string): Uint8Array<ArrayBuffer> | null {
 }
 
 /**
- * Scans the message for pi's `@path` mentions.
+ * Scans `[from, to)` of the message for pi's `@path` mentions.
  *
  * The interactive editor's `@` is only a path autocomplete: it writes the path
  * into the message as plain text and leaves reading it to the agent. So unlike
@@ -169,15 +281,27 @@ function readMentionedFile(path: string): Uint8Array<ArrayBuffer> | null {
  * between the model seeing it and the agent staring at a path it cannot read.
  *
  * A mention has to start the message or follow whitespace, and has to name a
- * file that exists; everything else is left alone.
+ * file that exists; everything else is left alone. `to` lets `parseUserMessage`
+ * scan the text on both sides of an inlined marker run (piped stdin content
+ * can precede it) without also scanning the run's own, untrustworthy body.
  */
-function parseMentions(text: string, from: number, cwd: string): PendingAttachment[] {
+function parseMentions(text: string, from: number, cwd: string, to: number = text.length): PendingAttachment[] {
   const attachments: PendingAttachment[] = [];
   const mention = /(^|\s)@("[^"]+"|\S+)/g;
-  mention.lastIndex = from;
+  // A mention starting at exactly `from` — the common case right after a
+  // marker run, since `markerEnd` above consumes the trailing newline — would
+  // never match if `lastIndex` were set to `from`: the regex has no `m` flag,
+  // so `^` only matches real index 0, and `\s` has to consume a character at
+  // or after `lastIndex`. Starting one character earlier lets `\s` consume the
+  // boundary character (e.g. the marker's trailing newline) so the `@` at
+  // `from` itself can still match. `.exec` never returns a match starting
+  // before `lastIndex`, so this cannot pull in anything from before `from`
+  // except that one boundary character, and it only ever matches as `\s`.
+  mention.lastIndex = Math.max(0, from - 1);
 
   for (let match = mention.exec(text); match !== null; match = mention.exec(text)) {
     const start = match.index + match[1].length;
+    if (start >= to) break;
     const end = start + 1 + match[2].length;
     const quoted = match[2].startsWith('"');
     const path = resolve(cwd, quoted ? match[2].slice(1, -1) : match[2]);
@@ -209,79 +333,170 @@ function parseMentions(text: string, from: number, cwd: string): PendingAttachme
  * leaves `@path` in the message as plain text. Those are picked up too — see
  * `parseMentions`.
  *
- * Inlined markers are only recognised as a prefix run, and a text marker only
- * counts when its body still matches the file on disk byte for byte. That
- * keeps a `<file name="...">` the user typed themselves — or one quoted inside
- * an attached file — from being mistaken for an attachment. The first marker
- * that fails to verify ends that scan: the ones after it can no longer be
- * located reliably, so they stay inline, which is the current behaviour anyway.
+ * The run is not required to start the message: pi puts piped stdin content
+ * *before* the inlined markers (`buildInitialMessage` joins `[stdinContent,
+ * fileText, messages[0]]` — `dist/cli/initial-message.js:6-16`), so
+ * `cat notes.txt | pi @file.ts "..."` has real stdin text ahead of the run.
+ * The run is instead found at the first `MARKER_OPEN` occurrence anywhere in
+ * the message and is still only recognised as a *contiguous* run from there —
+ * a text marker only counts when its body still matches the file on disk byte
+ * for byte, which is what keeps a `<file name="...">` the user (or piped
+ * stdin) typed themselves from being mistaken for an attachment even now that
+ * it need not be the very first thing in the message. The first marker that
+ * fails to verify ends that scan: the ones after it can no longer be located
+ * reliably, so they stay inline, which is the current behaviour anyway.
  */
 export function parseUserMessage(message: ChatMessageLike, cwd: string): ParsedUserMessage {
   const { text, images } = collectContent(message);
   const attachments: PendingAttachment[] = [];
-  let position = 0;
+  // Where the run *could* start — the message up to here (piped stdin, in
+  // pi's CLI form) is ordinary text and stays mention-scannable below.
+  const runStart = text.indexOf(MARKER_OPEN);
+  let position = runStart < 0 ? text.length : runStart;
+  // Tracks the end of the prefix marker run for the mention scan below, even
+  // past a marker that failed verification: that marker's body is still file
+  // content (or the remains of it), never text the user typed, so it must
+  // never be searched for `@mentions` — see the loop's failure branch.
+  // Defaults to `position` (not 0): when there is no run at all, the whole
+  // message is scanned in the "before the run" pass below regardless.
+  let scanFrom = position;
   let nextImage = 0;
 
   while (text.startsWith(MARKER_OPEN, position)) {
     const nameStart = position + MARKER_OPEN.length;
     const nameEnd = text.indexOf(MARKER_NAME_CLOSE, nameStart);
-    if (nameEnd < 0) break;
+    if (nameEnd < 0) {
+      // The marker never closes its name tag. If a verified marker precedes
+      // this one within the run (`position > runStart` — *not* `position > 0`:
+      // the run can legitimately start at a nonzero offset because of stdin,
+      // so a literal `> 0` would treat "nothing verified yet, just offset by
+      // stdin" as trustworthy inliner output), the run so far is real inliner
+      // output and this unclosed tag is most likely the mangled remains of
+      // another one — unsafe to mention-scan. Starting cold at the run's own
+      // beginning, pi never emits an unclosed name tag, so this is far more
+      // likely to just be text that happens to start with the marker's
+      // literal prefix — treating the rest of the message as off-limits would
+      // silently drop every `@` mention in an ordinary message.
+      if (position > runStart) scanFrom = text.length;
+      break;
+    }
 
     const path = text.slice(nameStart, nameEnd);
     const bodyStart = nameEnd + MARKER_NAME_CLOSE.length;
-    const image = isImagePath(path);
 
-    // A text marker's body is `\n<content>\n`, so the closing tag sits at a
-    // known offset — no scanning, which is what makes a file that itself
-    // contains `</file>` parse correctly. An image marker's body is pi's own
-    // hint text, which never contains the closing tag.
-    const diskContent = image ? null : readTextFile(path);
-    const closeAt = image
-      ? text.indexOf(MARKER_CLOSE, bodyStart)
-      : diskContent === null
-        ? -1
-        : bodyStart + diskContent.length + 2;
-    if (closeAt < 0 || !text.startsWith(MARKER_CLOSE, closeAt)) break;
-    if (!image && text.slice(bodyStart, closeAt) !== `\n${diskContent}\n`) break;
+    // pi's inliner decides text-vs-image independently of any extension guess
+    // we make here, so the two are tried in turn against the marker's own
+    // shape instead of trusting CONTENT_TYPE_BY_EXTENSION: a text marker's
+    // body is `\n<disk content>\n` at a byte-exact offset (which is also what
+    // lets a file that itself contains `</file>` parse correctly), an image
+    // marker's is pi's own hint text with the closing tag findable by a plain
+    // scan. A wrong extension guess (`.svg` inlined as text, `.heic` with no
+    // entry in the map at all) then degrades to "try the other shape" instead
+    // of losing every marker after this one.
+    const diskContent = readTextFile(path, text.length - bodyStart);
+    const textCloseAt = diskContent === null ? -1 : bodyStart + diskContent.length + 2;
+    const textVerified =
+      diskContent !== null &&
+      text.startsWith(MARKER_CLOSE, textCloseAt) &&
+      text.slice(bodyStart, textCloseAt) === `\n${diskContent}\n`;
 
-    let markerEnd = closeAt + MARKER_CLOSE.length;
-    if (text.startsWith("\n", markerEnd)) markerEnd += 1;
-
-    if (image) {
-      // pi resizes images before attaching them, so the block's bytes — not the
-      // ones on disk — are what the model was meant to see.
-      const block = images[nextImage];
-      if (!block?.data) break;
-      nextImage += 1;
-      const bytes = Buffer.from(block.data, "base64");
-      if (bytes.byteLength <= ATTACHMENT_MAX_IMAGE_BYTES) {
-        const contentType = block.mimeType ?? contentTypeForPath(path);
-        attachments.push(makeAttachment(path, contentType, bytes, text, position, markerEnd, true));
-      }
-    } else {
+    if (textVerified) {
+      let markerEnd = textCloseAt + MARKER_CLOSE.length;
+      if (text.startsWith("\n", markerEnd)) markerEnd += 1;
       const bytes = Buffer.from(diskContent as string, "utf8");
       if (bytes.byteLength >= ATTACHMENT_MIN_TEXT_BYTES) {
         attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, position, markerEnd, true));
       }
+      position = markerEnd;
+      scanFrom = position;
+      continue;
     }
 
-    position = markerEnd;
+    const imageCloseAt = text.indexOf(MARKER_CLOSE, bodyStart);
+    if (imageCloseAt < 0) {
+      // Neither interpretation could even locate a closing tag. Same
+      // position-gated reasoning as the branch above.
+      if (position > runStart) scanFrom = text.length;
+      break;
+    }
+
+    let markerEnd = imageCloseAt + MARKER_CLOSE.length;
+    if (text.startsWith("\n", markerEnd)) markerEnd += 1;
+
+    // Classified from what pi actually writes (see `classifyImageBody` and its
+    // two constants), not guessed at from newlines: a genuine image marker's
+    // body can be multiple lines (a conversion hint plus a dimension note), and
+    // a single-line `[Image omitted:` body is still a genuine image marker —
+    // just one that consumed no `image` content block. A text marker whose
+    // disk content changed after pi inlined it (the text interpretation just
+    // failed above) never matches either shape, and falls through below.
+    const imageShape = classifyImageBody(text.slice(bodyStart, imageCloseAt));
+
+    if (imageShape === "omitted") {
+      // pi tried and gave up — no `image` block was ever pushed for this
+      // marker, so there is nothing to upload and `nextImage` must not move.
+      // Still recorded (with no bytes) so `applyAttachmentPointers` can tell
+      // the model it never saw this image, the same as any other image that
+      // never reached Dust — the "not-image" fallback below would otherwise
+      // treat it as unlocated and kill-switch the mention scan past it too,
+      // when its span is in fact perfectly well known.
+      attachments.push(makeAttachment(path, imageContentType(path), new Uint8Array(0), text, position, markerEnd, true));
+      position = markerEnd;
+      scanFrom = position;
+      continue;
+    }
+
+    if (imageShape === "consumes-block") {
+      // pi resizes images before attaching them, so the block's bytes — not
+      // the ones on disk — are what the model was meant to see. Recorded
+      // regardless of size: an oversized image is still a real, located
+      // marker, and dropping it here — before it ever reaches `attachments` —
+      // would make it invisible to `applyAttachmentPointers`, leaving the
+      // model with no idea the image existed at all. `attachFilesToConversation`
+      // is what actually enforces `ATTACHMENT_MAX_IMAGE_BYTES`, the same way it
+      // handles any other reason an upload cannot proceed.
+      const block = images[nextImage];
+      if (block?.data) {
+        nextImage += 1;
+        const bytes = Buffer.from(block.data, "base64");
+        const contentType = block.mimeType ?? contentTypeForPath(path);
+        attachments.push(makeAttachment(path, contentType, bytes, text, position, markerEnd, true));
+        position = markerEnd;
+        scanFrom = position;
+        continue;
+      }
+    }
+
+    // Neither interpretation verified: this marker's own span is known (its
+    // closing tag was located), which is strong enough evidence of genuine
+    // inliner output — a well-formed `<file name="...">...</file>` block is
+    // not the kind of thing someone pastes by coincidence — that the run ends
+    // here unconditionally, regardless of `position`. Every marker after this
+    // one in the original text is unlocated and therefore untrustworthy too,
+    // so the whole remainder is excluded from the mention scan, not just this
+    // marker's own span.
+    scanFrom = text.length;
+    break;
   }
 
-  attachments.push(...parseMentions(text, position, cwd));
+  // Two disjoint regions, never the run's own span: whatever precedes it
+  // (nothing, or piped stdin content) and whatever the run's own logic above
+  // decided is safe to resume scanning from afterward.
+  attachments.push(...parseMentions(text, 0, cwd, runStart < 0 ? text.length : runStart));
+  attachments.push(...parseMentions(text, scanFrom, cwd));
 
   // Logged even when nothing matched: "my `@file` was not uploaded" is
   // otherwise indistinguishable from "the upload failed", and the two have
   // nothing in common to investigate.
   debugLog("dust:files", "Scanned the user message for attachments", {
     cwd,
-    inlinedMarkers: position > 0,
+    inlinedMarkers: runStart >= 0 && position > runStart,
     imageBlocks: images.length,
     attachments: attachments.map((attachment) => ({
       path: attachment.path,
       contentType: attachment.contentType,
       fileSize: attachment.bytes.byteLength,
-      marker: attachment.marker.slice(0, 80),
+      marker: markerSummary(attachment.marker),
     })),
   });
 
@@ -299,23 +514,72 @@ export function parseUserMessage(message: ChatMessageLike, cwd: string): ParsedU
  * snapshot — and a mention already says that as briefly as it can be said.
  * Mentions are therefore left exactly as typed.
  *
+ * A file that failed to upload is left as-is — that is the safe fallback for
+ * text, whose marker still carries the whole body (or, for a mention, a path
+ * the agent's local tools can still read). An image is different: nothing
+ * about it ever reaches Dust except through this upload, so its marker is
+ * either an empty tag or a short processing hint pi wrote, and its `image`
+ * content block never leaves this extension either — meaning a failed image
+ * upload otherwise vanishes without a trace, and the model answers about a
+ * picture it was never shown. `pendingAttachments` — the full parse, not just
+ * the successes — is what makes a failure visible: any image in it that
+ * `attached` does not cover gets a note in its place instead of silence.
+ *
  * Rewriting happens by position rather than by string match, so one marker
  * never rewrites another that merely starts the same way.
  */
-export function applyAttachmentPointers(text: string, attached: AttachedFile[]): string {
-  const ordered = attached
-    .filter((entry) => entry.attachment.inlined)
-    .sort((a, b) => a.attachment.start - b.attachment.start);
+export function applyAttachmentPointers(
+  text: string,
+  attached: AttachedFile[],
+  pendingAttachments: PendingAttachment[] = [],
+): string {
+  const attachedPointers = new Set(attached.map((entry) => entry.attachment));
+  const failedImages = pendingAttachments.filter(
+    (attachment) => attachment.contentType.startsWith("image/") && !attachedPointers.has(attachment),
+  );
+
+  const edits = [
+    ...attached
+      .filter((entry) => entry.attachment.inlined)
+      .map((entry) => ({
+        start: entry.attachment.start,
+        end: entry.attachment.end,
+        replacement: entry.attachment.marker.endsWith("\n")
+          ? `@${entry.attachment.path}\n`
+          : `@${entry.attachment.path}`,
+      })),
+    ...failedImages.map((attachment) => {
+      // `dust-files.ts` never even tries to upload an image over Dust's
+      // ceiling — recomputing the same comparison here (rather than plumbing
+      // a reason code through `AttachedFile`) is what lets the note say why,
+      // rather than the generic message a network failure gets.
+      const reason = attachment.bytes.byteLength > ATTACHMENT_MAX_IMAGE_BYTES
+        ? "it is too large to attach"
+        : "it could not be attached";
+      return {
+        start: attachment.start,
+        end: attachment.end,
+        // Inlined: the marker itself carries nothing worth keeping (an empty
+        // tag or a hint like "resized from..."), so it is replaced outright. A
+        // mention's `@path` is still a real, locally-readable path, so it is
+        // kept and just annotated.
+        replacement: attachment.inlined
+          ? `[the image "${attachment.fileName}" is not visible to you — ${reason}]${attachment.marker.endsWith("\n") ? "\n" : ""}`
+          : `${attachment.marker} (${reason} — the image is not visible to you)`,
+      };
+    }),
+  ].sort((a, b) => a.start - b.start);
+
   let rewritten = "";
   let position = 0;
 
-  for (const { attachment } of ordered) {
-    // A file attached twice yields two markers; a stale span would mean the
-    // caller passed spans from a different text.
-    if (attachment.start < position) continue;
-    rewritten += text.slice(position, attachment.start);
-    rewritten += attachment.marker.endsWith("\n") ? `@${attachment.path}\n` : `@${attachment.path}`;
-    position = attachment.end;
+  for (const { start, end, replacement } of edits) {
+    // A file attached (or failed) twice yields two markers; a stale span
+    // would mean the caller passed spans from a different text.
+    if (start < position) continue;
+    rewritten += text.slice(position, start);
+    rewritten += replacement;
+    position = end;
   }
 
   return rewritten + text.slice(position);

@@ -282,6 +282,29 @@ describe("@file attachments in a turn", () => {
     expect(bodyOf(fetchMock, (url) => url.endsWith("/messages")).content).toContain(fileContent);
   });
 
+  // Unlike a failed text upload, whose marker still carries the whole body,
+  // a failed image upload used to leave the model with nothing at all: the
+  // inline marker is an empty tag, and the `image` content block never
+  // reaches Dust through any other path. The message text must say so.
+  it("tells the model an image could not be attached instead of silently dropping it", async () => {
+    const streamSimple = await setup();
+    const fetchMock = makeTurnFetch({ uploadOk: false });
+    vi.stubGlobal("fetch", fetchMock);
+    const imagePath = join(dir, "failed-shot.png");
+    writeFileSync(imagePath, "x");
+
+    await runTurn(streamSimple, [
+      { type: "text", text: `<file name="${imagePath}"></file>\nwhat is this` },
+      { type: "image", mimeType: "image/png", data: Buffer.from("png-bytes").toString("base64") },
+    ]);
+
+    const create = bodyOf(fetchMock, (url) => url.endsWith("/assistant/conversations"));
+    expect(create.contentFragments).toBeUndefined();
+    expect(create.message.content).not.toContain(`<file name="${imagePath}">`);
+    expect(create.message.content).toContain("could not be attached");
+    expect(create.message.content).toContain("what is this");
+  });
+
   it("uploads an image block that would otherwise be dropped", async () => {
     const streamSimple = await setup();
     const fetchMock = makeTurnFetch();
