@@ -7,7 +7,7 @@ import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.j
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
-import { invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
+import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
@@ -89,12 +89,13 @@ async function ensureMcpServer(
   runtime.mcpServerId = serverId;
 
   // The listener and heartbeat outlive the access token that registered the
-  // server, so they must not close over the headers used above. Prefer a
-  // freshly refreshed token held in memory (see `refreshedAccessToken` on
-  // DustSessionRuntime — `setCredentials` cannot persist it), then the stored
-  // credential, and fall back to those headers only if nothing is available.
+  // server, so they must not close over the headers used above. Go through
+  // the single `currentAccessToken()` accessor (prefers a freshly refreshed
+  // in-memory token, with its own expiry, over storage — see its doc on
+  // DustSessionRuntime) and fall back to those headers only if nothing is
+  // available at all.
   const getAuthHeaders = (): Record<string, string> => {
-    const access = runtime.refreshedAccessToken || runtime.sessionContext.getCredentials()?.access;
+    const access = runtime.currentAccessToken();
     return access ? buildAuthHeaders(access) : authHeaders;
   };
 
@@ -206,11 +207,18 @@ async function postValidateAction(
 ): Promise<void> {
   const url = `${baseUrl}/assistant/conversations/${conversationId}/messages/${messageId}/validate-action`;
   debugLog("dust:session", "Posting validate-action", { conversationId, messageId, actionId, approved, url });
-  await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
     headers: { ...authHeaders, "Content-Type": "application/json" },
     body: JSON.stringify({ actionId, approved: approved ? "approved" : "rejected" }),
   });
+  if (!res.ok) {
+    // A long approval wait can outlive the access token, and this can 401 —
+    // surfaced here rather than left silent, though there is nothing useful
+    // to retry with: the approval decision has already been made and Dust's
+    // side of it is what failed to record.
+    debugLog("dust:session", "Post validate-action failed", { status: res.status, conversationId, messageId, actionId });
+  }
 }
 
 async function createConversation(
@@ -371,7 +379,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           const hostToken = await runtime.sessionContext.resolveAccessToken();
           if (hostToken) {
             liveCred = { ...(runtime.sessionContext.getCredentials() ?? liveCred), access: hostToken };
-            runtime.refreshedAccessToken = hostToken;
+            runtime.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
             debugLog("dust:session", "Pre-stream token refresh delegated to host");
           } else {
             try {
@@ -380,9 +388,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
               // setCredentials (persistCredentialState) drops the token trio —
               // it never reaches auth.json — so without this, every later
               // getAuthHeaders() would keep reading the old, still-expired
-              // token back out of storage.
+              // token back out of storage. refreshToken() reports a real
+              // expiry (unlike the host path above), so use it rather than
+              // the assumed TTL.
               if (liveCred.access) {
-                runtime.refreshedAccessToken = liveCred.access;
+                runtime.setRefreshedAccessToken(liveCred.access, liveCred.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
               }
               debugLog("dust:session", "Pre-stream token refresh succeeded");
             } catch (err) {
@@ -403,48 +413,64 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         const agentSId = model.sId ?? "";
         debugLog("dust:session", "Resolved stream context", { workspaceId, region, baseUrl, agentSId, username });
 
-        const authHeaders = buildAuthHeaders(accessToken);
+        // Last-resort fallback: only reached if nothing is in memory AND
+        // nothing is stored yet (there should always be something by the time
+        // any of these run, but a snapshot beats an empty Authorization header).
+        const fallbackAuthHeaders = buildAuthHeaders(accessToken);
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-        // A turn can outlive the ~15 minute access token, so the long-lived
-        // event stream re-reads the current token per request instead of
-        // pinning the one this turn started with. A refresh done through the
-        // direct fallback below lives only in `refreshedAccessToken` — it
-        // never reaches storage — so that takes priority over the stored one.
-        const getAuthHeaders = (): Record<string, string> => {
-          const current = runtime.refreshedAccessToken || runtime.sessionContext.getAccessToken();
-          return current ? buildAuthHeaders(current) : authHeaders;
+        // The single accessor every call site below goes through, instead of
+        // each hand-rolling its own priority chain — see
+        // `DustSessionRuntime#currentAccessToken()`'s doc. A turn can outlive
+        // the ~15 minute access token, so this is called fresh at each site
+        // rather than pinning one snapshot for the whole turn.
+        const resolveAuthHeaders = (): Record<string, string> => {
+          const current = runtime.currentAccessToken();
+          return current ? buildAuthHeaders(current) : fallbackAuthHeaders;
         };
+        const getAuthHeaders = resolveAuthHeaders;
 
         // Called after a 401: refresh through pi (which persists the rotation)
         // and fall back to a direct refresh. Returning false means the session
         // really is dead.
-        const refreshAuth = async (): Promise<boolean> => {
-          const hostToken = await runtime.sessionContext.resolveAccessToken();
-          if (hostToken) {
-            runtime.refreshedAccessToken = hostToken;
-            return true;
-          }
-          try {
-            const refreshed = await refreshToken(runtime.sessionContext.getCredentials() ?? liveCred);
-            runtime.sessionContext.setCredentials(refreshed);
-            // persistCredentialState drops access/refresh/expires (auth.json
-            // is pi-owned, we can no longer write it), so the rotated token
-            // would otherwise vanish the instant it's "saved": every later
-            // getAuthHeaders() call — ours and the MCP listener/heartbeat's —
-            // would keep re-reading the same expired token from storage and
-            // loop straight back into the same 401.
-            if (refreshed.access) {
-              runtime.refreshedAccessToken = refreshed.access;
+        //
+        // Single-flighted on the runtime: streamEvents, the MCP listener, and
+        // the MCP heartbeat all call this, and can all hit a 401 in the same
+        // window. Two concurrent direct refreshes would race the same
+        // rotating refresh token — WorkOS honors one and answers
+        // `invalid_grant` to the other — so every caller while one is already
+        // in flight awaits that same attempt instead of starting its own.
+        const refreshAuth = (): Promise<boolean> => {
+          runtime.refreshInFlight ??= (async (): Promise<boolean> => {
+            const hostToken = await runtime.sessionContext.resolveAccessToken();
+            if (hostToken) {
+              runtime.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+              return true;
             }
-            return Boolean(refreshed.access);
-          } catch (err) {
-            debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
-            return false;
-          }
+            try {
+              const refreshed = await refreshToken(runtime.sessionContext.getCredentials() ?? liveCred);
+              runtime.sessionContext.setCredentials(refreshed);
+              // persistCredentialState drops access/refresh/expires (auth.json
+              // is pi-owned, we can no longer write it), so the rotated token
+              // would otherwise vanish the instant it's "saved": every later
+              // getAuthHeaders() call — ours and the MCP listener/heartbeat's —
+              // would keep re-reading the same expired token from storage and
+              // loop straight back into the same 401.
+              if (refreshed.access) {
+                runtime.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+              }
+              return Boolean(refreshed.access);
+            } catch (err) {
+              debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
+              return false;
+            }
+          })().finally(() => {
+            runtime.refreshInFlight = null;
+          });
+          return runtime.refreshInFlight;
         };
 
-        await ensureMcpServer(runtime, baseUrl, authHeaders, refreshAuth);
+        await ensureMcpServer(runtime, baseUrl, resolveAuthHeaders(), refreshAuth);
 
         const userText = extractUserText(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
@@ -460,7 +486,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         if (!runtime.conversationId) {
           ({ conversationSId, userMessageSId, agentMessageSId } = await createConversation(
             baseUrl,
-            authHeaders,
+            resolveAuthHeaders(),
             signal,
             runtime,
             agentSId,
@@ -473,7 +499,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           conversationSId = runtime.conversationId;
           userMessageSId = await postMessageToConversation(
             baseUrl,
-            authHeaders,
+            resolveAuthHeaders(),
             signal,
             runtime,
             conversationSId,
@@ -484,7 +510,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           );
           agentMessageSId = await fetchConversationAgentMessageId(
             baseUrl,
-            authHeaders,
+            resolveAuthHeaders(),
             signal,
             conversationSId,
             userMessageSId,
@@ -502,7 +528,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           model,
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
-            postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
+            postValidateAction(baseUrl, resolveAuthHeaders(), conversationId, messageId, actionId, approved),
           recordPreApproval: (actionId, approved) => runtime.preApprovedActions.set(actionId, approved),
           resolveApprovalGate: () => runtime.resolveApprovalGate(),
         });

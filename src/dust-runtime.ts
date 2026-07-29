@@ -38,6 +38,22 @@ const NOOP_SESSION_CONTEXT: SessionContextController = {
 
 const NOOP_CONFIRM = async () => true;
 
+interface HeldAccessToken {
+  token: string;
+  expiresAt: number;
+}
+
+/**
+ * pi's own `resolveAccessToken` host path doesn't report an expiry (it just
+ * hands back an apiKey), but it persists the rotation to auth.json itself,
+ * essentially synchronously. The in-memory holder only needs to survive long
+ * enough to bridge the gap until a later `getAccessToken()` read reflects
+ * that write — this is a conservative assumed lifetime for that bridge, well
+ * under Dust's ~15 minute token life, not a claim about the token's real
+ * expiry.
+ */
+export const HOST_TOKEN_ASSUMED_TTL_MS = 5 * 60 * 1000;
+
 export class DustSessionRuntime {
   /** Extension API handle, used to append tool-call entries to the transcript. */
   pi: ExtensionAPI | null = null;
@@ -49,18 +65,47 @@ export class DustSessionRuntime {
   mcpRequestsAbortController: AbortController | null = null;
   sessionContext: SessionContextController = NOOP_SESSION_CONTEXT;
   /**
-   * The most recently refreshed access token, held in memory.
+   * The most recently refreshed access token, held in memory with an expiry.
    *
-   * `setCredentials` (persistCredentialState) deliberately drops the token
-   * trio — auth.json is pi-owned, and we can no longer write it — so a
-   * refresh done through the direct WorkOS fallback (as opposed to pi's own
-   * `resolveAccessToken` host path, which pi persists itself) would otherwise
-   * vanish the instant it's stored: every later `getAuthHeaders()` call would
-   * keep reading the same stale token out of storage and loop back into the
-   * same 401. This is the one place that survives the round trip, and every
-   * getAuthHeaders() in dust-stream-provider.ts must prefer it over storage.
+   * Invariants:
+   * - **Written by**: `refreshAuth`'s two branches (dust-stream-provider.ts,
+   *   shared single-flight via `refreshInFlight` below), the pre-stream
+   *   refresh block in `dustRealStream`, and `refreshExpiredToken` at
+   *   session_start (dust-session-events.ts) — every place that resolves a
+   *   token outside of pi's own persisted storage.
+   * - **Read by**: `DustSessionRuntime#currentAccessToken()`, the single
+   *   accessor every `getAuthHeaders()`/auth-header builder in
+   *   dust-stream-provider.ts must go through — never read this field
+   *   directly.
+   * - **Expires**: entries carry their own `expiresAt` and are ignored (and
+   *   dropped) once past it, falling through to storage instead. This is
+   *   what makes it safe for it to unconditionally win otherwise: a stale
+   *   entry cannot outrank a fresher stored token forever, only until it
+   *   naturally times out.
+   * - **Cleared by**: `resetSessionState()`, `onLogin` (dust.ts — a fresh
+   *   login must not let a previous account's or workspace's live token keep
+   *   outranking the new one), and every `markInvalidated()` path (a dead
+   *   session has nothing left worth holding onto).
+   *
+   * Why this exists at all: `setCredentials` (persistCredentialState)
+   * deliberately drops the token trio — auth.json is pi-owned, and we can no
+   * longer write it — so a refresh done through the direct WorkOS fallback
+   * (as opposed to pi's own `resolveAccessToken` host path, which persists
+   * the rotation itself) would otherwise vanish the instant it's "saved":
+   * every later auth-header build would keep reading the same stale token
+   * out of storage and loop back into the same 401.
    */
-  refreshedAccessToken: string | null = null;
+  refreshedAccessToken: HeldAccessToken | null = null;
+  /**
+   * Single-flight guard for `refreshAuth`. The event stream, the MCP
+   * listener, and the MCP heartbeat can all hit a 401 in the same window and
+   * each call `refreshAuth` — without memoizing the in-flight attempt here,
+   * two concurrent direct refreshes would race the same rotating refresh
+   * token: WorkOS honors the first and answers `invalid_grant` to the
+   * second, which would then report a false refresh failure and invalidate a
+   * session that had, in fact, just been refreshed successfully.
+   */
+  refreshInFlight: Promise<boolean> | null = null;
   confirmFn: (title: string, message: string) => Promise<boolean> = NOOP_CONFIRM;
   /**
    * When true, tool calls run without prompting. Session-scoped and off by
@@ -70,6 +115,38 @@ export class DustSessionRuntime {
   preApprovedActions = new Map<string, boolean>();
   pendingApprovalPromise: Promise<void> | null = null;
   private resolveApprovalGateFn: (() => void) | null = null;
+
+  /** Publishes a freshly refreshed token, valid until `expiresAt` (ms epoch). */
+  setRefreshedAccessToken(token: string, expiresAt: number): void {
+    this.refreshedAccessToken = token ? { token, expiresAt } : null;
+  }
+
+  /** Drops the held token unconditionally — used by every "session is dead or changed" path. */
+  clearRefreshedAccessToken(): void {
+    this.refreshedAccessToken = null;
+  }
+
+  /**
+   * The single accessor every auth-header builder in dust-stream-provider.ts
+   * must go through, instead of each hand-rolling its own `||` chain over
+   * `refreshedAccessToken` and storage. Prefers the in-memory holder while it
+   * is still within its assumed lifetime — since storage cannot carry a
+   * directly-refreshed token at all (see `refreshedAccessToken`'s doc) — and
+   * otherwise falls through to whatever is currently persisted.
+   */
+  currentAccessToken(): string {
+    const held = this.refreshedAccessToken;
+    if (held) {
+      if (held.expiresAt > Date.now()) {
+        return held.token;
+      }
+      // Past its assumed lifetime: drop it rather than let it keep
+      // shadowing storage (which may since have rotated to something newer,
+      // e.g. after a fresh login) forever.
+      this.refreshedAccessToken = null;
+    }
+    return this.sessionContext.getAccessToken();
+  }
 
   createApprovalGate(): void {
     this.pendingApprovalPromise = new Promise<void>((resolve) => {
@@ -107,6 +184,7 @@ export class DustSessionRuntime {
 
   resetSessionState(): void {
     this.conversationId = null;
+    this.clearRefreshedAccessToken();
     this.clearMcpState();
   }
 }
@@ -128,7 +206,7 @@ export function invalidateRuntimeCredentials(runtime: DustSessionRuntime, creden
   runtime.sessionContext.setCredentials(invalidateCredentials(credentials));
   markInvalidated();
   runtime.conversationId = null;
-  runtime.refreshedAccessToken = null;
+  runtime.clearRefreshedAccessToken();
   runtime.clearMcpState();
 }
 

@@ -114,11 +114,16 @@ describe("MCP registration-lost callbacks are scoped to their own registration (
     // Listener A independently discovers the registration is gone — a real
     // SSE 404, the actual trigger for a lost registration — and the runtime
     // clears state for real, because at this moment it IS the current
-    // registration.
+    // registration. Poll for an actual side effect of clearMcpState()
+    // (it clears the heartbeat interval) instead of flushing a fixed number
+    // of microtasks: a fixed count only proves today's synchronous handler
+    // ran, and would silently stop proving anything the moment the catch
+    // chain gains one more `await`.
+    const clearIntervalSpy = vi.spyOn(global, "clearInterval");
     rejectListenerA!(new Error(MCP_REGISTRATION_LOST_MESSAGE));
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => {
+      expect(clearIntervalSpy).toHaveBeenCalled();
+    });
 
     // Turn 2: mcpServerId was cleared, so this registers a fresh server, B.
     registerMcpServerMock.mockResolvedValueOnce("srv-B");
@@ -141,10 +146,10 @@ describe("MCP registration-lost callbacks are scoped to their own registration (
 
     // Heartbeat A's long-in-flight request finally resolves (e.g. a stale
     // 403). Without the identity guard this would clear B's live
-    // registration mid-session — it must be a no-op instead.
+    // registration mid-session — it must be a no-op instead. This callback is
+    // synchronous today, so there is no async gap to wait out here; turn 3
+    // below is the actual assertion.
     onRegistrationLostA!();
-    await Promise.resolve();
-    await Promise.resolve();
 
     // Turn 3: if B's registration had been wiped, ensureMcpServer would
     // register a third time. It must not.

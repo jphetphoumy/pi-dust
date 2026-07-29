@@ -207,6 +207,119 @@ describe("dust MCP runtime helpers", () => {
     await promise;
   });
 
+  it("earns a fresh refresh budget after a connect that actually succeeds, even within the cooldown window", async () => {
+    // Without resetting the cooldown on a successful connect, a refresh that
+    // is immediately followed by a good connection which then closes early
+    // (a transient drop, or Dust's early `done` sentinel) and hits a 401 of
+    // its own would have that second 401 blocked by the still-fresh cooldown
+    // from the first — even though the connection in between proved the
+    // token was genuinely good a moment ago.
+    const abortController = new AbortController();
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call += 1;
+      if (call === 1) return { ok: false, status: 401, body: null };
+      if (call === 2) {
+        // A connect that succeeds and then closes immediately (no data, no
+        // "done" sentinel needed — an already-finished body is enough).
+        return { ok: true, body: makeMcpRequestStream([]) };
+      }
+      if (call === 3) return { ok: false, status: 401, body: null };
+      return { ok: true, body: makePendingRequestStream(abortController.signal) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshAuth = vi.fn().mockResolvedValue(true);
+
+    const promise = listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth,
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
+      getTools: () => [],
+      getConfirmFn: () => async () => true,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions: new Map(),
+    });
+
+    // No real time needs to pass between the two 401s — the reset happens on
+    // the successful connect in between, not on a clock.
+    await vi.waitFor(() => {
+      expect(call).toBeGreaterThanOrEqual(4);
+    });
+    expect(refreshAuth).toHaveBeenCalledTimes(2);
+
+    abortController.abort();
+    await promise;
+  });
+
+  it("does not execute a tool call if the listener was aborted while parked on the approval gate (issue #32 defect 4)", async () => {
+    // clearMcpState() resolves the approval gate unconditionally (so a
+    // parked listener doesn't hang forever) and then aborts the controller.
+    // Waking up from that gate is not the same as still being wanted: without
+    // an abort check right after, the listener would go on to prompt for and
+    // EXECUTE the tool call, then POST the result to a registration that's
+    // already gone — or, on a session switch, into whatever session is live
+    // now instead of the one that asked.
+    const callRequest = { jsonrpc: "2.0", id: "req-1", method: "tools/call", params: { name: "bash", arguments: {} } };
+    const abortController = new AbortController();
+
+    let resolveGate: (() => void) | undefined;
+    const pendingApprovalPromise = new Promise<void>((resolve) => {
+      resolveGate = resolve;
+    });
+    let reachedGate = false;
+    const getPendingApprovalPromise = () => {
+      reachedGate = true;
+      return pendingApprovalPromise;
+    };
+
+    const executeMcpTool = vi.fn().mockResolvedValue({ content: [{ type: "text" as const, text: "ok" }], isError: false });
+    const confirmFn = vi.fn().mockResolvedValue(true);
+
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: makeMcpRequestStream([
+        `data: ${JSON.stringify({ eventId: "e1", data: callRequest })}\n\n`,
+      ]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool,
+      getTools: () => [],
+      getConfirmFn: () => confirmFn,
+      getPendingApprovalPromise,
+      preApprovedActions: new Map(),
+    });
+
+    // getPendingApprovalPromise() and the await right after it are adjacent
+    // with no await in between, so by the time this flips true the listener
+    // is provably already suspended on the gate.
+    await vi.waitFor(() => {
+      expect(reachedGate).toBe(true);
+    });
+
+    // The two effects of clearMcpState(), in order: abort the controller,
+    // then resolve the gate so nothing is left hanging.
+    abortController.abort();
+    resolveGate!();
+
+    await promise;
+
+    expect(confirmFn).not.toHaveBeenCalled();
+    expect(executeMcpTool).not.toHaveBeenCalled();
+  });
+
   it.each([403, 404])("throws MCP_REGISTRATION_LOST_MESSAGE on terminal HTTP %i without retrying", async (status) => {
     const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status, body: null });
     vi.stubGlobal("fetch", fetchMock);

@@ -4,7 +4,7 @@ import { describeConversation, resolveAttachment, verifyConversation } from "./d
 import type { ConversationAttachment } from "./dust-conversation.js";
 import { debugLog } from "./dust-debug.js";
 import { refreshApprovalStatus } from "./dust-approval.js";
-import { applyRuntimeContext, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
+import { applyRuntimeContext, HOST_TOKEN_ASSUMED_TTL_MS, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import {
   clearInvalidated,
   forgetConversationId,
@@ -66,9 +66,17 @@ function notifyReloginRequired(ctx: PiRuntimeContext): void {
  *
  * Older pi builds have no `getProviderAuth`; there we fall back to a direct
  * refresh, which still yields a usable in-memory token for this session.
+ *
+ * Either success path also publishes into `runtime.refreshedAccessToken` —
+ * the in-memory holder every `getAuthHeaders()` in dust-stream-provider.ts
+ * prefers over storage. Without that, this refresh and the holder could
+ * diverge: storage picks up the fresh token immediately, but the holder (if
+ * still live from an earlier direct refresh elsewhere in the same session)
+ * would keep outranking it with something older until it happened to expire.
  */
 async function refreshExpiredToken(
   ctx: PiRuntimeContext,
+  runtime: DustSessionRuntime,
   cred: DustCredentials,
 ): Promise<DustCredentials> {
   const getProviderAuth = ctx.modelRegistry?.getProviderAuth;
@@ -79,6 +87,7 @@ async function refreshExpiredToken(
       const apiKey = resolved?.auth?.apiKey;
       if (apiKey) {
         debugLog("dust:session", "Refreshed token via pi provider auth");
+        runtime.setRefreshedAccessToken(apiKey, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
         // pi persisted the rotation; re-read so we pick up the new expiry.
         return { ...(getStoredCredentials() ?? cred), access: apiKey };
       }
@@ -89,6 +98,7 @@ async function refreshExpiredToken(
       debugLog("dust:session", "Provider auth refresh failed", { error: errorMessage(err) });
       notifyReloginRequired(ctx);
       markInvalidated();
+      runtime.clearRefreshedAccessToken();
       return invalidateCredentials(cred);
     }
   }
@@ -97,12 +107,16 @@ async function refreshExpiredToken(
     const refreshed = await refreshToken(cred);
     persistCredentialState(refreshed);
     debugLog("dust:session", "Refreshed token during session_start");
+    if (refreshed.access) {
+      runtime.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+    }
     return refreshed;
   } catch (err) {
     debugLog("dust:session", "Token refresh failed during session_start", { error: errorMessage(err) });
     if (isSessionExpiredError(err)) {
       markInvalidated();
       notifyReloginRequired(ctx);
+      runtime.clearRefreshedAccessToken();
       return invalidateCredentials(cred);
     }
     console.error(`[dust] token refresh failed at session_start: ${errorMessage(err)}`);
@@ -263,7 +277,7 @@ export function registerDustSessionEvents(
     const attached = attachConversation(runtime, ctx, event);
 
     if (cred.access && shouldRefreshAccessToken(cred.expires, SESSION_START_REFRESH_SKEW_MS)) {
-      cred = normalizeStoredCredentials(await refreshExpiredToken(ctx, cred));
+      cred = normalizeStoredCredentials(await refreshExpiredToken(ctx, runtime, cred));
     }
 
     await confirmAttachment(runtime, ctx, cred, attached);
@@ -283,6 +297,7 @@ export function registerDustSessionEvents(
     if (agentFetch.unauthorized) {
       const invalidatedCred = invalidateCredentials(cred);
       markInvalidated();
+      runtime.clearRefreshedAccessToken();
       registerProviderForCredentials(invalidatedCred);
       return;
     }

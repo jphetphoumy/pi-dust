@@ -220,6 +220,12 @@ export async function listenMcpRequests({
     }
 
     reconnectAttempt = 0;
+    // A connect that actually succeeds earns a fresh refresh budget: the
+    // cooldown above is meant to survive a run of retryable failures between
+    // one refresh and the next 401, not to stay latched after a perfectly
+    // good connection that later closes early (a transient drop, or Dust's
+    // early `done` sentinel) and immediately hits a 401 of its own.
+    lastRefreshAttemptAt = 0;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -299,6 +305,21 @@ export async function listenMcpRequests({
                 const pendingApprovalPromise = getPendingApprovalPromise();
                 if (pendingApprovalPromise !== null) {
                   await pendingApprovalPromise;
+                }
+
+                // The gate above is resolved unconditionally by
+                // `clearMcpState()` (registration lost, or a session switch
+                // abandoning this listener entirely) so that a parked waiter
+                // doesn't hang forever — but waking up is not the same as
+                // still being wanted. Without this check, a listener that
+                // wakes up aborted would go on to prompt for and EXECUTE the
+                // tool call regardless, then POST the result to a
+                // registration that's already gone (or, on a session switch,
+                // to whatever session is live now instead of the one that
+                // asked).
+                if (abortController.signal.aborted) {
+                  debugLog("dust:mcp", "MCP listener aborted while parked on the approval gate, skipping tool execution", { toolName });
+                  return;
                 }
 
                 let allowed: boolean;
