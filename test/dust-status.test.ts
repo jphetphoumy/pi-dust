@@ -447,6 +447,7 @@ describe("dust /status", () => {
   describe("interactive panel", () => {
     const THEME_STUB = {
       fg: (_c: string, t: string) => t,
+      bg: (_c: string, t: string) => t,
       bold: (t: string) => t,
     };
 

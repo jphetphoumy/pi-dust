@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionContextController } from "../src/dust-runtime.js";
 import { StatusLoader } from "../src/dust-status-loader.js";
-import { DustStatusPanel, truncate } from "../src/dust-status-panel.js";
+import { DustStatusPanel, panelHeight, truncate } from "../src/dust-status-panel.js";
 import { renderBreakdownRows, renderBreakdownTab, renderOverviewTab, spinnerFrame } from "../src/dust-status-tab-render.js";
 import {
   DEFAULT_PERIOD,
@@ -347,6 +347,22 @@ describe("dust /status panel", () => {
         expect(line.replace(ANSI, "").length).toBeLessThanOrEqual(40);
       }
       panel.dispose();
+    });
+  });
+
+  describe("sizing", () => {
+    it("leaves room for the transcript above the panel", () => {
+      // The panel renders in the editor's slot, so its height pushes the
+      // transcript up — it must never claim the whole screen.
+      expect(panelHeight(50)).toBeLessThan(50);
+      expect(panelHeight(50)).toBe(26);
+      expect(panelHeight(30)).toBe(22);
+    });
+
+    it("stays usable in a short terminal and when the size is unknown", () => {
+      expect(panelHeight(12)).toBe(10);
+      expect(panelHeight(0)).toBe(26);
+      expect(panelHeight(-5)).toBe(26);
     });
   });
 

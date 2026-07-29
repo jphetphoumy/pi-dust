@@ -112,6 +112,8 @@ Responsibilities:
 Responsibilities:
 
 - expose the read-only `/status` panel, interactive where the host supports it
+- open it inline via `ui.custom` *without* `overlay`, so pi swaps it into the
+  editor's slot: full width, above the prompt, editor restored on close
 - resolve the credit API target synchronously, so a not-logged-in run opens nothing
 - assemble session counters and the credit endpoints into one payload
 - decide what is refetched live and what is served from the session cache
@@ -146,7 +148,8 @@ The interactive overlay component.
 
 Responsibilities:
 
-- draw the tab bar, the scroll indicator and the footer hints
+- draw the tab bar (active tab as a filled chip), scroll indicator and footer hints
+- size itself from the terminal height, leaving the transcript visible above
 - handle ←/→/tab, ↑/↓, PgUp/PgDn, `d`/`w`/`m`, `r` and Esc
 - animate a spinner only while something is pending
 - truncate styled lines so the panel never reflows mid-gauge

@@ -13,7 +13,7 @@ import { debugLog } from "./dust-debug.js";
 import { buildSessionContext, type DustSessionRuntime, type SessionContextController } from "./dust-runtime.js";
 import { getStoredCredentials } from "./dust-state.js";
 import { StatusLoader } from "./dust-status-loader.js";
-import { DustStatusPanel } from "./dust-status-panel.js";
+import { DustStatusPanel, panelHeight } from "./dust-status-panel.js";
 import { renderStatusPanel } from "./dust-status-render.js";
 import type { DustAgent, DustCredentials, DustModel, DustStatusData, PiRuntimeContext } from "./dust-types.js";
 
@@ -23,8 +23,6 @@ const NOT_LOGGED_IN = "Not logged in to Dust. Run /login first.";
 const NO_WORKSPACE = "No Dust workspace selected. Run /workspace first.";
 /** Window the Overview tab's inline breakdowns cover. */
 const OVERVIEW_BREAKDOWN_DAYS = 30;
-/** Overlay rows; the component pages the body inside this. */
-const PANEL_HEIGHT = 28;
 
 /** Everything needed to talk to the credit API, resolved without any network call. */
 export interface StatusTarget {
@@ -37,7 +35,7 @@ export interface StatusTarget {
 
 type CustomUi = <T>(
   factory: (
-    tui: { requestRender: () => void },
+    tui: { requestRender: () => void; terminal?: { rows?: number } },
     theme: never,
     keybindings: unknown,
     done: (result: T) => void,
@@ -251,8 +249,19 @@ async function openStatusPanel(
     // current and no request is needed.
     if (loader.overview.status === "loading") refresh();
 
-    return new DustStatusPanel(theme, loader, () => tui.requestRender(), done, refresh, PANEL_HEIGHT);
-  }, { overlay: true, overlayOptions: { width: "90%", maxHeight: "80%", anchor: "center" } });
+    // Not an overlay: pi swaps the component into the editor's slot, so the
+    // panel renders inline above the prompt at full width and restores the
+    // editor on close. A floating overlay left the transcript showing through
+    // wherever a line was shorter than the overlay box.
+    return new DustStatusPanel(
+      theme,
+      loader,
+      () => tui.requestRender(),
+      done,
+      refresh,
+      panelHeight(tui.terminal?.rows ?? 0),
+    );
+  });
 
   return true;
 }

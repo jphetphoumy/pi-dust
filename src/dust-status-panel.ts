@@ -14,8 +14,23 @@ import {
 } from "./dust-status-tabs.js";
 
 const SPINNER_INTERVAL_MS = 120;
-/** Rows reserved for the tab bar, blank lines and the footer hint. */
+/** Rows reserved for the tab bar, the rule, the scroll counter and the footer. */
 const CHROME_HEIGHT = 6;
+/** Leaves the transcript visible above the panel rather than filling the screen. */
+const MAX_PANEL_HEIGHT = 26;
+const MIN_PANEL_HEIGHT = 10;
+
+/**
+ * Rows the panel may occupy.
+ *
+ * It renders in the editor's slot at the bottom of the screen, so its height
+ * pushes the transcript up — hence the cap. `rows` is 0 when the terminal size
+ * is unknown, in which case the default keeps the panel a sensible size.
+ */
+export function panelHeight(rows: number): number {
+  if (!rows || rows <= 0) return MAX_PANEL_HEIGHT;
+  return Math.max(MIN_PANEL_HEIGHT, Math.min(MAX_PANEL_HEIGHT, rows - 8));
+}
 
 /**
  * The interactive `/status` panel.
@@ -118,11 +133,20 @@ export class DustStatusPanel implements Component {
     this.loader.ensureLoaded(STATUS_TABS[index], this.period);
   }
 
+  /**
+   * Tab bar with the active tab as a filled chip.
+   *
+   * The panel renders inline in the editor's slot, so it has no frame of its
+   * own; the chip is what makes the selection obvious at a glance.
+   */
   private renderTabBar(): string {
     const th = this.theme;
-    return `  ${STATUS_TABS.map((tab, index) => (
-      index === this.tabIndex ? th.bold(th.fg("accent", tab.label)) : th.fg("dim", tab.label)
-    )).join("   ")}`;
+    const tabs = STATUS_TABS.map((tab, index) => (
+      index === this.tabIndex
+        ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${tab.label} `)))
+        : th.fg("dim", ` ${tab.label} `)
+    )).join(" ");
+    return `  ${th.bold(th.fg("accent", "Dust"))}  ${tabs}`;
   }
 
   private renderFooter(): string {
@@ -160,7 +184,7 @@ export class DustStatusPanel implements Component {
 
     const lines = [
       this.renderTabBar(),
-      th.fg("borderMuted", "  " + "─".repeat(Math.max(0, Math.min(width, 100) - 4))),
+      th.fg("borderMuted", `  ${"─".repeat(Math.max(0, width - 4))}`),
       ...visible,
     ];
 
