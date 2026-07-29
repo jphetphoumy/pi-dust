@@ -139,6 +139,14 @@ function readMentionedFile(path: string): Uint8Array<ArrayBuffer> | null {
   try {
     const stats = statSync(path);
     if (!stats.isFile()) {
+      // A folder is left to the agent's local tools rather than expanded here:
+      // uploading one is a bulk operation with a bill and a rate limit
+      // attached, and `@node_modules` should not be able to trigger it by
+      // accident. Logged so it does not look like the mention was missed.
+      debugLog("dust:files", "Mention does not name a file, leaving it to the agent", {
+        path,
+        isDirectory: stats.isDirectory(),
+      });
       return null;
     }
     const limit = isImagePath(path) ? ATTACHMENT_MAX_IMAGE_BYTES : ATTACHMENT_MAX_TEXT_BYTES;

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -332,8 +332,19 @@ describe("parseUserMessage: @ mentions typed in the TUI", () => {
     expect(parsed.attachments).toEqual([]);
   });
 
+  // Uploading a folder would be a bulk operation with a bill attached — the
+  // agent can still explore it with the local tools, as it does today.
   it("ignores a mention that names a directory", () => {
     const parsed = parseUserMessage({ role: "user", content: "@." }, dir);
+    expect(parsed.attachments).toEqual([]);
+  });
+
+  it("ignores a directory mentioned with a trailing slash, as the autocomplete writes it", () => {
+    mkdirSync(join(dir, "nested"), { recursive: true });
+    writeLargeFile(join("nested", "inside.ts"));
+
+    const parsed = parseUserMessage({ role: "user", content: "@nested/ summarise" }, dir);
+
     expect(parsed.attachments).toEqual([]);
   });
 
