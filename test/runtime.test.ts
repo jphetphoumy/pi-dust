@@ -11,7 +11,7 @@ import {
   shouldRefreshAccessToken,
 } from "../src/dust-runtime.js";
 import { persistCredentialState } from "../src/dust-state.js";
-import { agentDir, makeCredentials, readState, seedLoggedIn, sessionPath, useTempAgentDir } from "./helpers/dust-fixtures.js";
+import { agentDir, makeCredentials, makeSessionContext, readState, seedLoggedIn, sessionPath, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust runtime", () => {
   useTempAgentDir();
@@ -253,14 +253,10 @@ describe("dust runtime", () => {
       const runtime = new DustSessionRuntime();
       const fetchMock = vi.fn();
       globalThis.fetch = fetchMock as never;
-      runtime.sessionContext = {
-        getSessionFile: () => undefined,
-        saveConversationId: () => {},
-        getCredentials: () => makeCredentials() as never,
-        setCredentials: () => {},
+      runtime.sessionContext = makeSessionContext({
         resolveAccessToken: async () => "host-token",
         getAccessToken: () => "stale",
-      };
+      });
 
       await expect(runtime.refreshAccessToken()).resolves.toBe(true);
 
@@ -278,14 +274,11 @@ describe("dust runtime", () => {
         status: 200,
         json: () => Promise.resolve({ access_token: "direct-token", refresh_token: "new-ref", expires_in: 3600 }),
       })) as never;
-      runtime.sessionContext = {
-        getSessionFile: () => undefined,
-        saveConversationId: () => {},
-        getCredentials: () => makeCredentials() as never,
+      runtime.sessionContext = makeSessionContext({
         setCredentials,
         resolveAccessToken: async () => null,
         getAccessToken: () => "stale",
-      };
+      });
 
       await expect(runtime.refreshAccessToken()).resolves.toBe(true);
 
@@ -301,14 +294,11 @@ describe("dust runtime", () => {
         status: 200,
         json: () => Promise.resolve({ access_token: "direct-token", refresh_token: "new-ref", expires_in: 3600 }),
       })) as never;
-      runtime.sessionContext = {
-        getSessionFile: () => undefined,
-        saveConversationId: () => {},
+      runtime.sessionContext = makeSessionContext({
         getCredentials: () => null,
-        setCredentials: () => {},
         resolveAccessToken: async () => null,
         getAccessToken: () => "",
-      };
+      });
 
       await expect(runtime.refreshAccessToken(fallback as never)).resolves.toBe(true);
       expect(runtime.currentAccessToken()).toBe("direct-token");
@@ -317,17 +307,31 @@ describe("dust runtime", () => {
     it("returns false, and leaves nothing held, when neither path produces a token", async () => {
       const runtime = new DustSessionRuntime();
       globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 400 })) as never;
-      runtime.sessionContext = {
-        getSessionFile: () => undefined,
-        saveConversationId: () => {},
-        getCredentials: () => makeCredentials() as never,
-        setCredentials: () => {},
+      runtime.sessionContext = makeSessionContext({
         resolveAccessToken: async () => null,
         getAccessToken: () => "stale",
-      };
+      });
 
       await expect(runtime.refreshAccessToken()).resolves.toBe(false);
       expect(runtime.currentAccessToken()).toBe("stale");
+    });
+
+    it("returns false and never calls fetch when there are no credentials at all (issue #40 divergence point)", async () => {
+      // This is the exact branch where the old credits-local refresh and the
+      // old stream-local refresh used to diverge: credits returned false
+      // here, stream fell back to its own `liveCred`. With no
+      // fallbackCredentials passed either, refreshAccessToken() must bail out
+      // before ever touching the network.
+      const runtime = new DustSessionRuntime();
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock as never;
+      runtime.sessionContext = makeSessionContext({
+        getCredentials: () => null,
+        resolveAccessToken: async () => null,
+      });
+
+      await expect(runtime.refreshAccessToken()).resolves.toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it("single-flights concurrent callers into one refresh", async () => {
@@ -337,17 +341,13 @@ describe("dust runtime", () => {
       const runtime = new DustSessionRuntime();
       let resolveAccessTokenCalls = 0;
       let resolveHost!: (token: string | null) => void;
-      runtime.sessionContext = {
-        getSessionFile: () => undefined,
-        saveConversationId: () => {},
-        getCredentials: () => makeCredentials() as never,
-        setCredentials: () => {},
+      runtime.sessionContext = makeSessionContext({
         resolveAccessToken: () => {
           resolveAccessTokenCalls++;
           return new Promise((resolve) => { resolveHost = resolve; });
         },
         getAccessToken: () => "stale",
-      };
+      });
 
       const first = runtime.refreshAccessToken();
       const second = runtime.refreshAccessToken();
@@ -366,21 +366,18 @@ describe("dust runtime", () => {
       const runtime = new DustSessionRuntime();
       let resolveAccessTokenCalls = 0;
       let resolveHost!: (token: string | null) => void;
-      runtime.sessionContext = {
-        getSessionFile: () => undefined,
-        saveConversationId: () => {},
-        getCredentials: () => makeCredentials() as never,
-        setCredentials: () => {},
+      runtime.sessionContext = makeSessionContext({
         resolveAccessToken: () => {
           resolveAccessTokenCalls++;
           return new Promise((resolve) => { resolveHost = resolve; });
         },
         getAccessToken: () => "stale",
-      };
+      });
+      const refreshSpy = vi.spyOn(runtime, "refreshAccessToken");
 
       let usageCalls = 0;
       const fetchMock = vi.fn((url: string, init?: { headers: Record<string, string> }) => {
-        if (!url.includes("credits/my-usage")) return Promise.resolve({ ok: false, status: 401 });
+        if (!url.includes("credits/my-usage")) throw new Error(`unexpected fetch: ${url}`);
         usageCalls++;
         return Promise.resolve(
           init?.headers.Authorization === "Bearer shared-token"
@@ -395,7 +392,12 @@ describe("dust runtime", () => {
       // Stream-provider call site, closing over its own `liveCred` fallback.
       const streamPromise = runtime.refreshAccessToken(makeCredentials({ access: "other" }) as never);
 
-      await vi.waitFor(() => expect(resolveAccessTokenCalls).toBe(1));
+      // Wait for both call sites to have actually joined the flight — not
+      // just for the first to have started it — before letting the host
+      // token resolve. Waiting on resolveAccessTokenCalls alone would pass
+      // trivially, since the stream call site's own refreshAccessToken() call
+      // above already bumps it to 1 synchronously.
+      await vi.waitFor(() => expect(refreshSpy).toHaveBeenCalledTimes(2));
       resolveHost("shared-token");
 
       await expect(streamPromise).resolves.toBe(true);

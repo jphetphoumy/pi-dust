@@ -197,7 +197,7 @@ export function registerDustStatusCommand(pi: ExtensionAPI, runtime: DustSession
         return;
       }
 
-      const opened = await openStatusPanel(runtime, runtimeCtx, target, signal);
+      const opened = await openStatusPanel(runtime, runtimeCtx, target.baseUrl, signal);
       if (opened) return;
 
       // No interactive UI (headless, RPC, or a pi without ui.custom): fall back
@@ -229,7 +229,7 @@ export function registerDustStatusCommand(pi: ExtensionAPI, runtime: DustSession
 async function openStatusPanel(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,
-  target: StatusTarget,
+  baseUrl: string,
   signal?: AbortSignal,
 ): Promise<boolean> {
   const custom = (ctx.ui as { custom?: CustomUi } | undefined)?.custom;
@@ -248,7 +248,7 @@ async function openStatusPanel(
   await custom<undefined>((tui, theme, _keybindings, done) => {
     loader = new StatusLoader(
       runtime,
-      target.baseUrl,
+      baseUrl,
       () => tui.requestRender(),
       signal,
       tracker.dirty ? null : tracker.lastOverview,

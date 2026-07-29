@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DustSessionRuntime, type SessionContextController } from "../src/dust-runtime.js";
+import { DustSessionRuntime } from "../src/dust-runtime.js";
 import { StatusLoader } from "../src/dust-status-loader.js";
 import { DustStatusPanel, panelHeight, truncate } from "../src/dust-status-panel.js";
 import { renderBreakdownRows, renderBreakdownTab, renderOverviewTab, spinnerFrame } from "../src/dust-status-tab-render.js";
@@ -13,7 +13,7 @@ import {
   tabCacheKey,
 } from "../src/dust-status-tabs.js";
 import type { DustStatusData } from "../src/dust-types.js";
-import { useTempAgentDir } from "./helpers/dust-fixtures.js";
+import { makeSessionContext, useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 /** Theme is only ever used for styling, so identity functions keep assertions plain. */
 const THEME = {
@@ -25,21 +25,17 @@ const THEME = {
   inverse: (text: string) => text,
 } as never;
 
-const SESSION_CONTEXT: SessionContextController = {
-  getSessionFile: () => undefined,
-  saveConversationId: () => {},
-  getCredentials: () => ({ type: "oauth", access: "tok", refresh: "r", expires: Date.now() + 1e6 }),
-  setCredentials: () => {},
-  resolveAccessToken: async () => "tok",
-  getAccessToken: () => "tok",
-};
+const SESSION_CONTEXT = makeSessionContext({
+  getCredentials: () => ({ type: "oauth", access: "tok", refresh: "r", expires: Date.now() + 1e6 }) as never,
+});
 
 // StatusLoader reads through a runtime (so credit fetches share the in-memory
 // refreshed-token holder and single-flight guard with the rest of the
 // extension), not a bare session controller — wire one up with the same
-// behavior the old inline stub had.
-const RUNTIME = new DustSessionRuntime();
-RUNTIME.sessionContext = SESSION_CONTEXT;
+// behavior the old inline stub had. Rebuilt fresh in `beforeEach` below so
+// mutable runtime state (a held refreshed token, an in-flight refresh) never
+// leaks from one test into the next.
+let RUNTIME: DustSessionRuntime;
 
 const OVERVIEW: DustStatusData = {
   workspaceName: "Acme", region: "us-central1", agentName: "@dust",
@@ -69,7 +65,11 @@ describe("dust /status panel", () => {
   useTempAgentDir();
 
   let originalFetch: typeof globalThis.fetch;
-  beforeEach(() => { originalFetch = globalThis.fetch; });
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    RUNTIME = new DustSessionRuntime();
+    RUNTIME.sessionContext = SESSION_CONTEXT;
+  });
   afterEach(() => { globalThis.fetch = originalFetch; vi.restoreAllMocks(); });
 
   describe("tabs", () => {

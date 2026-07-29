@@ -185,15 +185,18 @@ export class DustSessionRuntime {
    * The most recently refreshed access token, held in memory with an expiry.
    *
    * Invariants:
-   * - **Written by**: `refreshAuth`'s two branches (dust-stream-provider.ts,
-   *   shared single-flight via `refreshInFlight` below), the pre-stream
-   *   refresh block in `dustRealStream`, and `refreshExpiredToken` at
-   *   session_start (dust-session-events.ts) — every place that resolves a
-   *   token outside of pi's own persisted storage.
+   * - **Written by**: `refreshAccessToken()` below (its own two branches;
+   *   `refreshAuth` in dust-stream-provider.ts is now a one-line delegate to
+   *   it), the pre-stream refresh block in `dustRealStream`
+   *   (dust-stream-provider.ts), and `refreshExpiredToken` at session_start
+   *   (dust-session-events.ts) — every place that resolves a token outside of
+   *   pi's own persisted storage. The latter two still hand-roll their own
+   *   refresh body rather than calling `refreshAccessToken()`; see that
+   *   method's doc for why they're out of scope here.
    * - **Read by**: `DustSessionRuntime#currentAccessToken()`, the single
-   *   accessor every `getAuthHeaders()`/auth-header builder in
-   *   dust-stream-provider.ts must go through — never read this field
-   *   directly.
+   *   accessor every auth-header builder in dust-stream-provider.ts and
+   *   `dust-credits.ts`'s `fetchCreditsJson` must go through — never read
+   *   this field directly.
    * - **Expires**: entries carry their own `expiresAt` and are ignored (and
    *   dropped) once past it, falling through to storage instead. This is
    *   what makes it safe for it to unconditionally win otherwise: a stale
@@ -341,12 +344,13 @@ export class DustSessionRuntime {
   }
 
   /**
-   * The single accessor every auth-header builder in dust-stream-provider.ts
-   * must go through, instead of each hand-rolling its own `||` chain over
-   * `refreshedAccessToken` and storage. Prefers the in-memory holder while it
-   * is still within its assumed lifetime — since storage cannot carry a
-   * directly-refreshed token at all (see `refreshedAccessToken`'s doc) — and
-   * otherwise falls through to whatever is currently persisted.
+   * The single accessor every auth-header builder in dust-stream-provider.ts,
+   * and `dust-credits.ts`'s credit fetches, must go through — instead of each
+   * hand-rolling its own `||` chain over `refreshedAccessToken` and storage.
+   * Prefers the in-memory holder while it is still within its assumed
+   * lifetime — since storage cannot carry a directly-refreshed token at all
+   * (see `refreshedAccessToken`'s doc) — and otherwise falls through to
+   * whatever is currently persisted.
    */
   currentAccessToken(): string {
     const held = this.refreshedAccessToken;
@@ -365,13 +369,26 @@ export class DustSessionRuntime {
   /**
    * Refreshes the access token, single-flighted on `refreshInFlight`.
    *
-   * Every caller — the event stream, the MCP listener/heartbeat
-   * (dust-stream-provider.ts), and `/status` credit fetches (dust-credits.ts)
-   * — hits this same method instead of each rolling its own refresh body, so
-   * there is exactly one implementation to keep in sync with WorkOS's
-   * refresh-token rotation, and a 401 concurrent with another caller's
-   * refresh awaits that one attempt instead of racing it with a second direct
-   * refresh against the same (now-rotated) refresh token.
+   * Scope: this is the single implementation for 401-recovery refreshes.
+   * Every 401-recovery caller — the event stream, the MCP listener/heartbeat
+   * (dust-stream-provider.ts, via the one-line `refreshAuth` delegate), and
+   * `/status` credit fetches (dust-credits.ts) — hits this same method
+   * instead of each rolling its own refresh body, so a 401 concurrent with
+   * another caller's refresh awaits that one attempt instead of racing it
+   * with a second direct refresh against the same (now-rotated) refresh
+   * token.
+   *
+   * Out of scope: two other refresh bodies predate this method and are *not*
+   * merged into it — the proactive pre-stream refresh block in
+   * `dustRealStream` (dust-stream-provider.ts, gated on
+   * `shouldRefreshAccessToken`) and `refreshExpiredToken` at session_start
+   * (dust-session-events.ts). Both still hand-roll their own host-token-then-
+   * direct-refresh body and do not go through `refreshInFlight`, so a turn
+   * starting (which runs the pre-stream refresh) while `/status` triggers a
+   * credits refresh can still race two direct refreshes against the same
+   * rotating refresh token. Folding those two into this method is a real
+   * behavior change (careful handling of `liveCred` updates and
+   * `isSessionExpiredError` needed) and is intentionally left for later work.
    *
    * Prefers pi's own `resolveAccessToken` host path, which persists the
    * rotation to auth.json itself; falls back to a direct WorkOS refresh
