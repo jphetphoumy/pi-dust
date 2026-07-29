@@ -91,8 +91,13 @@ export interface PendingAttachment {
   bytes: Uint8Array<ArrayBuffer>;
   /** Content hash, used to skip re-uploading the same file in one conversation. */
   hash: string;
-  /** The exact text — an inlined `<file>` block or an `@` mention — this replaces. */
+  /** The exact text — an inlined `<file>` block or an `@` mention — this came from. */
   marker: string;
+  /**
+   * Whether the marker carries the file's body. Only an inlined one has to be
+   * rewritten; a mention already names the file as briefly as it can be named.
+   */
+  inlined: boolean;
   /** Where `marker` sits in the message, so rewriting one never hits another. */
   start: number;
   end: number;

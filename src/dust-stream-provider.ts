@@ -66,20 +66,19 @@ function buildToolGuidance(cwd: string): string {
     "- NEVER use `files__create`, `files__edit` or any other `files__*` tool to write the user's files:",
     "  those write to Dust conversation storage, not to the user's machine, and the user cannot use them.",
     "- Do not create files with bash heredocs; use the write tool.",
-    "- A `<file name=\"...\" attached=\"fil_...\" />` tag means the user attached that local file to this",
-    "  conversation. Read it with `conversation_files__cat` (or `files__cat`) using the attached id —",
-    `  that copy is a snapshot, so edit the local path with \`${MCP_TOOL_PREFIX}__edit\`.`,
+    "- An `@path` in the user's message is a local file attached to this conversation: read the",
+    "  attachment, but edit the local path — the attached copy is a snapshot.",
   ].join("\n");
 }
 
 /**
  * A title from what the user typed, not from the files they attached.
  *
- * The first 50 characters of an `@`-mentioned message are the attachment
- * pointers, which would leave every such conversation titled `<file name=...`.
+ * The first 50 characters of an `@`-mentioned message are the paths, which
+ * would leave every such conversation titled `@/home/…/src/`.
  */
 function buildConversationTitle(userText: string): string {
-  const typed = userText.replace(/<file name="[^"]*"[^>]*\/>\n?/g, "").trim();
+  const typed = userText.replace(/(^|\s)@("[^"]+"|\S+)/g, "").trim();
   const title = typed || userText;
   return title.substring(0, 50) + (title.length > 50 ? "..." : "");
 }

@@ -14,6 +14,7 @@ function makeAttachment(overrides: Partial<PendingAttachment> = {}): PendingAtta
     marker: '<file name="/home/dev/app/src/big.ts">\nconst answer = 42;\n</file>\n',
     start: 0,
     end: 60,
+    inlined: true,
     ...overrides,
   };
 }

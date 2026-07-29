@@ -179,7 +179,7 @@ describe("@file attachments in a turn", () => {
 
     const create = bodyOf(fetchMock, (url) => url.endsWith("/assistant/conversations"));
     expect(create.contentFragments).toEqual([{ title: "big.ts", fileId: "fil_1" }]);
-    expect(create.message.content).toContain(`<file name="${filePath}" attached="fil_1" />`);
+    expect(create.message.content).toContain(`@${filePath}`);
     expect(create.message.content).toContain("explain this");
     expect(create.message.content).not.toContain(fileContent);
   });
@@ -195,7 +195,10 @@ describe("@file attachments in a turn", () => {
       .toBe("why is this slow?");
   });
 
-  it("tells the agent it can read attached files without paying for them", async () => {
+  // Dust already tells the agent how to read an attachment, and it did so
+  // unprompted in a live run. The one thing it cannot know is that edits belong
+  // to the local path rather than to the conversation's snapshot.
+  it("tells the agent that an @path is attached but edited locally", async () => {
     const streamSimple = await setup();
     const fetchMock = makeTurnFetch();
     vi.stubGlobal("fetch", fetchMock);
@@ -203,7 +206,7 @@ describe("@file attachments in a turn", () => {
     await runTurn(streamSimple, inlinedMessage());
 
     const create = bodyOf(fetchMock, (url) => url.endsWith("/assistant/conversations"));
-    expect(create.message.content).toContain("conversation_files__cat");
+    expect(create.message.content).toContain("edit the local path");
   });
 
   it("attaches a content fragment to a conversation that already exists", async () => {
@@ -219,7 +222,7 @@ describe("@file attachments in a turn", () => {
     expect(bodyOf(fetchMock, (url) => url.includes("/content_fragments")))
       .toEqual({ title: "big.ts", fileId: "fil_1" });
     expect(bodyOf(fetchMock, (url) => url.endsWith("/messages")).content)
-      .toContain(`<file name="${filePath}" attached="fil_1" />`);
+      .toContain(`@${filePath}`);
   });
 
   it("does not upload the same file twice in one conversation", async () => {
@@ -235,7 +238,7 @@ describe("@file attachments in a turn", () => {
     const fragments = fetchMock.mock.calls.filter(([url]: [string]) => url.includes("/content_fragments"));
     expect(fragments).toHaveLength(0);
     expect(bodyOf(fetchMock, (url) => url.endsWith("/messages")).content)
-      .toContain(`<file name="${filePath}" attached="fil_1" />`);
+      .toContain(`@${filePath}`);
   });
 
   it("re-uploads when the conversation the file was meant for was never created", async () => {
@@ -311,7 +314,7 @@ describe("@file attachments in a turn", () => {
     expect(bodyOf(fetchMock, (url) => url.endsWith("/files"))).toMatchObject({ fileName: "big.ts" });
     const create = bodyOf(fetchMock, (url) => url.endsWith("/assistant/conversations"));
     expect(create.contentFragments).toEqual([{ title: "big.ts", fileId: "fil_1" }]);
-    expect(create.message.content).toContain(`<file name="${filePath}" attached="fil_1" /> explain this`);
+    expect(create.message.content).toContain("@big.ts explain this");
   });
 
   it("leaves a message with no attachment untouched", async () => {

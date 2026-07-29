@@ -221,14 +221,31 @@ describe("parseUserMessage", () => {
 });
 
 describe("applyAttachmentPointers", () => {
-  it("replaces the inlined body with a pointer carrying the local path and file id", () => {
+  it("replaces an inlined body with a bare mention of the local path", () => {
     const { path, content } = writeLargeFile("pointer.ts");
     const text = `${textMarker(path, content)}explain`;
     const parsed = parseUserMessage({ role: "user", content: text }, dir);
 
     const rewritten = applyAttachmentPointers(text, [attached(parsed.attachments[0], "fil_123")]);
 
-    expect(rewritten).toBe(`<file name="${path}" attached="fil_123" />\nexplain`);
+    expect(rewritten).toBe(`@${path}\nexplain`);
+  });
+
+  // Dust renders every attachment into the model's context itself, with its id,
+  // title and a snippet. Repeating that inline would pay twice for it; the only
+  // thing Dust cannot know is the local path, which the mention already is.
+  it("leaves a mention exactly as the user typed it", () => {
+    writeLargeFile("as-typed.ts");
+    writeLargeFile("as-typed.ts.bak");
+    const text = "@as-typed.ts and @as-typed.ts.bak please";
+    const parsed = parseUserMessage({ role: "user", content: text }, dir);
+
+    const rewritten = applyAttachmentPointers(
+      text,
+      parsed.attachments.map((attachment) => attached(attachment, "fil_a")),
+    );
+
+    expect(rewritten).toBe(text);
   });
 
   it("leaves markers of attachments that were not uploaded untouched", () => {
@@ -248,24 +265,7 @@ describe("applyAttachmentPointers", () => {
       parsed.attachments.map((attachment) => attached(attachment, "fil_9")),
     );
 
-    expect(rewritten).toBe(
-      `<file name="${path}" attached="fil_9" />\n<file name="${path}" attached="fil_9" />\n`,
-    );
-  });
-
-  // A mention is bare text, so replacing it by string match would also hit
-  // `@big.ts.bak`, which is a different file.
-  it("rewrites a mention without touching a longer path that starts the same way", () => {
-    writeLargeFile("prefix-collide.ts");
-    writeLargeFile("prefix-collide.ts.bak");
-    const text = "@prefix-collide.ts and @prefix-collide.ts.bak";
-    const parsed = parseUserMessage({ role: "user", content: text }, dir);
-
-    const rewritten = applyAttachmentPointers(text, [attached(parsed.attachments[0], "fil_a")]);
-
-    expect(rewritten).toBe(
-      `<file name="${join(dir, "prefix-collide.ts")}" attached="fil_a" /> and @prefix-collide.ts.bak`,
-    );
+    expect(rewritten).toBe(`@${path}\n@${path}\n`);
   });
 });
 

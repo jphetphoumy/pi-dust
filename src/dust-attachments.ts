@@ -88,6 +88,7 @@ function makeAttachment(
   text: string,
   start: number,
   end: number,
+  inlined: boolean,
 ): PendingAttachment {
   return {
     path,
@@ -98,6 +99,7 @@ function makeAttachment(
     marker: text.slice(start, end),
     start,
     end,
+    inlined,
   };
 }
 
@@ -179,7 +181,7 @@ function parseMentions(text: string, from: number, cwd: string): PendingAttachme
     const bytes = readMentionedFile(path);
     if (!bytes || bytes.byteLength === 0) continue;
 
-    attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, start, end));
+    attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, start, end, false));
   }
 
   return attachments;
@@ -246,12 +248,12 @@ export function parseUserMessage(message: ChatMessageLike, cwd: string): ParsedU
       const bytes = Buffer.from(block.data, "base64");
       if (bytes.byteLength <= ATTACHMENT_MAX_IMAGE_BYTES) {
         const contentType = block.mimeType ?? contentTypeForPath(path);
-        attachments.push(makeAttachment(path, contentType, bytes, text, position, markerEnd));
+        attachments.push(makeAttachment(path, contentType, bytes, text, position, markerEnd, true));
       }
     } else {
       const bytes = Buffer.from(diskContent as string, "utf8");
       if (bytes.byteLength >= ATTACHMENT_MIN_TEXT_BYTES) {
-        attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, position, markerEnd));
+        attachments.push(makeAttachment(path, contentTypeForPath(path), bytes, text, position, markerEnd, true));
       }
     }
 
@@ -279,26 +281,32 @@ export function parseUserMessage(message: ChatMessageLike, cwd: string): ParsedU
 }
 
 /**
- * Swaps each uploaded file's marker for a pointer to the conversation
- * attachment. The local path stays in the pointer: the copy in the conversation
- * is a read-only snapshot, and edits still have to target the file on disk.
+ * Drops the body of every file that was uploaded, leaving a bare `@` mention of
+ * its local path.
  *
- * Rewriting happens by position rather than by string match, so one mention
- * never rewrites another that merely starts the same way (`@a.ts` inside
- * `@a.ts.bak`).
+ * Nothing else is added, because nothing else is missing: Dust renders each
+ * attachment into the model's context itself, with its file id, title and a
+ * snippet. The one thing it cannot know is where the file lives on the user's
+ * machine — which edits have to target, since the conversation's copy is a
+ * snapshot — and a mention already says that as briefly as it can be said.
+ * Mentions are therefore left exactly as typed.
+ *
+ * Rewriting happens by position rather than by string match, so one marker
+ * never rewrites another that merely starts the same way.
  */
 export function applyAttachmentPointers(text: string, attached: AttachedFile[]): string {
-  const ordered = [...attached].sort((a, b) => a.attachment.start - b.attachment.start);
+  const ordered = attached
+    .filter((entry) => entry.attachment.inlined)
+    .sort((a, b) => a.attachment.start - b.attachment.start);
   let rewritten = "";
   let position = 0;
 
-  for (const { attachment, fileId } of ordered) {
+  for (const { attachment } of ordered) {
     // A file attached twice yields two markers; a stale span would mean the
     // caller passed spans from a different text.
     if (attachment.start < position) continue;
-    const pointer = `<file name="${attachment.path}" attached="${fileId}" />`;
     rewritten += text.slice(position, attachment.start);
-    rewritten += attachment.marker.endsWith("\n") ? `${pointer}\n` : pointer;
+    rewritten += attachment.marker.endsWith("\n") ? `@${attachment.path}\n` : `@${attachment.path}`;
     position = attachment.end;
   }
 
