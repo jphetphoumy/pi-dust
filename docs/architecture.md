@@ -103,6 +103,102 @@ Responsibilities:
 - expose the `/workspace` command
 - prompt the user for workspace switching
 - persist the selected workspace in extension state
+- drop the cached credit figures, which belong to the workspace being left
+
+### `src/dust-status.ts`
+
+`/status` command registration.
+
+Responsibilities:
+
+- expose the read-only `/status` panel, interactive where the host supports it
+- open it inline via `ui.custom` *without* `overlay`, so pi swaps it into the
+  editor's slot: full width, above the prompt, editor restored on close
+- resolve the credit API target synchronously, so a not-logged-in run opens nothing
+- assemble session counters and the credit endpoints into one payload
+- decide what is refetched live and what is served from the session cache
+- fall back to a one-shot transcript panel when there is no custom-UI surface
+
+### `src/dust-status-tabs.ts`
+
+Tab and window definitions for the interactive panel.
+
+Responsibilities:
+
+- define the tabs: Overview plus one per Dust analytics dimension
+- define the `d`/`w`/`m` windows and the per-tab cache keys
+
+There is no "by model" tab: Dust meters credits (AWU) per message, and its
+analytics dimensions are `usage_type | agent | user | origin | api_key` only.
+There is no "by user" tab either — `my-usage-analytics` is already scoped to you.
+
+### `src/dust-status-loader.ts`
+
+Async state behind the panel.
+
+Responsibilities:
+
+- hold each tab as a loading/ready/error slice
+- fetch a tab the first time it is opened, once per tab and window
+- notify the component so it can repaint as data lands
+
+### `src/dust-status-panel.ts`
+
+The interactive overlay component.
+
+Responsibilities:
+
+- draw the tab bar (active tab as a filled chip), scroll indicator and footer hints
+- size itself from the terminal height, leaving the transcript visible above
+- handle ←/→/tab, ↑/↓, PgUp/PgDn, `d`/`w`/`m`, `r` and Esc
+- animate a spinner only while something is pending
+- truncate styled lines so the panel never reflows mid-gauge
+
+### `src/dust-status-tab-render.ts`
+
+Per-tab bodies.
+
+Responsibilities:
+
+- rank a breakdown, show shares and bars scaled to the largest row
+- render the loading, error and empty states
+
+### `src/dust-status-render.ts`
+
+Credit panel layout.
+
+Responsibilities:
+
+- draw the ASCII bar gauges
+- format credits, wall-clock durations and reset dates
+- omit sections whose data is missing or unusable
+
+### `src/dust-credits.ts`
+
+Private credit API client.
+
+Responsibilities:
+
+- resolve the `/api/w/:wId` base URL for the credential's region
+- fetch seat usage, fair-use allowance, the 30-day breakdown and top conversations
+- fetch the month/week/day credit totals as `groupBy`-less time series
+- refresh the access token and retry once on 401
+
+Period windows are sized so the *last* bucket of each series is a complete
+current period: Dust buckets on a `calendar_interval` over a trailing
+`[now - (days-1), now]` window, so 32 days always spans the 1st of the month and
+8 days always spans the current week's Monday.
+
+### `src/dust-ceiling.ts`
+
+Monthly credit ceiling resolution.
+
+Responsibilities:
+
+- resolve the ceiling the gauges fill against: `PI_DUST_MONTHLY_CREDITS`, then
+  the seat allocation, then the per-user spend cap, then a default of 8000
+- pro-rate that ceiling onto a week or a day, using the real length of the
+  current month
 
 ### `src/dust-auth.ts`
 
@@ -214,13 +310,21 @@ once the action has already been approved.
 src/
   dust.ts
   dust-auth.ts
+  dust-ceiling.ts
   dust-constants.ts
+  dust-credits.ts
   dust-debug.ts
   dust-mcp.ts
   dust-provider.ts
   dust-runtime.ts
   dust-session-events.ts
   dust-state.ts
+  dust-status.ts
+  dust-status-loader.ts
+  dust-status-panel.ts
+  dust-status-render.ts
+  dust-status-tab-render.ts
+  dust-status-tabs.ts
   dust-stream.ts
   dust-stream-provider.ts
   dust-tools.ts
@@ -246,4 +350,5 @@ Current suites cover:
 - stream parsing and reconnection
 - tool approval flow
 - workspace behavior
+- credit status panel: fetching, caching, tabs and rendering
 - debug logging and redaction

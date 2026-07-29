@@ -1,10 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { workspaceLabel } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
+import type { DustSessionRuntime } from "./dust-runtime.js";
 import { getStoredCredentials, patchDustState } from "./dust-state.js";
 import type { PiRuntimeContext, Workspace } from "./dust-types.js";
 
-export function registerDustWorkspaceCommand(pi: ExtensionAPI): void {
+export function registerDustWorkspaceCommand(pi: ExtensionAPI, runtime?: DustSessionRuntime): void {
   pi.registerCommand("workspace", {
     description: "Show current Dust workspace and switch between workspaces",
     handler: async (_args, ctx) => {
@@ -30,6 +31,9 @@ export function registerDustWorkspaceCommand(pi: ExtensionAPI): void {
       if (!picked || picked.sId === cred.workspaceId) return;
 
       patchDustState({ workspaceId: picked.sId });
+      // Credits are per workspace, so every cached figure — and the session
+      // baseline they are measured against — belongs to the workspace we left.
+      runtime?.credits.reset();
       debugLog("dust:session", "Switched workspace", { from: cred.workspaceId, to: picked.sId, name: picked.name });
       runtimeCtx.ui?.notify?.(`Switched to workspace: ${picked.name}`, "info");
     },

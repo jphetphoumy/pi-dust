@@ -120,6 +120,8 @@ Tests are intentionally grouped by domain:
 - `test/stream.test.ts`
 - `test/tool-approval.test.ts`
 - `test/workspace.test.ts`
+- `test/dust-status.test.ts`
+- `test/dust-status-panel.test.ts`
 - `test/debug.test.ts`
 
 Shared fixtures live in `test/helpers/dust-fixtures.ts`.

@@ -231,6 +231,94 @@ export interface PiEventStream {
   [Symbol.asyncIterator](): AsyncIterator<PiStreamEvent>;
 }
 
+/**
+ * Per-member credit usage, from `GET /api/w/:wId/credits/my-usage`.
+ *
+ * This is a private (session-authenticated) Dust endpoint, so every field is
+ * optional at runtime: a shape change upstream must blank a row of the panel,
+ * not throw.
+ */
+export interface MemberUsage {
+  consumedAwuCredits: number | null;
+  consumedFromAllowanceAwuCredits: number | null;
+  consumedFromPoolAwuCredits: number | null;
+  memberUsageLimit: number | null;
+  seatBalanceAwu: number | null;
+  spendLimitAwuCredits: number | null;
+  spendLimitSource: string | null;
+  nextCreditResetAt: string | null;
+  billingFrequency: string | null;
+  seatType: string | null;
+  creditState: string | null;
+  nearLimit: boolean | null;
+}
+
+/** Fair-use allowance for free plans, where `my-usage` reports no seat allocation. */
+export interface FairUseCredits {
+  /** -1 means unlimited. */
+  limit: number | null;
+  timeframe: string | null;
+  count: number | null;
+}
+
+export interface CreditBreakdownEntry {
+  label: string;
+  credits: number;
+}
+
+/** Analytics dimensions Dust can group credit usage by. */
+export type CreditGroupBy = "usage_type" | "agent" | "origin" | "api_key";
+
+export interface UsageAnalytics {
+  granularity: string | null;
+  groups: CreditBreakdownEntry[];
+}
+
+/** One calendar-aligned (UTC) bucket of the credit time series. */
+export interface CreditBucket {
+  startMs: number;
+  credits: number;
+}
+
+export interface CreditSeries {
+  granularity: string | null;
+  buckets: CreditBucket[];
+}
+
+/**
+ * The three period totals `/status` leads with. Each is the last bucket of its
+ * own series, so it is the current, in-progress calendar period.
+ */
+export interface CreditTotals {
+  month: CreditSeries | null;
+  week: CreditSeries | null;
+  day: CreditSeries | null;
+}
+
+export interface TopConversations {
+  conversations: CreditBreakdownEntry[];
+}
+
+/** Everything `/status` renders, assembled from up to four endpoints. */
+export interface DustStatusData {
+  workspaceName: string;
+  region: string;
+  agentName: string | null;
+  durationMs: number;
+  messagesSent: number;
+  sessionCredits: number | null;
+  sessionBaselineAt: number | null;
+  usage: MemberUsage | null;
+  fairUse: FairUseCredits | null;
+  totals: CreditTotals;
+  /** Monthly credit ceiling the gauges are drawn against. */
+  monthlyCeiling: number;
+  /** True when the ceiling is the configured fallback, not one Dust reported. */
+  ceilingIsFallback: boolean;
+  analytics: UsageAnalytics | null;
+  topConversations: TopConversations | null;
+}
+
 export interface LoginCallbacks {
   onAuth: (params: { url: string; instructions: string }) => void;
   onProgress?: (message: string) => void;
