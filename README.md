@@ -16,9 +16,10 @@ tool bridge (`bash`, `read`, `edit`) with local approval.
 - Dust agents exposed as Pi models
 - Conversation reuse across turns
 - SSE streaming with tool approval support
-- `@file` mentions uploaded to the Dust conversation instead of pasted into the
-  message: images reach the agent instead of being dropped, and a file's body is
-  not re-billed as prompt tokens on every later turn
+- `@file` mentions uploaded to the Dust conversation — typed in the prompt or
+  passed on the command line: images reach the agent instead of being dropped or
+  left as an unreadable path, and an inlined file's body is not re-billed as
+  prompt tokens on every later turn
 - `/status` credit panel — a tabbed, keyboard-driven inline panel:
   - **Overview**: session usage, plus month / week / day gauges
   - **Agents · Type · Source · API key**: credit breakdowns, with `d`/`w`/`m` to

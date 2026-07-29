@@ -51,13 +51,20 @@ Responsibilities:
 
 ### `src/dust-attachments.ts`
 
-Splits pi's `@file` inlining back out of a user message.
+Finds the files a user attached with `@`. pi produces two different forms, and
+both land here:
 
-pi's CLI file processor prefixes the message with a `<file name="...">` marker
-per mentioned file: the whole body for a text file, an empty tag for an image
-whose bytes ride along as a separate `image` content block. Left as is, the
-text bodies are billed as prompt tokens on every later turn of the conversation
-and the images are dropped entirely, since only `text` blocks reach Dust.
+- **the CLI inlines.** `pi @foo.ts "..."` prefixes the message with a
+  `<file name="...">` marker per file: the whole body for a text file, an empty
+  tag for an image whose bytes ride along as a separate `image` content block.
+  Left as is, the text bodies are billed as prompt tokens on every later turn of
+  the conversation and the images are dropped entirely, since only `text` blocks
+  reach Dust.
+- **the interactive editor does not.** Its `@` is a path autocomplete: it writes
+  `@path` into the message as plain text and leaves reading it to the agent.
+  Nothing has to be undone for these, but uploading still pays off — and for an
+  image it is the difference between the model seeing it and the agent staring
+  at a path it cannot open.
 
 Responsibilities:
 
@@ -65,9 +72,13 @@ Responsibilities:
   when its body still matches the file on disk byte for byte, so a
   `<file name="...">` the user typed is never mistaken for an attachment
 - pair image blocks with their markers, keeping pi's resized bytes
-- leave small files inline, where an upload plus a `cat` round trip costs more
+- recognise `@path` mentions that name a real file, resolved against the
+  session's working directory, and read those from disk
+- leave small text files alone, where an upload plus a `cat` round trip costs
+  more than what it saves
 - rewrite an attached file's marker into a pointer that keeps the local path,
-  so edits still target the file on disk rather than the conversation snapshot
+  so edits still target the file on disk rather than the conversation snapshot.
+  Rewriting is by position, so `@a.ts` never rewrites the `@a.ts` in `@a.ts.bak`
 
 ### `src/dust-files.ts`
 
