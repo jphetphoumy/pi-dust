@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { refreshToken } from "./dust-auth.js";
+import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import {
   getStoredCredentials,
@@ -377,6 +378,15 @@ export class DustSessionRuntime {
    * (`fallbackCredentials` is the caller's own best snapshot of the current
    * credentials, used only if `sessionContext` itself has none — e.g. a
    * turn's `liveCred` closed over before this call).
+   *
+   * `fallbackCredentials` only matters for whichever call *starts* the
+   * flight — a second, concurrent caller just awaits `refreshInFlight` and
+   * never gets its own fallback considered. This can't bite in practice
+   * (every caller's `sessionContext.getCredentials()` reads the same stored
+   * credential, so the fallback is only ever reached when that read is
+   * already null for everyone), but it's the shape of the divergent-bodies
+   * defect this method exists to prevent, so don't reintroduce a per-caller
+   * refresh body to "fix" it.
    */
   async refreshAccessToken(fallbackCredentials?: DustCredentials): Promise<boolean> {
     this.refreshInFlight ??= (async (): Promise<boolean> => {
@@ -403,7 +413,10 @@ export class DustSessionRuntime {
         }
         return Boolean(refreshed.access);
       } catch (err) {
-        debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
+        debugLog("dust:session", "Refresh after 401 failed", {
+          expired: errorMessage(err) === SESSION_EXPIRED_MESSAGE,
+          error: errorMessage(err),
+        });
         return false;
       }
     })().finally(() => {

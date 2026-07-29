@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchCreditsJson } from "../src/dust-credits.js";
 import {
   applyRuntimeContext,
   buildSessionContext,
@@ -355,6 +356,52 @@ describe("dust runtime", () => {
       await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
       expect(resolveAccessTokenCalls).toBe(1);
       expect(runtime.currentAccessToken()).toBe("shared-token");
+    });
+
+    it("dedupes a credits fetch's 401 with a concurrent stream-provider-style refresh call", async () => {
+      // dust-credits.ts's call site (`runtime.refreshAccessToken()`, no
+      // fallback) and dust-stream-provider.ts's (`runtime.refreshAccessToken(liveCred)`,
+      // with one) must land on the very same in-flight refresh when they race,
+      // not just when the same call site races itself.
+      const runtime = new DustSessionRuntime();
+      let resolveAccessTokenCalls = 0;
+      let resolveHost!: (token: string | null) => void;
+      runtime.sessionContext = {
+        getSessionFile: () => undefined,
+        saveConversationId: () => {},
+        getCredentials: () => makeCredentials() as never,
+        setCredentials: () => {},
+        resolveAccessToken: () => {
+          resolveAccessTokenCalls++;
+          return new Promise((resolve) => { resolveHost = resolve; });
+        },
+        getAccessToken: () => "stale",
+      };
+
+      let usageCalls = 0;
+      const fetchMock = vi.fn((url: string, init?: { headers: Record<string, string> }) => {
+        if (!url.includes("credits/my-usage")) return Promise.resolve({ ok: false, status: 401 });
+        usageCalls++;
+        return Promise.resolve(
+          init?.headers.Authorization === "Bearer shared-token"
+            ? { ok: true, status: 200, json: () => Promise.resolve({ member: {} }) }
+            : { ok: false, status: 401 },
+        );
+      });
+      globalThis.fetch = fetchMock as never;
+
+      // Credits call site.
+      const creditsPromise = fetchCreditsJson(runtime, "https://x/api/w/w1/credits/my-usage");
+      // Stream-provider call site, closing over its own `liveCred` fallback.
+      const streamPromise = runtime.refreshAccessToken(makeCredentials({ access: "other" }) as never);
+
+      await vi.waitFor(() => expect(resolveAccessTokenCalls).toBe(1));
+      resolveHost("shared-token");
+
+      await expect(streamPromise).resolves.toBe(true);
+      await expect(creditsPromise).resolves.toEqual({ member: {} });
+      expect(resolveAccessTokenCalls).toBe(1);
+      expect(usageCalls).toBe(2);
     });
   });
 });

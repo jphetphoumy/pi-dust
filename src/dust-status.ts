@@ -43,7 +43,11 @@ type CustomUi = <T>(
 ) => Promise<T>;
 
 /**
- * Assembles the panel's data.
+ * Resolves the panel's target, and — despite the name — is not purely a
+ * resolver: it lazily wires `runtime.sessionContext` in place the first time
+ * `/status` runs before any `session_start` has done so (see the comment on
+ * that assignment below). Idempotent and safe to call more than once per
+ * command, which is what both callers below do.
  *
  * Live figures (seat balance, spend cap, reset date) are refetched whenever the
  * session has advanced since the last read — a user who just ran a few turns

@@ -38,8 +38,8 @@ const SESSION_CONTEXT: SessionContextController = {
 // refreshed-token holder and single-flight guard with the rest of the
 // extension), not a bare session controller — wire one up with the same
 // behavior the old inline stub had.
-const SESSION = new DustSessionRuntime();
-SESSION.sessionContext = SESSION_CONTEXT;
+const RUNTIME = new DustSessionRuntime();
+RUNTIME.sessionContext = SESSION_CONTEXT;
 
 const OVERVIEW: DustStatusData = {
   workspaceName: "Acme", region: "us-central1", agentName: "@dust",
@@ -109,9 +109,9 @@ describe("dust /status panel", () => {
 
   describe("loader", () => {
     it("starts ready when handed a cached overview, and loading otherwise", () => {
-      expect(new StatusLoader(SESSION, "u", () => {}, undefined, OVERVIEW).overview)
+      expect(new StatusLoader(RUNTIME, "u", () => {}, undefined, OVERVIEW).overview)
         .toEqual({ status: "ready", value: OVERVIEW });
-      expect(new StatusLoader(SESSION, "u", () => {}).overview).toEqual({ status: "loading" });
+      expect(new StatusLoader(RUNTIME, "u", () => {}).overview).toEqual({ status: "loading" });
     });
 
     it("fetches a breakdown once per tab and window, then serves it from memory", async () => {
@@ -119,7 +119,7 @@ describe("dust /status panel", () => {
       globalThis.fetch = fetchMock as never;
 
       const onChange = vi.fn();
-      const loader = new StatusLoader(SESSION, "https://x/api/w/w1", onChange);
+      const loader = new StatusLoader(RUNTIME, "https://x/api/w/w1", onChange);
       const tab = STATUS_TABS[1];
 
       loader.ensureLoaded(tab, DEFAULT_PERIOD);
@@ -136,7 +136,7 @@ describe("dust /status panel", () => {
       const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(breakdownBody([["a", "@dust", 1]]))));
       globalThis.fetch = fetchMock as never;
 
-      const loader = new StatusLoader(SESSION, "https://x/api/w/w1", () => {});
+      const loader = new StatusLoader(RUNTIME, "https://x/api/w/w1", () => {});
       const tab = STATUS_TABS[1];
 
       loader.ensureLoaded(tab, STATUS_PERIODS[2]);
@@ -151,14 +151,14 @@ describe("dust /status panel", () => {
 
     it("records an error slice when a breakdown fails", async () => {
       globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse({}, 500))) as never;
-      const loader = new StatusLoader(SESSION, "https://x/api/w/w1", () => {});
+      const loader = new StatusLoader(RUNTIME, "https://x/api/w/w1", () => {});
 
       loader.ensureLoaded(STATUS_TABS[1], DEFAULT_PERIOD);
       await vi.waitFor(() => expect(loader.breakdown(STATUS_TABS[1], DEFAULT_PERIOD)?.status).toBe("error"));
     });
 
     it("keeps a previously-loaded overview when a refresh fails", () => {
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, OVERVIEW);
       loader.markOverviewRefreshing();
       loader.setOverview(new Error("boom"));
 
@@ -167,7 +167,7 @@ describe("dust /status panel", () => {
     });
 
     it("surfaces the error when there was nothing to fall back to", () => {
-      const loader = new StatusLoader(SESSION, "u", () => {});
+      const loader = new StatusLoader(RUNTIME, "u", () => {});
       loader.setOverview(new Error("boom"));
       expect(loader.overview).toEqual({ status: "error", message: "boom" });
     });
@@ -175,7 +175,7 @@ describe("dust /status panel", () => {
     it("does nothing for a tab that has no remote data", () => {
       const fetchMock = vi.fn();
       globalThis.fetch = fetchMock as never;
-      const loader = new StatusLoader(SESSION, "u", () => {});
+      const loader = new StatusLoader(RUNTIME, "u", () => {});
 
       loader.ensureLoaded(STATUS_TABS[0], DEFAULT_PERIOD);
       expect(fetchMock).not.toHaveBeenCalled();
@@ -250,7 +250,7 @@ describe("dust /status panel", () => {
     };
 
     it("renders the tab bar and a footer hint", () => {
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, OVERVIEW);
       const { panel } = makePanel(loader);
       const out = panel.render(100).join("\n");
 
@@ -264,7 +264,7 @@ describe("dust /status panel", () => {
 
     it("switches tabs with arrows and tab, and loads the newly shown tab", () => {
       globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse(breakdownBody([["a", "@dust", 1]])))) as never;
-      const loader = new StatusLoader(SESSION, "https://x/api/w/w1", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "https://x/api/w/w1", () => {}, undefined, OVERVIEW);
       const ensure = vi.spyOn(loader, "ensureLoaded");
       const { panel, requestRender } = makePanel(loader);
 
@@ -279,7 +279,7 @@ describe("dust /status panel", () => {
     });
 
     it("offers the window hint only where the window applies", () => {
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, OVERVIEW);
       const { panel } = makePanel(loader);
 
       expect(panel.render(120).join("\n")).not.toContain("d day");
@@ -290,7 +290,7 @@ describe("dust /status panel", () => {
 
     it("ignores the window keys on tabs that do not use them", () => {
       globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse(breakdownBody([["a", "@dust", 1]])))) as never;
-      const loader = new StatusLoader(SESSION, "https://x/api/w/w1", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "https://x/api/w/w1", () => {}, undefined, OVERVIEW);
       const { panel, requestRender } = makePanel(loader);
 
       panel.handleInput("d");
@@ -300,7 +300,7 @@ describe("dust /status panel", () => {
 
     it("changes the window on a breakdown tab", () => {
       globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse(breakdownBody([["a", "@dust", 1]])))) as never;
-      const loader = new StatusLoader(SESSION, "https://x/api/w/w1", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "https://x/api/w/w1", () => {}, undefined, OVERVIEW);
       const ensure = vi.spyOn(loader, "ensureLoaded");
       const { panel } = makePanel(loader);
 
@@ -311,7 +311,7 @@ describe("dust /status panel", () => {
     });
 
     it("closes on escape and stops its spinner", () => {
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, OVERVIEW);
       const { panel, done } = makePanel(loader);
 
       panel.handleInput("\x1b");
@@ -321,7 +321,7 @@ describe("dust /status panel", () => {
     });
 
     it("asks for a refresh on r", () => {
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, OVERVIEW);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, OVERVIEW);
       const onRefresh = vi.fn();
       const { panel } = makePanel(loader, onRefresh);
 
@@ -332,7 +332,7 @@ describe("dust /status panel", () => {
 
     it("pages a long body and reports the visible range", () => {
       const long = { ...OVERVIEW, analytics: { granularity: "day", groups: Array.from({ length: 40 }, (_, i) => ({ label: `agent-${i}`, credits: 40 - i })) } };
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, long);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, long);
       const { panel } = makePanel(loader);
 
       const first = panel.render(100).join("\n");
@@ -347,7 +347,7 @@ describe("dust /status panel", () => {
 
     it("never emits a line wider than the viewport", () => {
       const wide = { ...OVERVIEW, workspaceName: "W".repeat(200) };
-      const loader = new StatusLoader(SESSION, "u", () => {}, undefined, wide);
+      const loader = new StatusLoader(RUNTIME, "u", () => {}, undefined, wide);
       const { panel } = makePanel(loader);
 
       for (const line of panel.render(40)) {
