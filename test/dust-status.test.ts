@@ -386,7 +386,6 @@ describe("dust /status", () => {
 
       expect(data.agentName).toBeNull();
     });
-
   });
 
   describe("resolveStatusTarget", () => {

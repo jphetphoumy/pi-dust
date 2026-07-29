@@ -16,7 +16,7 @@ tool bridge (`bash`, `read`, `edit`) with local approval.
 - Dust agents exposed as Pi models
 - Conversation reuse across turns
 - SSE streaming with tool approval support
-- `/status` credit panel — a tabbed, keyboard-driven overlay:
+- `/status` credit panel — a tabbed, keyboard-driven inline panel:
   - **Overview**: session usage, plus month / week / day gauges
   - **Agents · Type · Source · API key**: credit breakdowns, with `d`/`w`/`m` to
     switch between the last 24h, 7 days and 30 days
