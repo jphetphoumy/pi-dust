@@ -152,7 +152,7 @@ Responsibilities:
 
 ### `src/dust-status-panel.ts`
 
-The interactive overlay component.
+The interactive credit panel component.
 
 Responsibilities:
 

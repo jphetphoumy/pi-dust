@@ -387,7 +387,10 @@ describe("dust /status", () => {
       expect(data.agentName).toBeNull();
     });
 
-    it("leaves runtime.sessionContext untouched when not logged in", async () => {
+  });
+
+  describe("resolveStatusTarget", () => {
+    it("leaves runtime.sessionContext untouched when not logged in", () => {
       // Regression test: ensureSessionContext(runtime, ctx) must run AFTER the
       // login/workspace guards, not before. Otherwise resolveStatusTarget would
       // overwrite a correctly-wired sessionContext (set up at session_start via

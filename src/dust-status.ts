@@ -43,7 +43,7 @@ type CustomUi = <T>(
 ) => Promise<T>;
 
 /**
- * Ensures `runtime.sessionContext` is wired before anything reads through it.
+ * Ensures `runtime.sessionContext` is wired once the target has resolved.
  *
  * The command can run before any turn has wired the runtime up (no
  * session_start yet), in which case `runtime.sessionContext` is still the
@@ -71,6 +71,8 @@ export function resolveStatusTarget(
   if (!cred?.access) return { error: NOT_LOGGED_IN };
   if (!cred.workspaceId) return { error: NO_WORKSPACE };
 
+  // After the guards, deliberately: a logged-out run must not replace a
+  // correctly-wired sessionContext with one built from the command's ctx.
   ensureSessionContext(runtime, ctx);
 
   const region = cred.region ?? "us-central1";
