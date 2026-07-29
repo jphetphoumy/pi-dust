@@ -5,6 +5,8 @@ export const DUST_US_URL = "https://dust.tt";
 export const DUST_EU_URL = "https://eu.dust.tt";
 export const DUST_CLI_VERSION = "0.4.4";
 export const SESSION_EXPIRED_MESSAGE = "Dust session expired — run /logout then /login to re-authenticate.";
+/** Distinguishes a lapsed MCP server registration (403/404) from a dead session (401). */
+export const MCP_REGISTRATION_LOST_MESSAGE = "MCP server registration lost, re-registration required.";
 
 /** Name registered with Dust; tools are exposed as `<slugified name>__<tool>`. */
 export const MCP_SERVER_NAME = "pi-dust-extension";

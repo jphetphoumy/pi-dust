@@ -1,4 +1,4 @@
-import { DUST_HEADERS, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { DUST_HEADERS, MCP_REGISTRATION_LOST_MESSAGE, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
@@ -14,6 +14,10 @@ const STREAM_REFRESH_SKEW_MS = 30_000;
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
+}
+
+function isRegistrationLostError(error: unknown): boolean {
+  return error instanceof Error && error.message === MCP_REGISTRATION_LOST_MESSAGE;
 }
 
 function buildAuthHeaders(accessToken: string): Record<string, string> {
@@ -75,6 +79,7 @@ async function ensureMcpServer(
   runtime: DustSessionRuntime,
   baseUrl: string,
   authHeaders: Record<string, string>,
+  refreshAuth: () => Promise<boolean>,
 ): Promise<void> {
   if (runtime.mcpServerId) {
     return;
@@ -92,7 +97,16 @@ async function ensureMcpServer(
     return access ? buildAuthHeaders(access) : authHeaders;
   };
 
-  runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, getAuthHeaders, serverId);
+  // Registration lapsed server-side (heartbeat got a 403/404, or the listener
+  // reconnect did): nothing left to talk to. Clear the runtime's MCP state so
+  // the next turn's ensureMcpServer call re-registers and reconnects, instead
+  // of short-circuiting on a dead `mcpServerId` forever.
+  const onRegistrationLost = (): void => {
+    debugLog("dust:mcp", "MCP registration lost, clearing runtime state for re-registration");
+    runtime.clearMcpState();
+  };
+
+  runtime.mcpHeartbeatTimer = startMcpHeartbeat(baseUrl, getAuthHeaders, serverId, refreshAuth, onRegistrationLost);
   runtime.createApprovalGate();
 
   const abortController = new AbortController();
@@ -100,6 +114,7 @@ async function ensureMcpServer(
   listenMcpRequests({
     baseUrl,
     getAuthHeaders,
+    refreshAuth,
     serverId,
     abortController,
     buildConfirmMessage,
@@ -131,16 +146,26 @@ async function ensureMcpServer(
       return;
     }
     console.error(`[dust:mcp] listenMcpRequests fatal: ${err}`);
-    // If session expired, invalidate credentials so that the next stream attempt will trigger a re-login
+    // Session expired means the refresh attempted inside listenMcpRequests
+    // already failed — only now is it safe to invalidate credentials and
+    // force a re-login. invalidateRuntimeCredentials also clears MCP state.
     if (isSessionExpiredError(err)) {
       const credentials = runtime.sessionContext.getCredentials();
       if (credentials) {
-        debugLog("dust:session", "MCP session expired, invalidating credentials in runtime context");
+        debugLog("dust:session", "MCP session expired after failed refresh, invalidating credentials in runtime context");
         invalidateRuntimeCredentials(runtime, credentials);
       } else {
         debugLog("dust:session", "Session expired but no credentials found in runtime context — nothing to invalidate");
       }
+      return;
     }
+    // Any other terminal exit (registration lost, unexpected stream error)
+    // must not leave a dead mcpServerId/heartbeat/abort controller behind —
+    // clear them so the next turn re-registers instead of running toolless.
+    if (isRegistrationLostError(err)) {
+      debugLog("dust:mcp", "MCP registration lost, clearing runtime state for re-registration");
+    }
+    runtime.clearMcpState();
   });
 }
 
@@ -370,7 +395,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           }
         };
 
-        await ensureMcpServer(runtime, baseUrl, authHeaders);
+        await ensureMcpServer(runtime, baseUrl, authHeaders, refreshAuth);
 
         const userText = extractUserText(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();

@@ -1,4 +1,4 @@
-import { DUST_MCP_PROTOCOL_VERSION, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { DUST_MCP_PROTOCOL_VERSION, MCP_REGISTRATION_LOST_MESSAGE, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
@@ -6,6 +6,20 @@ import { type McpToolResult } from "./dust-tools.js";
 
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
+
+// Dust closes the MCP requests SSE stream after ~5 minutes server-side
+// (src/dust-mcp.ts `data: done` handling below). A heartbeat interval equal
+// to that window races the boundary: the two loops jitter independently, so
+// either can fire microseconds after the other and look like the server
+// closed the registration out from under a live heartbeat. Keeping the
+// heartbeat comfortably shorter — with a bit of jitter so many sessions
+// started at once do not all beat in lockstep — keeps it clear of the edge.
+const HEARTBEAT_BASE_INTERVAL_MS = 4 * 60 * 1000;
+const HEARTBEAT_JITTER_MS = 30_000;
+
+function heartbeatIntervalMs(): number {
+  return HEARTBEAT_BASE_INTERVAL_MS + Math.floor(Math.random() * HEARTBEAT_JITTER_MS);
+}
 
 /** True when an error is just this listener being shut down. */
 export function isAbortError(error: unknown, signal?: AbortSignal): boolean {
@@ -55,27 +69,55 @@ export function startMcpHeartbeat(
   baseUrl: string,
   getAuthHeaders: () => Record<string, string>,
   serverId: string,
+  refreshAuth: () => Promise<boolean>,
+  onRegistrationLost: () => void,
 ): ReturnType<typeof setInterval> {
   return setInterval(async () => {
     try {
       debugLog("dust:mcp", "Sending MCP heartbeat", { serverId });
       // Headers are resolved per beat: this outlives the access token, and a
       // stale one lets the registration lapse, taking the tools with it.
-      await fetch(`${baseUrl}/mcp/heartbeat`, {
+      const res = await fetch(`${baseUrl}/mcp/heartbeat`, {
         method: "POST",
         headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ serverId }),
       });
-    } catch {
-      // heartbeat failures are non-fatal
+      if (!res.ok) {
+        if (res.status === 401) {
+          // The access token aged out between beats. Refresh so the next tick
+          // (and getAuthHeaders() everywhere else) picks up a live token —
+          // there is nothing to retry immediately, the beat itself is best-effort.
+          debugLog("dust:mcp", "MCP heartbeat unauthorized, refreshing token", { status: res.status });
+          await refreshAuth();
+          return;
+        }
+        if (res.status === 403 || res.status === 404) {
+          // The server-side registration is gone (e.g. it lapsed while this
+          // beat was stale). Nothing left to heartbeat — tell the caller so it
+          // can clear state and let the next turn re-register.
+          debugLog("dust:mcp", "MCP heartbeat registration lost", { status: res.status });
+          onRegistrationLost();
+          return;
+        }
+        debugLog("dust:mcp", "MCP heartbeat non-ok response", { status: res.status });
+      }
+    } catch (error) {
+      debugLog("dust:mcp", "MCP heartbeat request failed", { error: String(error) });
+      // Network-level heartbeat failures are non-fatal; the next beat retries.
     }
-  }, 5 * 60 * 1000);
+  }, heartbeatIntervalMs());
 }
 
 interface ListenMcpRequestsOptions {
   baseUrl: string;
   /** Resolved per request: the token rotates during a long session. */
   getAuthHeaders: () => Record<string, string>;
+  /**
+   * Attempts a token refresh after a 401 on connect. Returns true if a retry
+   * is worthwhile. Mirrors `streamEvents`'s `refreshAuth` (dust-stream.ts) —
+   * same fallback chain, reused rather than reimplemented.
+   */
+  refreshAuth: () => Promise<boolean>;
   serverId: string;
   abortController: AbortController;
   buildConfirmMessage: (toolName: string, args: JsonObject) => string;
@@ -89,6 +131,7 @@ interface ListenMcpRequestsOptions {
 export async function listenMcpRequests({
   baseUrl,
   getAuthHeaders,
+  refreshAuth,
   serverId,
   abortController,
   buildConfirmMessage,
@@ -101,6 +144,7 @@ export async function listenMcpRequests({
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
   let reconnectAttempt = 0;
+  let refreshedAfterUnauthorized = false;
 
   while (!abortController.signal.aborted) {
     const reqUrl = lastEventId ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}` : url;
@@ -124,13 +168,26 @@ export async function listenMcpRequests({
 
     if (!res.ok) {
       if (res.status === 401) {
+        // Dust access tokens live ~15 minutes, well under the ~5 minute
+        // interval Dust closes this stream at, so a 401 here usually means
+        // the token aged out rather than that the session is dead. Refresh
+        // once through the same fallback chain streamEvents uses and retry
+        // the connect; only give up if the refresh itself fails.
+        if (!refreshedAfterUnauthorized && await refreshAuth()) {
+          refreshedAfterUnauthorized = true;
+          debugLog("dust:mcp", "Refreshed token after MCP SSE 401, retrying connect");
+          continue;
+        }
         debugLog("dust:mcp", "MCP SSE session expired", { status: res.status });
         throw new Error(SESSION_EXPIRED_MESSAGE);
       }
       if (res.status === 403 || res.status === 404) {
-        debugLog("dust:mcp", "MCP SSE terminal error, aborting", { status: res.status });
-        abortController.abort();
-        return;
+        // The server-side registration itself is gone — reconnecting with a
+        // fresh token would not help. Throw instead of silently returning so
+        // the caller can clear runtime state and let the next turn
+        // re-register, rather than the tools disappearing with no trace.
+        debugLog("dust:mcp", "MCP SSE registration lost", { status: res.status });
+        throw new Error(MCP_REGISTRATION_LOST_MESSAGE);
       }
       const delayMs = retryDelay(reconnectAttempt);
       debugLog("dust:mcp", "MCP SSE non-ok response, retrying", { status: res.status, delayMs, attempt: reconnectAttempt + 1 });
@@ -147,6 +204,7 @@ export async function listenMcpRequests({
     }
 
     reconnectAttempt = 0;
+    refreshedAfterUnauthorized = false;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

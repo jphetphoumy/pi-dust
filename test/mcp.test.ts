@@ -901,6 +901,195 @@ describe("dust extension", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // MCP listener resilience (issue #32): 401 refresh-and-retry, refresh
+  // failure still invalidating, and re-registration after a terminal exit.
+  // ---------------------------------------------------------------------------
+
+  describe("MCP listener resilience", () => {
+    async function setupWithMcpListener() {
+      const creds = makeCredentials();
+      seedLoggedIn(creds);
+      let capturedStreamSimple: any;
+      let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+
+      const mockApi = {
+        registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
+          capturedStreamSimple = config.streamSimple;
+        }),
+        registerCommand: vi.fn(),
+        on: vi.fn((event: string, handler: any) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+      };
+
+      dustExtension(mockApi as any);
+
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+      }));
+      const ctx = {
+        modelRegistry: {},
+        ...piToolContextFields(),
+        sessionManager: {
+          getSessionFile: vi.fn().mockReturnValue("/s/s1.json"),
+          getEntries: vi.fn().mockReturnValue([]),
+          getSessionId: vi.fn().mockReturnValue("test-session"),
+        },
+      };
+      await sessionStartHandler!({}, ctx);
+      vi.unstubAllGlobals();
+
+      return { capturedStreamSimple };
+    }
+
+    const model = {
+      id: "agent-sonnet",
+      sId: "agentSId-1",
+      name: "AgentSonnet",
+      provider: "dust",
+      api: "dust",
+    };
+
+    function conversationCreateResponse(convSId: string, msgSId: string, agentMsgSId: string) {
+      return {
+        conversation: {
+          sId: convSId,
+          content: [
+            [{ type: "user_message", sId: msgSId }],
+            [{ type: "agent_message", sId: agentMsgSId, parentMessageId: msgSId }],
+          ],
+        },
+        message: { sId: msgSId },
+      };
+    }
+
+    it("refreshes the token once and retries the connect after a 401 on the MCP SSE, without invalidating the session", async () => {
+      const { capturedStreamSimple } = await setupWithMcpListener();
+
+      let mcpRequestsCalls = 0;
+      const fetchMock = vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes("/mcp/register")) {
+          return { ok: true, json: () => Promise.resolve({ serverId: "srv-401", expiresAt: new Date(Date.now() + 300_000).toISOString() }) };
+        }
+        if (u.includes("/mcp/requests")) {
+          mcpRequestsCalls += 1;
+          if (mcpRequestsCalls === 1) {
+            return { ok: false, status: 401, body: null };
+          }
+          return { ok: true, body: makePendingSseStream() };
+        }
+        if (u.includes("user_management/authenticate")) {
+          return { ok: true, json: () => Promise.resolve({ access_token: "refreshed-mcp-token", refresh_token: "new-ref", expires_in: 3600 }) };
+        }
+        if (u.includes("/assistant/conversations") && !u.includes("/messages") && !u.includes("/events")) {
+          return { ok: true, json: () => Promise.resolve(conversationCreateResponse("conv-1", "m1", "am1")) };
+        }
+        if (u.includes("/events")) {
+          return { ok: true, body: makeSseStream([{ type: "agent_message_success" }]) };
+        }
+        throw new Error(`unexpected fetch to ${u}`);
+      });
+
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hello" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      await waitForCall(() => (mcpRequestsCalls >= 2 ? true : undefined), "MCP SSE retry after 401 refresh");
+      expect(mcpRequestsCalls).toBeGreaterThanOrEqual(2);
+
+      const refreshCall = fetchMock.mock.calls.find(([url]: [string]) => String(url).includes("user_management/authenticate"));
+      expect(refreshCall).toBeDefined();
+
+      // The refresh succeeded, so the session must not be marked dead.
+      expect(readState().invalidated).not.toBe(true);
+    });
+
+    it("invalidates credentials only once the 401 refresh itself fails, not before", async () => {
+      const { capturedStreamSimple } = await setupWithMcpListener();
+
+      const fetchMock = vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes("/mcp/register")) {
+          return { ok: true, json: () => Promise.resolve({ serverId: "srv-dead", expiresAt: new Date(Date.now() + 300_000).toISOString() }) };
+        }
+        if (u.includes("/mcp/requests")) {
+          return { ok: false, status: 401, body: null };
+        }
+        if (u.includes("user_management/authenticate")) {
+          // Refresh token is dead too (WorkOS invalid_grant) — this is the
+          // only case that should force a re-login.
+          return { ok: false, status: 400 };
+        }
+        if (u.includes("/assistant/conversations") && !u.includes("/messages") && !u.includes("/events")) {
+          return { ok: true, json: () => Promise.resolve(conversationCreateResponse("conv-1", "m1", "am1")) };
+        }
+        if (u.includes("/events")) {
+          return { ok: true, body: makeSseStream([{ type: "agent_message_success" }]) };
+        }
+        throw new Error(`unexpected fetch to ${u}`);
+      });
+
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = capturedStreamSimple(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const _ of stream) { /* drain */ }
+
+      await waitForCall(() => (readState().invalidated ? true : undefined), "credentials invalidated after failed refresh");
+      expect(readState()).toMatchObject({ invalidated: true });
+    });
+
+    it("re-registers the MCP server on the next turn after the registration is lost", async () => {
+      const { capturedStreamSimple } = await setupWithMcpListener();
+
+      // Turn 1: register succeeds, but the MCP SSE reconnect finds the
+      // registration itself gone (404) — no amount of refreshing fixes that.
+      const fetchMock1 = vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "srv-lost", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
+        .mockResolvedValueOnce({ ok: false, status: 404, body: null })
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(conversationCreateResponse("conv-1", "m1", "am1")) })
+        .mockResolvedValueOnce({ ok: true, body: makeSseStream([{ type: "agent_message_success" }]) });
+
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.stubGlobal("fetch", fetchMock1);
+
+      const stream1 = capturedStreamSimple(model, { messages: [{ role: "user", content: "First" }] });
+      for await (const _ of stream1) { /* drain */ }
+
+      // The listener's rejection is handled off the main turn's await chain;
+      // give its .catch a moment to clear runtime MCP state.
+      await waitForCall(() => (fetchMock1.mock.calls.length >= 2 ? true : undefined), "MCP SSE 404 observed");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      vi.unstubAllGlobals();
+
+      // Turn 2: same conversation (conversationId survives), but the dead
+      // mcpServerId must have been cleared so this turn registers again
+      // instead of advertising a server nothing is listening behind.
+      const fetchMock2 = vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "srv-new", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ message: { sId: "m2" } }) })
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ conversation: { sId: "conv-1", content: [[{ type: "user_message", sId: "m2" }], [{ type: "agent_message", sId: "am2", parentMessageId: "m2" }]] } }) })
+        .mockResolvedValueOnce({ ok: true, body: makeSseStream([{ type: "agent_message_success" }]) });
+
+      vi.stubGlobal("fetch", fetchMock2);
+
+      const stream2 = capturedStreamSimple(model, { messages: [{ role: "user", content: "Second" }] });
+      for await (const _ of stream2) { /* drain */ }
+
+      const registerCalls = fetchMock2.mock.calls.filter(([url]: [string]) => String(url).includes("/mcp/register"));
+      expect(registerCalls).toHaveLength(1);
+
+      const msgCall = fetchMock2.mock.calls.find(([url]: [string]) =>
+        String(url).includes("/assistant/conversations/conv-1/messages") && !String(url).includes("/events"));
+      expect(msgCall).toBeDefined();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // tool_params visibility in pi stream
   // ---------------------------------------------------------------------------
 

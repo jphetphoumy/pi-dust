@@ -1,6 +1,6 @@
 import { TextEncoder } from "util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
+import { MCP_REGISTRATION_LOST_MESSAGE, SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
 import { listenMcpRequests, startMcpHeartbeat } from "../src/dust-mcp.js";
 
 function makeMcpRequestStream(frames: string[]): ReadableStream<Uint8Array> {
@@ -11,6 +11,21 @@ function makeMcpRequestStream(frames: string[]): ReadableStream<Uint8Array> {
         controller.enqueue(encoder.encode(frame));
       }
       controller.close();
+    },
+  });
+}
+
+/**
+ * A stream that never closes on its own, so a reconnect loop parks instead of
+ * cycling — but tears down cleanly once the given controller is aborted, the
+ * same way a real fetch's body would.
+ */
+function makePendingRequestStream(signal: AbortSignal): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      signal.addEventListener("abort", () => {
+        controller.error(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
+      }, { once: true });
     },
   });
 }
@@ -36,6 +51,7 @@ describe("dust MCP runtime helpers", () => {
     const promise = listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -55,37 +71,21 @@ describe("dust MCP runtime helpers", () => {
     await promise;
   });
 
-  it("throws SESSION_EXPIRED_MESSAGE on HTTP 401 without retrying", async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 401, body: null });
+  it("refreshes once and retries the connect on HTTP 401, without throwing", async () => {
+    const abortController = new AbortController();
+    const fetchMock = vi.fn()
+      // 1. connect -> 401
+      .mockResolvedValueOnce({ ok: false, status: 401, body: null })
+      // 2. retried connect after refresh -> ok, stays open until aborted
+      .mockResolvedValueOnce({ ok: true, body: makePendingRequestStream(abortController.signal) });
     vi.stubGlobal("fetch", fetchMock);
 
-    const abortController = new AbortController();
-    await expect(
-      listenMcpRequests({
-        baseUrl: "https://dust.test/api/v1/w/ws-1",
-        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
-        serverId: "srv-1",
-        abortController,
-        buildConfirmMessage: () => "confirm",
-        executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
-      getTools: () => [],
-        getConfirmFn: () => async () => true,
-        getPendingApprovalPromise: () => null,
-        preApprovedActions: new Map(),
-      }),
-    ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+    const refreshAuth = vi.fn().mockResolvedValue(true);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([403, 404])("aborts and resolves on terminal HTTP %i without retrying", async (status) => {
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status, body: null });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const abortController = new AbortController();
-    await listenMcpRequests({
+    const promise = listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth,
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -96,8 +96,92 @@ describe("dust MCP runtime helpers", () => {
       preApprovedActions: new Map(),
     });
 
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(refreshAuth).toHaveBeenCalledTimes(1);
+
+    abortController.abort();
+    await promise;
+  });
+
+  it("throws SESSION_EXPIRED_MESSAGE on HTTP 401 when the refresh itself fails", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 401, body: null });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshAuth = vi.fn().mockResolvedValue(false);
+    const abortController = new AbortController();
+    await expect(
+      listenMcpRequests({
+        baseUrl: "https://dust.test/api/v1/w/ws-1",
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+        refreshAuth,
+        serverId: "srv-1",
+        abortController,
+        buildConfirmMessage: () => "confirm",
+        executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
+        getTools: () => [],
+        getConfirmFn: () => async () => true,
+        getPendingApprovalPromise: () => null,
+        preApprovedActions: new Map(),
+      }),
+    ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+
+    expect(refreshAuth).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(abortController.signal.aborted).toBe(true);
+  });
+
+  it("does not refresh a second time within the same connect attempt loop", async () => {
+    // Two 401s in a row after one refresh means the session really is dead —
+    // refreshing again would loop forever instead of surfacing the failure.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 401, body: null })
+      .mockResolvedValueOnce({ ok: false, status: 401, body: null });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshAuth = vi.fn().mockResolvedValue(true);
+    const abortController = new AbortController();
+
+    await expect(
+      listenMcpRequests({
+        baseUrl: "https://dust.test/api/v1/w/ws-1",
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+        refreshAuth,
+        serverId: "srv-1",
+        abortController,
+        buildConfirmMessage: () => "confirm",
+        executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
+        getTools: () => [],
+        getConfirmFn: () => async () => true,
+        getPendingApprovalPromise: () => null,
+        preApprovedActions: new Map(),
+      }),
+    ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+
+    expect(refreshAuth).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([403, 404])("throws MCP_REGISTRATION_LOST_MESSAGE on terminal HTTP %i without retrying", async (status) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status, body: null });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const abortController = new AbortController();
+    await expect(
+      listenMcpRequests({
+        baseUrl: "https://dust.test/api/v1/w/ws-1",
+        getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+        refreshAuth: async () => false,
+        serverId: "srv-1",
+        abortController,
+        buildConfirmMessage: () => "confirm",
+        executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
+        getTools: () => [],
+        getConfirmFn: () => async () => true,
+        getPendingApprovalPromise: () => null,
+        preApprovedActions: new Map(),
+      }),
+    ).rejects.toThrow(MCP_REGISTRATION_LOST_MESSAGE);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not open the MCP SSE request loop when already aborted", async () => {
@@ -110,6 +194,7 @@ describe("dust MCP runtime helpers", () => {
     await listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -131,6 +216,7 @@ describe("dust MCP runtime helpers", () => {
     const promise = listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -175,6 +261,7 @@ describe("dust MCP runtime helpers", () => {
     await listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       serverId: "srv-1",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -200,9 +287,73 @@ describe("dust MCP runtime helpers", () => {
       "https://dust.test/api/v1/w/ws-1",
       () => ({ Authorization: "Bearer token" }),
       "srv-1",
+      async () => true,
+      () => {},
     );
 
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    clearInterval(timer);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the token on a 401 heartbeat instead of treating it as success", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 401 });
+    vi.stubGlobal("fetch", fetchMock);
+    const refreshAuth = vi.fn().mockResolvedValue(true);
+    const onRegistrationLost = vi.fn();
+
+    const timer = startMcpHeartbeat(
+      "https://dust.test/api/v1/w/ws-1",
+      () => ({ Authorization: "Bearer token" }),
+      "srv-1",
+      refreshAuth,
+      onRegistrationLost,
+    );
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    clearInterval(timer);
+
+    expect(refreshAuth).toHaveBeenCalledTimes(1);
+    expect(onRegistrationLost).not.toHaveBeenCalled();
+  });
+
+  it.each([403, 404])("treats a %i heartbeat as a lost registration", async (status) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status });
+    vi.stubGlobal("fetch", fetchMock);
+    const refreshAuth = vi.fn().mockResolvedValue(true);
+    const onRegistrationLost = vi.fn();
+
+    const timer = startMcpHeartbeat(
+      "https://dust.test/api/v1/w/ws-1",
+      () => ({ Authorization: "Bearer token" }),
+      "srv-1",
+      refreshAuth,
+      onRegistrationLost,
+    );
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    clearInterval(timer);
+
+    expect(onRegistrationLost).toHaveBeenCalledTimes(1);
+    expect(refreshAuth).not.toHaveBeenCalled();
+  });
+
+  it("fires the heartbeat comfortably before Dust's 5 minute stream timeout", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const timer = startMcpHeartbeat(
+      "https://dust.test/api/v1/w/ws-1",
+      () => ({ Authorization: "Bearer token" }),
+      "srv-1",
+      async () => true,
+      () => {},
+    );
+
+    // Just under 5 minutes must already have produced a beat, otherwise the
+    // heartbeat and Dust's server-side close race at the same boundary.
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000 - 1);
     clearInterval(timer);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -228,6 +379,7 @@ describe("dust MCP listener shutdown", () => {
     const promise = listenMcpRequests({
       baseUrl: "https://dust.test/api/v1/w/ws-1",
       getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
       serverId: "srv-abort",
       abortController,
       buildConfirmMessage: () => "confirm",
@@ -261,6 +413,8 @@ describe("dust MCP auth freshness", () => {
       "https://dust.test/api/v1/w/ws-1",
       () => ({ Authorization: `Bearer ${token}` }),
       "srv-rotate",
+      async () => true,
+      () => {},
     );
 
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
