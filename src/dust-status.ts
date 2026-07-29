@@ -10,7 +10,7 @@ import {
   fetchUsageBreakdown,
 } from "./dust-credits.js";
 import { debugLog } from "./dust-debug.js";
-import { buildSessionContext, type DustSessionRuntime, type SessionContextController } from "./dust-runtime.js";
+import { buildSessionContext, type DustSessionRuntime } from "./dust-runtime.js";
 import { getStoredCredentials } from "./dust-state.js";
 import { StatusLoader } from "./dust-status-loader.js";
 import { DustStatusPanel, panelHeight } from "./dust-status-panel.js";
@@ -30,7 +30,6 @@ export interface StatusTarget {
   workspaceId: string;
   region: string;
   baseUrl: string;
-  session: SessionContextController;
 }
 
 type CustomUi = <T>(
@@ -60,17 +59,22 @@ export function resolveStatusTarget(
   if (!cred?.access) return { error: NOT_LOGGED_IN };
   if (!cred.workspaceId) return { error: NO_WORKSPACE };
 
+  // The command can run before any turn has wired the runtime up (no
+  // session_start yet), in which case `runtime.sessionContext` is still the
+  // no-op default. Wire it from the command's own context in place — every
+  // credit fetch below reads through `runtime`, so it needs a working
+  // `sessionContext` on the same instance, not a free-floating one only this
+  // call would see.
+  if (!runtime.sessionContext.getCredentials()) {
+    runtime.sessionContext = buildSessionContext(ctx);
+  }
+
   const region = cred.region ?? "us-central1";
   return {
     cred,
     workspaceId: cred.workspaceId,
     region,
     baseUrl: creditsBaseUrl(region, cred.workspaceId),
-    // The command can run before any turn has wired the runtime up, so derive a
-    // session controller from the command context when there is none yet.
-    session: runtime.sessionContext.getCredentials()
-      ? runtime.sessionContext
-      : buildSessionContext(ctx),
   };
 }
 
@@ -82,17 +86,17 @@ export async function collectStatusData(
   const target = resolveStatusTarget(runtime, ctx);
   if ("error" in target) return target;
 
-  const { cred, workspaceId, region, baseUrl, session } = target;
+  const { cred, workspaceId, region, baseUrl } = target;
   const tracker = runtime.credits;
 
   const needsLiveRead = tracker.dirty || tracker.lastConsumedCredits === null;
   const [usage, fairUse, totals] = needsLiveRead
     ? await Promise.all([
-        fetchMemberUsage(session, baseUrl, signal),
-        fetchFairUseCredits(session, baseUrl, signal),
+        fetchMemberUsage(runtime, baseUrl, signal),
+        fetchFairUseCredits(runtime, baseUrl, signal),
         // The period totals are the headline figures, so they follow the live
         // rule too — a user who just ran turns must see them move.
-        fetchCreditTotals(session, baseUrl, signal),
+        fetchCreditTotals(runtime, baseUrl, signal),
       ])
     : [tracker.cachedUsage, tracker.cachedFairUse, tracker.cachedTotals];
 
@@ -109,10 +113,10 @@ export async function collectStatusData(
     : tracker.sessionDelta();
 
   if (tracker.analytics === null) {
-    tracker.analytics = await fetchUsageBreakdown(session, baseUrl, "agent", OVERVIEW_BREAKDOWN_DAYS, signal);
+    tracker.analytics = await fetchUsageBreakdown(runtime, baseUrl, "agent", OVERVIEW_BREAKDOWN_DAYS, signal);
   }
   if (tracker.topConversations === null) {
-    tracker.topConversations = await fetchTopConversations(session, baseUrl, signal);
+    tracker.topConversations = await fetchTopConversations(runtime, baseUrl, signal);
   }
 
   const workspace = cred.workspaces?.find((candidate) => candidate.sId === workspaceId);
@@ -239,7 +243,7 @@ async function openStatusPanel(
 
   await custom<undefined>((tui, theme, _keybindings, done) => {
     loader = new StatusLoader(
-      target.session,
+      runtime,
       target.baseUrl,
       () => tui.requestRender(),
       signal,

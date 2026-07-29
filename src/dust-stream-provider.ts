@@ -580,43 +580,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
 
         // Called after a 401: refresh through pi (which persists the rotation)
         // and fall back to a direct refresh. Returning false means the session
-        // really is dead.
-        //
-        // Single-flighted on the runtime: streamEvents, the MCP listener, and
-        // the MCP heartbeat all call this, and can all hit a 401 in the same
-        // window. Two concurrent direct refreshes would race the same
-        // rotating refresh token — WorkOS honors one and answers
-        // `invalid_grant` to the other — so every caller while one is already
-        // in flight awaits that same attempt instead of starting its own.
-        const refreshAuth = (): Promise<boolean> => {
-          runtime.refreshInFlight ??= (async (): Promise<boolean> => {
-            const hostToken = await runtime.sessionContext.resolveAccessToken();
-            if (hostToken) {
-              runtime.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
-              return true;
-            }
-            try {
-              const refreshed = await refreshToken(runtime.sessionContext.getCredentials() ?? liveCred);
-              runtime.sessionContext.setCredentials(refreshed);
-              // persistCredentialState drops access/refresh/expires (auth.json
-              // is pi-owned, we can no longer write it), so the rotated token
-              // would otherwise vanish the instant it's "saved": every later
-              // getAuthHeaders() call — ours and the MCP listener/heartbeat's —
-              // would keep re-reading the same expired token from storage and
-              // loop straight back into the same 401.
-              if (refreshed.access) {
-                runtime.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
-              }
-              return Boolean(refreshed.access);
-            } catch (err) {
-              debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
-              return false;
-            }
-          })().finally(() => {
-            runtime.refreshInFlight = null;
-          });
-          return runtime.refreshInFlight;
-        };
+        // really is dead. `liveCred` is passed as the fallback in case
+        // `sessionContext` itself has nothing yet — see
+        // `DustSessionRuntime#refreshAccessToken()`'s doc for why this is a
+        // single shared method rather than each caller rolling its own body.
+        const refreshAuth = (): Promise<boolean> => runtime.refreshAccessToken(liveCred);
 
         await ensureMcpServer(runtime, baseUrl, resolveAuthHeaders(), refreshAuth);
 

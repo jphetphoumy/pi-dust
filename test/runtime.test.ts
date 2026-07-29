@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyRuntimeContext,
   buildSessionContext,
@@ -235,5 +235,126 @@ describe("dust runtime", () => {
     expect(invalidateCredentials(makeCredentials())).toEqual(
       expect.objectContaining({ access: "", refresh: "", expires: 0 }),
     );
+  });
+
+  describe("refreshAccessToken", () => {
+    let originalFetch: typeof globalThis.fetch;
+
+    beforeEach(() => {
+      originalFetch = globalThis.fetch;
+    });
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    it("prefers the host's resolveAccessToken and holds the result", async () => {
+      const runtime = new DustSessionRuntime();
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock as never;
+      runtime.sessionContext = {
+        getSessionFile: () => undefined,
+        saveConversationId: () => {},
+        getCredentials: () => makeCredentials() as never,
+        setCredentials: () => {},
+        resolveAccessToken: async () => "host-token",
+        getAccessToken: () => "stale",
+      };
+
+      await expect(runtime.refreshAccessToken()).resolves.toBe(true);
+
+      // Held in memory rather than round-tripped through storage — storage
+      // cannot carry a directly-resolved token at all.
+      expect(runtime.currentAccessToken()).toBe("host-token");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("falls back to a direct WorkOS refresh when the host has nothing", async () => {
+      const runtime = new DustSessionRuntime();
+      const setCredentials = vi.fn();
+      globalThis.fetch = vi.fn(() => Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ access_token: "direct-token", refresh_token: "new-ref", expires_in: 3600 }),
+      })) as never;
+      runtime.sessionContext = {
+        getSessionFile: () => undefined,
+        saveConversationId: () => {},
+        getCredentials: () => makeCredentials() as never,
+        setCredentials,
+        resolveAccessToken: async () => null,
+        getAccessToken: () => "stale",
+      };
+
+      await expect(runtime.refreshAccessToken()).resolves.toBe(true);
+
+      expect(runtime.currentAccessToken()).toBe("direct-token");
+      expect(setCredentials).toHaveBeenCalledWith(expect.objectContaining({ access: "direct-token" }));
+    });
+
+    it("falls back to fallbackCredentials when sessionContext has none of its own", async () => {
+      const runtime = new DustSessionRuntime();
+      const fallback = makeCredentials({ refresh: "fallback-ref" });
+      globalThis.fetch = vi.fn(() => Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ access_token: "direct-token", refresh_token: "new-ref", expires_in: 3600 }),
+      })) as never;
+      runtime.sessionContext = {
+        getSessionFile: () => undefined,
+        saveConversationId: () => {},
+        getCredentials: () => null,
+        setCredentials: () => {},
+        resolveAccessToken: async () => null,
+        getAccessToken: () => "",
+      };
+
+      await expect(runtime.refreshAccessToken(fallback as never)).resolves.toBe(true);
+      expect(runtime.currentAccessToken()).toBe("direct-token");
+    });
+
+    it("returns false, and leaves nothing held, when neither path produces a token", async () => {
+      const runtime = new DustSessionRuntime();
+      globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 400 })) as never;
+      runtime.sessionContext = {
+        getSessionFile: () => undefined,
+        saveConversationId: () => {},
+        getCredentials: () => makeCredentials() as never,
+        setCredentials: () => {},
+        resolveAccessToken: async () => null,
+        getAccessToken: () => "stale",
+      };
+
+      await expect(runtime.refreshAccessToken()).resolves.toBe(false);
+      expect(runtime.currentAccessToken()).toBe("stale");
+    });
+
+    it("single-flights concurrent callers into one refresh", async () => {
+      // Two callers hitting a 401 in the same window — e.g. /status and the
+      // MCP listener — must not race two direct refreshes against the same
+      // rotating refresh token; the second must await the first's attempt.
+      const runtime = new DustSessionRuntime();
+      let resolveAccessTokenCalls = 0;
+      let resolveHost!: (token: string | null) => void;
+      runtime.sessionContext = {
+        getSessionFile: () => undefined,
+        saveConversationId: () => {},
+        getCredentials: () => makeCredentials() as never,
+        setCredentials: () => {},
+        resolveAccessToken: () => {
+          resolveAccessTokenCalls++;
+          return new Promise((resolve) => { resolveHost = resolve; });
+        },
+        getAccessToken: () => "stale",
+      };
+
+      const first = runtime.refreshAccessToken();
+      const second = runtime.refreshAccessToken();
+      resolveHost("shared-token");
+
+      await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+      expect(resolveAccessTokenCalls).toBe(1);
+      expect(runtime.currentAccessToken()).toBe("shared-token");
+    });
   });
 });

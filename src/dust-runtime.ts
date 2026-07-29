@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import {
   getStoredCredentials,
@@ -16,7 +17,7 @@ import type {
   TopConversations,
   UsageAnalytics,
 } from "./dust-types.js";
-import { agentMessageIdFromMcpRequestId } from "./dust-validation.js";
+import { agentMessageIdFromMcpRequestId, errorMessage } from "./dust-validation.js";
 
 export interface SessionContextController {
   getSessionFile: () => string | undefined;
@@ -212,13 +213,14 @@ export class DustSessionRuntime {
    */
   refreshedAccessToken: HeldAccessToken | null = null;
   /**
-   * Single-flight guard for `refreshAuth`. The event stream, the MCP
-   * listener, and the MCP heartbeat can all hit a 401 in the same window and
-   * each call `refreshAuth` — without memoizing the in-flight attempt here,
-   * two concurrent direct refreshes would race the same rotating refresh
-   * token: WorkOS honors the first and answers `invalid_grant` to the
-   * second, which would then report a false refresh failure and invalidate a
-   * session that had, in fact, just been refreshed successfully.
+   * Single-flight guard for `refreshAccessToken()`. The event stream, the MCP
+   * listener, the MCP heartbeat, and `/status` credit fetches can all hit a
+   * 401 in the same window and each call `refreshAccessToken()` — without
+   * memoizing the in-flight attempt here, two concurrent direct refreshes
+   * would race the same rotating refresh token: WorkOS honors the first and
+   * answers `invalid_grant` to the second, which would then report a false
+   * refresh failure and invalidate a session that had, in fact, just been
+   * refreshed successfully.
    */
   refreshInFlight: Promise<boolean> | null = null;
   confirmFn: (title: string, message: string) => Promise<boolean> = NOOP_CONFIRM;
@@ -357,6 +359,58 @@ export class DustSessionRuntime {
       this.refreshedAccessToken = null;
     }
     return this.sessionContext.getAccessToken();
+  }
+
+  /**
+   * Refreshes the access token, single-flighted on `refreshInFlight`.
+   *
+   * Every caller — the event stream, the MCP listener/heartbeat
+   * (dust-stream-provider.ts), and `/status` credit fetches (dust-credits.ts)
+   * — hits this same method instead of each rolling its own refresh body, so
+   * there is exactly one implementation to keep in sync with WorkOS's
+   * refresh-token rotation, and a 401 concurrent with another caller's
+   * refresh awaits that one attempt instead of racing it with a second direct
+   * refresh against the same (now-rotated) refresh token.
+   *
+   * Prefers pi's own `resolveAccessToken` host path, which persists the
+   * rotation to auth.json itself; falls back to a direct WorkOS refresh
+   * (`fallbackCredentials` is the caller's own best snapshot of the current
+   * credentials, used only if `sessionContext` itself has none — e.g. a
+   * turn's `liveCred` closed over before this call).
+   */
+  async refreshAccessToken(fallbackCredentials?: DustCredentials): Promise<boolean> {
+    this.refreshInFlight ??= (async (): Promise<boolean> => {
+      const hostToken = await this.sessionContext.resolveAccessToken();
+      if (hostToken) {
+        this.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+        return true;
+      }
+
+      const credentials = this.sessionContext.getCredentials() ?? fallbackCredentials ?? null;
+      if (!credentials) return false;
+
+      try {
+        const refreshed = await refreshToken(credentials);
+        this.sessionContext.setCredentials(refreshed);
+        // persistCredentialState drops access/refresh/expires (auth.json is
+        // pi-owned, we can no longer write it), so the rotated token would
+        // otherwise vanish the instant it's "saved": every later
+        // currentAccessToken() read — ours and every other caller's — would
+        // keep re-reading the same expired token from storage and loop
+        // straight back into the same 401.
+        if (refreshed.access) {
+          this.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
+        }
+        return Boolean(refreshed.access);
+      } catch (err) {
+        debugLog("dust:session", "Refresh after 401 failed", { error: errorMessage(err) });
+        return false;
+      }
+    })().finally(() => {
+      this.refreshInFlight = null;
+    });
+
+    return this.refreshInFlight;
   }
 
   createApprovalGate(): void {
