@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dustExtension from "../src/dust.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
+import { registerDustSessionEvents } from "../src/dust-session-events.js";
 import { collectStatusData } from "../src/dust-status.js";
 import {
   currentBucket,
@@ -589,6 +590,39 @@ describe("dust /status", () => {
       second.built.component!.dispose?.();
     });
 
+  });
+
+  describe("session lifecycle", () => {
+    /**
+     * pi 0.65 folded `session_switch` into `session_start`, so every transition
+     * — startup, /new, /resume, /fork — arrives on the one handler. The credit
+     * tracker must be dropped there: its clock, message count and session
+     * baseline all describe the session being left, and its cached breakdowns
+     * may belong to another workspace entirely.
+     */
+    it("drops the credit tracker on every session_start", async () => {
+      seedLoggedIn(makeCredentials());
+      globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse({ agentConfigurations: [] }))) as never;
+
+      const runtime = new DustSessionRuntime();
+      let sessionStart!: (event: unknown, ctx: unknown) => Promise<void>;
+      registerDustSessionEvents(
+        { on: vi.fn((event: string, handler: never) => { if (event === "session_start") sessionStart = handler; }) } as never,
+        runtime,
+        () => {},
+      );
+
+      runtime.credits.recordMessageSent();
+      runtime.credits.observeConsumedCredits(120);
+      runtime.credits.analytics = { granularity: "day", groups: [{ label: "@dust", credits: 5 }] };
+
+      await sessionStart({ reason: "resume" }, makeCtx());
+
+      expect(runtime.credits.messagesSent).toBe(0);
+      expect(runtime.credits.baselineCredits).toBeNull();
+      expect(runtime.credits.analytics).toBeNull();
+      expect(runtime.credits.lastOverview).toBeNull();
+    });
   });
 
   describe("period totals", () => {

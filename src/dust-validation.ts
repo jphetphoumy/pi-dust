@@ -2,6 +2,7 @@ import type {
   AgentConfigurationsResponse,
   ConversationCreateResponse,
   ConversationFetchResponse,
+  ConversationSummaryResponse,
   CreditBreakdownEntry,
   CreditBucket,
   CreditSeries,
@@ -222,6 +223,17 @@ export function parseConversationCreateResponse(value: unknown): ConversationCre
     },
     message: {
       sId: getStringField(message, "sId", "conversation create response"),
+    },
+  };
+}
+
+export function parseConversationSummaryResponse(value: unknown): ConversationSummaryResponse {
+  const data = parseJsonObject(value, "conversation summary response");
+  const conversation = getRecordField(data, "conversation", "conversation summary response");
+  return {
+    conversation: {
+      sId: getStringField(conversation, "sId", "conversation summary response"),
+      title: getOptionalStringField(conversation, "title"),
     },
   };
 }

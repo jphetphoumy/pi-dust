@@ -12,15 +12,14 @@ describe("dust extension", () => {
 
     /**
      * Build a streamSimple function wired with a custom confirmFn.
-     * The confirmFn is injected via session_switch so it is captured
-     * by currentConfirmFn inside dust.ts.
+     * The confirmFn reaches the runtime through session_start's ctx.ui, the
+     * same way pi wires the UI up.
      */
     async function setupWithConfirm(confirmFn: (title: string, message: string) => Promise<boolean>) {
       const creds = makeCredentials();
       seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
-      let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
 
       const mockApi = {
         registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
@@ -29,7 +28,6 @@ describe("dust extension", () => {
         registerCommand: vi.fn(),
         on: vi.fn((event: string, handler: any) => {
           if (event === "session_start") sessionStartHandler = handler;
-          if (event === "session_switch") sessionSwitchHandler = handler;
         }),
       };
 
@@ -54,9 +52,6 @@ describe("dust extension", () => {
 
       await sessionStartHandler!({}, makeCtx());
       vi.unstubAllGlobals();
-
-      // Wire the confirmFn via session_switch (simulates pi wiring up the UI)
-      sessionSwitchHandler!({ reason: "new" }, makeCtx());
 
       return { capturedStreamSimple };
     }

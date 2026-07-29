@@ -21,6 +21,20 @@ export interface DustCredentials extends OAuthCredentials {
 export interface SessionManagerLike {
   getSessionFile?: () => string | undefined;
   getEntries?: () => unknown[];
+  /** Transcript header. `parentSession` is set on forked and branched sessions. */
+  getHeader?: () => { parentSession?: string } | null;
+}
+
+/** Why pi started a session. Mirrors pi's `SessionStartEvent["reason"]`. */
+export type DustSessionReason = "startup" | "reload" | "new" | "resume" | "fork";
+
+/**
+ * pi 0.65 removed the post-transition `session_switch` / `session_fork` events;
+ * `session_start` now carries the reason and the file we came from instead.
+ */
+export interface DustSessionStartEvent {
+  reason?: DustSessionReason;
+  previousSessionFile?: string;
 }
 
 export interface UiLike {
@@ -111,6 +125,18 @@ export interface ConversationCreateResponse {
   };
   message: {
     sId: string;
+  };
+}
+
+/**
+ * What a reattach check needs: enough to prove the conversation is still there
+ * and to name it in the UI. Deliberately does not require `content`, so the
+ * check survives a conversation whose messages are paginated away.
+ */
+export interface ConversationSummaryResponse {
+  conversation: {
+    sId: string;
+    title?: string;
   };
 }
 
