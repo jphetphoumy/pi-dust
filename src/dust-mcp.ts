@@ -1,4 +1,4 @@
-import { DUST_MCP_PROTOCOL_VERSION, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { CANCELLED_TOOL_MESSAGE, DUST_MCP_PROTOCOL_VERSION, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
@@ -84,6 +84,13 @@ interface ListenMcpRequestsOptions {
   getConfirmFn: () => (title: string, message: string) => Promise<boolean>;
   getPendingApprovalPromise: () => Promise<void> | null;
   preApprovedActions: Map<string, boolean>;
+  /**
+   * True when the tool call belongs to a turn the user cancelled — matched on
+   * the request id where possible, falling back to the current turn. Required
+   * rather than defaulted: a missing check here means tool calls from a
+   * cancelled turn run on the user's machine, so it must not fail open.
+   */
+  isCancelledRequest: (requestId: unknown) => boolean;
 }
 
 export async function listenMcpRequests({
@@ -97,6 +104,7 @@ export async function listenMcpRequests({
   getConfirmFn,
   getPendingApprovalPromise,
   preApprovedActions,
+  isCancelledRequest,
 }: ListenMcpRequestsOptions): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
@@ -228,8 +236,16 @@ export async function listenMcpRequests({
                   await pendingApprovalPromise;
                 }
 
+                // A cancelled turn can still have tool calls in flight: Dust
+                // queued them before our cancel reached the agent loop. Refusing
+                // them up front also keeps the approval prompt from popping up
+                // for a turn the user just stopped.
                 let allowed: boolean;
-                if (preApprovedActions.size > 0) {
+                const cancelled = isCancelledRequest(request.id);
+                if (cancelled) {
+                  debugLog("dust:mcp", "Refusing tool call from a cancelled turn", { toolName });
+                  allowed = false;
+                } else if (preApprovedActions.size > 0) {
                   const firstEntry = preApprovedActions.entries().next();
                   if (firstEntry.done) {
                     allowed = await getConfirmFn()(
@@ -248,9 +264,10 @@ export async function listenMcpRequests({
                   );
                 }
 
+                const refusalText = cancelled ? CANCELLED_TOOL_MESSAGE : "Tool execution denied by user.";
                 const toolResult = allowed
                   ? await executeMcpTool(toolName, toolArgs)
-                  : { content: [{ type: "text", text: "Tool execution denied by user." }], isError: true };
+                  : { content: [{ type: "text", text: refusalText }], isError: true };
 
                 const responseMsg = {
                   jsonrpc: "2.0",

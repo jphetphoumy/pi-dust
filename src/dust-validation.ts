@@ -263,6 +263,27 @@ export function unwrapEnvelope(value: unknown): unknown {
   return isRecord(value) && "data" in value ? value.data : value;
 }
 
+/**
+ * Extracts the agent message an MCP request belongs to.
+ *
+ * Dust builds client-side request ids as
+ * `mcp_req_{conversationId}_{messageId}_{uuid}_{originalRequestId}` (see
+ * `makeClientSideMCPRequestIdForMessageAndConversation` in front). That is the
+ * only per-request marker of which turn asked for a tool call, and telling
+ * turns apart matters because cancelling is asynchronous on Dust's side: a
+ * cancelled loop can still emit a tool call after the next turn has started.
+ *
+ * Returns null for ids that do not match, so an unknown shape falls back to the
+ * coarser current-turn check rather than being trusted.
+ */
+export function agentMessageIdFromMcpRequestId(requestId: unknown): string | null {
+  if (typeof requestId !== "string") {
+    return null;
+  }
+  const match = /^mcp_req_([^_]+)_([^_]+)_([a-f0-9-]+)_(\d+)$/.exec(requestId);
+  return match ? match[2] : null;
+}
+
 export function parseMcpRequest(value: unknown): McpRequestLike | null {
   const request = unwrapEnvelope(value);
   if (!isRecord(request) || typeof request.method !== "string") {

@@ -218,7 +218,8 @@ export interface PiDoneEvent {
 
 export interface PiErrorEvent {
   type: "error";
-  reason: "error";
+  /** pi renders "aborted" as a cancelled turn rather than a failure. */
+  reason: "error" | "aborted";
   error: AssistantMessageLike;
 }
 
