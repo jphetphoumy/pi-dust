@@ -47,6 +47,51 @@ Responsibilities:
 - create or resume Dust conversations
 - connect Dust SSE with the MCP approval flow
 - translate failures into Pi stream errors
+- upload `@`-mentioned files to the conversation instead of sending them inline
+
+### `src/dust-attachments.ts`
+
+Finds the files a user attached with `@`. pi produces two different forms, and
+both land here:
+
+- **the CLI inlines.** `pi @foo.ts "..."` prefixes the message with a
+  `<file name="...">` marker per file: the whole body for a text file, an empty
+  tag for an image whose bytes ride along as a separate `image` content block.
+  Left as is, the text bodies are billed as prompt tokens on every later turn of
+  the conversation and the images are dropped entirely, since only `text` blocks
+  reach Dust.
+- **the interactive editor does not.** Its `@` is a path autocomplete: it writes
+  `@path` into the message as plain text and leaves reading it to the agent.
+  Nothing has to be undone for these, but uploading still pays off — and for an
+  image it is the difference between the model seeing it and the agent staring
+  at a path it cannot open.
+
+Responsibilities:
+
+- recognise the inliner's markers, and only those — a text marker counts only
+  when its body still matches the file on disk byte for byte, so a
+  `<file name="...">` the user typed is never mistaken for an attachment
+- pair image blocks with their markers, keeping pi's resized bytes
+- recognise `@path` mentions that name a real file, resolved against the
+  session's working directory, and read those from disk
+- leave small text files alone, where an upload plus a `cat` round trip costs
+  more than what it saves
+- rewrite an attached file's marker into a pointer that keeps the local path,
+  so edits still target the file on disk rather than the conversation snapshot.
+  Rewriting is by position, so `@a.ts` never rewrites the `@a.ts` in `@a.ts.bak`
+
+### `src/dust-files.ts`
+
+Dust file upload and content fragment plumbing.
+
+Responsibilities:
+
+- create the file record, then upload its bytes to the pre-signed URL
+- attach the file to the conversation as a content fragment, or hand it back
+  for the conversation-create request when there is no conversation yet
+- skip files already attached to the conversation, keyed by content hash
+- never throw: attaching is an optimisation, and a file that cannot be
+  uploaded is simply left inline rather than costing the user their turn
 
 ### `src/dust-state.ts`
 
@@ -331,11 +376,13 @@ once the action has already been approved.
 ```text
 src/
   dust.ts
+  dust-attachments.ts
   dust-auth.ts
   dust-ceiling.ts
   dust-constants.ts
   dust-credits.ts
   dust-debug.ts
+  dust-files.ts
   dust-mcp.ts
   dust-provider.ts
   dust-runtime.ts
@@ -371,6 +418,7 @@ Current suites cover:
 - MCP registration and request handling
 - stream parsing and reconnection
 - tool approval flow
+- `@file` parsing, upload and conversation attachment
 - workspace behavior
 - credit status panel: fetching, caching, tabs and rendering
 - debug logging and redaction

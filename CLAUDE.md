@@ -27,13 +27,15 @@ npx vitest run test/dust-auth.test.ts
 
 ## Architecture
 
-The project is organized as 27 TypeScript modules in `src/`, each with a single responsibility:
+The project is organized as 29 TypeScript modules in `src/`, each with a single responsibility:
 
 | Module | Role |
 |--------|------|
 | `dust.ts` | Main entrypoint — wires all modules together |
 | `dust-provider.ts` | Registers Dust agents as Pi models |
 | `dust-stream-provider.ts` | Conversation execution and stream orchestration |
+| `dust-attachments.ts` | Finds `@` files in a user message: the CLI's inlined `<file>` markers and the interactive editor's plain `@path` mentions |
+| `dust-files.ts` | Uploads files to Dust and attaches them as content fragments |
 | `dust-runtime.ts` | In-memory session state (conversation ID, MCP server ID, heartbeats) |
 | `dust-session-events.ts` | Hooks into Pi session lifecycle events |
 | `dust-conversation.ts` | Decides and verifies which Dust conversation a session continues |
@@ -63,6 +65,7 @@ The project is organized as 27 TypeScript modules in `src/`, each with a single 
 - **Auth:** `dust-auth.ts` handles OAuth device flow → token storage → workspace/agent discovery
 - **Conversation:** `dust-stream-provider.ts` coordinates Dust event stream + MCP request stream with dual approval logic
 - **Tool approval:** `dust-tools.ts` intercepts MCP tool calls and gates them on local user approval
+- **Attachments:** `@` files — inlined by the CLI, or left as plain `@path` by the interactive editor — are found by `dust-attachments.ts`, uploaded by `dust-files.ts` and replaced with a pointer, so bodies are not re-billed on every turn and images reach the model
 - **State:** `dust-runtime.ts` holds ephemeral session state; reset on session switch or credential invalidation
 - **Resume:** every session transition (startup, `/new`, `/resume`, `/fork`) arrives as one `session_start` carrying a `reason`; `dust-conversation.ts` maps the session file — or, for a fork, its parent — back to a Dust conversation and checks it still exists before reattaching
 
