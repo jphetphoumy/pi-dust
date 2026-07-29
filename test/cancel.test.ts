@@ -1,13 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import dustExtension from "../src/dust.js";
 import { createEventStream, streamEvents } from "../src/dust-stream.js";
-import { cancelMessageGeneration } from "../src/dust-stream-provider.js";
+import { cancelMessageGeneration, cancelPendingAgentMessage } from "../src/dust-stream-provider.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
+import type { PiEventStream } from "../src/dust-types.js";
 import {
+  makeConversationGetResponse,
   makeConversationResponse,
+  makeCredentials,
   makeModel,
   makePendingSseStream,
   makeSseStream,
   makeStreamSimpleFn,
+  piToolContextFields,
+  seedLoggedIn,
   useTempAgentDir,
   waitForCall,
   waitForMcpResult,
@@ -33,6 +39,55 @@ function makeStreamEventsOptions(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * Same wiring as `makeStreamSimpleFn`, but with the approval dialog injected
+ * through `session_switch` — the path pi uses to hand the extension its UI.
+ */
+async function makeStreamSimpleFnWithConfirm(
+  confirmFn: (title: string, message: string) => Promise<boolean>,
+): Promise<(model: unknown, context: unknown, options?: unknown) => PiEventStream> {
+  const creds = makeCredentials();
+  seedLoggedIn(creds);
+  let capturedStreamSimple: (model: unknown, context: unknown, options?: unknown) => PiEventStream;
+  let sessionStartHandler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let sessionSwitchHandler: ((event: unknown, ctx: unknown) => void) | undefined;
+
+  const mockApi = {
+    registerProvider: vi.fn((_name: string, config: Record<string, never>) => {
+      capturedStreamSimple = config.streamSimple;
+    }),
+    registerCommand: vi.fn(),
+    on: vi.fn((event: string, handler: never) => {
+      if (event === "session_start") sessionStartHandler = handler;
+      if (event === "session_switch") sessionSwitchHandler = handler;
+    }),
+  };
+
+  dustExtension(mockApi as never);
+
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+    ok: true,
+    json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+  }));
+
+  const makeCtx = () => ({
+    modelRegistry: {},
+    ...piToolContextFields(),
+    sessionManager: {
+      getSessionFile: vi.fn().mockReturnValue("/sessions/cancel.json"),
+      getEntries: vi.fn().mockReturnValue([]),
+      getSessionId: vi.fn().mockReturnValue("cancel-session"),
+    },
+    ui: { confirm: confirmFn },
+  });
+
+  await sessionStartHandler!({}, makeCtx());
+  vi.unstubAllGlobals();
+  sessionSwitchHandler!({ reason: "new" }, makeCtx());
+
+  return capturedStreamSimple!;
+}
+
 describe("cancellation", () => {
   useTempAgentDir();
 
@@ -42,11 +97,13 @@ describe("cancellation", () => {
   });
 
   describe("cancelMessageGeneration", () => {
+    const headers = () => ({ Authorization: "Bearer token" });
+
     it("POSTs the agent message ids to the conversation cancel endpoint", async () => {
       const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ success: true }) });
       vi.stubGlobal("fetch", fetchMock);
 
-      await cancelMessageGeneration(BASE_URL, { Authorization: "Bearer token" }, "conv-1", ["amsg-1"]);
+      await cancelMessageGeneration(BASE_URL, headers, "conv-1", ["amsg-1"]);
 
       const [url, init] = fetchMock.mock.calls[0] as [string, { method: string; body: string; headers: Record<string, string> }];
       expect(url).toBe(`${BASE_URL}/assistant/conversations/conv-1/cancel`);
@@ -55,16 +112,82 @@ describe("cancellation", () => {
       expect(init.headers.Authorization).toBe("Bearer token");
     });
 
+    // Long turns are both the ones most worth cancelling and the ones most
+    // likely to have outlived the ~15 minute access token.
+    it("refreshes and retries once when the token has expired", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 401 })
+        .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ success: true }) });
+      vi.stubGlobal("fetch", fetchMock);
+      let token = "stale";
+      const refreshAuth = vi.fn(async () => { token = "fresh"; return true; });
+
+      await cancelMessageGeneration(BASE_URL, () => ({ Authorization: `Bearer ${token}` }), "conv-1", ["amsg-1"], refreshAuth);
+
+      expect(refreshAuth).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [, retry] = fetchMock.mock.calls[1] as [string, { headers: Record<string, string> }];
+      expect(retry.headers.Authorization).toBe("Bearer fresh");
+    });
+
+    it("does not retry when the refresh fails", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 401 });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await cancelMessageGeneration(BASE_URL, headers, "conv-1", ["amsg-1"], async () => false);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     // The turn is already over when this runs; a failure here must not surface
     // as an extra error on top of the cancellation the user asked for.
     it("swallows a non-ok response", async () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
-      await expect(cancelMessageGeneration(BASE_URL, {}, "conv-1", ["amsg-1"])).resolves.toBeUndefined();
+      await expect(cancelMessageGeneration(BASE_URL, headers, "conv-1", ["amsg-1"])).resolves.toBeUndefined();
     });
 
     it("swallows a thrown request", async () => {
       vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
-      await expect(cancelMessageGeneration(BASE_URL, {}, "conv-1", ["amsg-1"])).resolves.toBeUndefined();
+      await expect(cancelMessageGeneration(BASE_URL, headers, "conv-1", ["amsg-1"])).resolves.toBeUndefined();
+    });
+
+    // A 200 carrying an error envelope would otherwise read as success.
+    it("does not report success for a 200 without a success body", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ error: { message: "nope" } }),
+      }));
+
+      await expect(cancelMessageGeneration(BASE_URL, headers, "conv-1", ["amsg-1"])).resolves.toBeUndefined();
+    });
+  });
+
+  describe("cancelPendingAgentMessage", () => {
+    it("looks the agent message up, then cancels it", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationGetResponse("conv-1", "umsg-1", "amsg-1")),
+        })
+        .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ success: true }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await cancelPendingAgentMessage(BASE_URL, () => ({ Authorization: "Bearer token" }), "conv-1", "umsg-1");
+
+      const [cancelUrl, cancelInit] = fetchMock.mock.calls[1] as [string, { body: string }];
+      expect(cancelUrl).toBe(`${BASE_URL}/assistant/conversations/conv-1/cancel`);
+      expect(JSON.parse(cancelInit.body)).toEqual({ messageIds: ["amsg-1"] });
+    });
+
+    it("gives up quietly when the lookup fails", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500 });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(
+        cancelPendingAgentMessage(BASE_URL, () => ({}), "conv-1", "umsg-1"),
+      ).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -326,6 +449,110 @@ describe("cancellation", () => {
       const posted = await waitForMcpResult(fetchMock, "req-after-cancel");
       expect(posted.result.result.isError).toBe(true);
       expect(posted.result.result.content[0].text).toBe("Tool execution cancelled by user.");
+    });
+
+    // Posting the user message already started the agent loop, so escaping
+    // before we learn the agent message id must still stop it.
+    it("cancels an agent loop started before the turn could begin", async () => {
+      const streamSimple = await makeStreamSimpleFn();
+      const controller = new AbortController();
+      let conversationFetches = 0;
+
+      const fetchMock = vi.fn(async (url: string, init?: { method?: string }) => {
+        const target = String(url);
+        if (target.endsWith("/mcp/register")) {
+          return { ok: true, json: () => Promise.resolve({ serverId: "mcp-cancel-4", expiresAt: new Date(Date.now() + 300_000).toISOString() }) };
+        }
+        if (target.includes("/mcp/requests")) {
+          return { ok: true, body: makePendingSseStream() };
+        }
+        // Turn one: create the conversation and finish, so turn two follows the
+        // post-message path where the agent message id is fetched separately.
+        if (target.endsWith("/assistant/conversations")) {
+          return { ok: true, json: () => Promise.resolve(makeConversationResponse("conv-cancel-4", "umsg-4", "amsg-cancel-4")) };
+        }
+        if (target.includes("/events")) {
+          return { ok: true, body: makeSseStream([{ type: "agent_message_success" }]) };
+        }
+        if (target.endsWith("/messages") && init?.method === "POST") {
+          return { ok: true, json: () => Promise.resolve({ message: { sId: "umsg-5" } }) };
+        }
+        if (target.endsWith("/cancel")) {
+          return { ok: true, status: 200, json: () => Promise.resolve({ success: true }) };
+        }
+        // GET the conversation: the user hits escape during the first lookup;
+        // the second is the recovery lookup, which runs on its own signal.
+        conversationFetches += 1;
+        if (conversationFetches === 1) {
+          controller.abort();
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        }
+        return { ok: true, json: () => Promise.resolve(makeConversationGetResponse("conv-cancel-4", "umsg-5", "amsg-cancel-5")) };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const first = streamSimple(makeModel(), { messages: [{ role: "user", content: "Hello" }] }, {});
+      await expect(first.result()).resolves.toMatchObject({ stopReason: "stop" });
+
+      const second = streamSimple(makeModel(), { messages: [{ role: "user", content: "And again" }] }, { signal: controller.signal });
+      await expect(second.result()).resolves.toMatchObject({ stopReason: "aborted" });
+
+      const cancelCall = await waitForCall(
+        () => (fetchMock.mock.calls as [string, { body?: string }][]).find(([url]) => String(url).endsWith("/cancel")),
+        "the cancel request",
+      );
+      expect(JSON.parse(cancelCall[1].body!)).toEqual({ messageIds: ["amsg-cancel-5"] });
+    });
+
+    // A tool call that arrives mid-turn parks on the approval gate. Cancelling
+    // has to release it and refuse it — not wake it up into a prompt for a turn
+    // the user already escaped out of.
+    it("releases a tool waiting on the approval gate and refuses it", async () => {
+      const confirmFn = vi.fn(async () => true);
+      const streamSimple = await makeStreamSimpleFnWithConfirm(confirmFn);
+      const controller = new AbortController();
+      const encoder = new TextEncoder();
+      let mcpController!: ReadableStreamDefaultController<Uint8Array>;
+      const mcpBody = new ReadableStream<Uint8Array>({ start(c) { mcpController = c; } });
+
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-cancel-5", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        .mockResolvedValueOnce({ ok: true, body: mcpBody })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationResponse("conv-cancel-5", "umsg-5", "amsg-cancel-5")),
+        })
+        .mockResolvedValue({ ok: true, status: 200, body: abortableBody(controller.signal), json: () => Promise.resolve({ success: true }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = streamSimple(makeModel(), { messages: [{ role: "user", content: "Hello" }] }, { signal: controller.signal });
+      await waitForCall(
+        () => (fetchMock.mock.calls as [string][]).find(([url]) => String(url).includes("/events")),
+        "the agent event stream to open",
+      );
+
+      // Delivered while the turn is live, so it parks on the approval gate.
+      const request = {
+        jsonrpc: "2.0",
+        id: "req-at-gate",
+        method: "tools/call",
+        params: { name: "bash", arguments: { command: "touch /tmp/pi-dust-should-not-exist" } },
+      };
+      mcpController.enqueue(encoder.encode(`data: ${JSON.stringify({ eventId: "mcp-e0", data: request })}\n\n`));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(confirmFn).not.toHaveBeenCalled();
+
+      controller.abort();
+      await stream.result();
+
+      const posted = await waitForMcpResult(fetchMock, "req-at-gate");
+      expect(posted.result.result.isError).toBe(true);
+      expect(posted.result.result.content[0].text).toBe("Tool execution cancelled by user.");
+      // Never prompted: the user escaped, so there was nothing left to approve.
+      expect(confirmFn).not.toHaveBeenCalled();
     });
 
     it("does not cancel a turn that already completed", async () => {

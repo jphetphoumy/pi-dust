@@ -350,9 +350,12 @@ describe("dust extension", () => {
       expect(events.some((e) => e.type === "done")).toBe(true);
     });
 
-    it("yields done event when agent_generation_cancelled is received", async () => {
+    // Cancellation can also originate elsewhere — the Dust web UI, another
+    // client — and a stopped turn must not render as a clean completion.
+    it("ends as aborted when agent_generation_cancelled is received", async () => {
       const model = makeModel();
       const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "tokens", text: "Half an answer" },
         { type: "agent_generation_cancelled" },
       ]);
       vi.stubGlobal("fetch", fetchMock);
@@ -361,7 +364,11 @@ describe("dust extension", () => {
       const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const e of stream) events.push(e);
 
-      expect(events.some((e) => e.type === "done")).toBe(true);
+      expect(events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
+      await expect(stream.result()).resolves.toMatchObject({
+        stopReason: "aborted",
+        content: [{ type: "text", text: "Half an answer" }],
+      });
     });
 
     it("throws with agent error message when agent_error is received", async () => {

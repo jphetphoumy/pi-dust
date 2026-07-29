@@ -353,13 +353,11 @@ export async function streamEvents({
                 debugLog("dust:stream", "Stream gracefully stopped", { fullText });
                 return;
               } else if (eventType === "agent_generation_cancelled") {
-                resolveApprovalGate();
-                const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
-                finalMessage.stopReason = "stop";
-                stream.push({ type: "done", reason: "stop", message: finalMessage });
-                stream.end();
-                debugLog("dust:stream", "Stream cancelled", { fullText });
+                // Dust says the generation was cancelled — by our own cancel
+                // request, or from the web UI or another client. Either way the
+                // turn was stopped, not completed, so it must not render as a
+                // clean finish.
+                finishAborted(stream, model, fullText, resolveApprovalGate);
                 return;
               } else if (eventType === "agent_error") {
                 debugLog("dust:stream", "Received agent error event", event);

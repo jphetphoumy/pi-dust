@@ -84,8 +84,12 @@ interface ListenMcpRequestsOptions {
   getConfirmFn: () => (title: string, message: string) => Promise<boolean>;
   getPendingApprovalPromise: () => Promise<void> | null;
   preApprovedActions: Map<string, boolean>;
-  /** True once the user cancelled the turn the tool call belongs to. */
-  isTurnCancelled?: () => boolean;
+  /**
+   * True once the user cancelled the turn the tool call belongs to. Required
+   * rather than defaulted: a missing check here means tool calls from a
+   * cancelled turn run on the user's machine, so it must not fail open.
+   */
+  isTurnCancelled: () => boolean;
 }
 
 export async function listenMcpRequests({
@@ -99,7 +103,7 @@ export async function listenMcpRequests({
   getConfirmFn,
   getPendingApprovalPromise,
   preApprovedActions,
-  isTurnCancelled = () => false,
+  isTurnCancelled,
 }: ListenMcpRequestsOptions): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;

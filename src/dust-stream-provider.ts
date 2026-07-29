@@ -6,7 +6,7 @@ import { createEventStream, findAgentMessageSId, makeEmptyMessage, streamEvents 
 import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
-import { errorMessage, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
+import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
 import { invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
 
@@ -189,27 +189,94 @@ async function postValidateAction(
  */
 export async function cancelMessageGeneration(
   baseUrl: string,
-  authHeaders: Record<string, string>,
+  getAuthHeaders: () => Record<string, string>,
   conversationId: string,
   messageIds: string[],
+  refreshAuth?: () => Promise<boolean>,
 ): Promise<void> {
   const url = `${baseUrl}/assistant/conversations/${conversationId}/cancel`;
   debugLog("dust:session", "Cancelling message generation", { conversationId, messageIds, url });
+
+  const post = async (): Promise<Response> => fetch(url, {
+    method: "POST",
+    headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ messageIds }),
+    signal: AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+  });
+
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { ...authHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify({ messageIds }),
-      signal: AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
-    });
+    let res = await post();
+    // The turns most worth cancelling are the long ones, which are also the
+    // ones most likely to have outlived the ~15 minute access token. Giving up
+    // on the 401 would fail exactly when this matters most.
+    if (res.status === 401 && refreshAuth && await refreshAuth()) {
+      debugLog("dust:session", "Refreshed token after 401, retrying cancel", { conversationId });
+      res = await post();
+    }
     if (!res.ok) {
       debugLog("dust:session", "Cancel request failed", { status: res.status, conversationId, messageIds });
+      return;
+    }
+    // Dust answers `{ success: true }`; anything else means the agent loop was
+    // not signalled, which would otherwise pass silently as a 200.
+    const body = await res.json().catch(() => null);
+    if (!isRecord(body) || body.success !== true) {
+      debugLog("dust:session", "Cancel request returned an unexpected body", { conversationId, body });
       return;
     }
     debugLog("dust:session", "Cancel request accepted", { conversationId, messageIds });
   } catch (error) {
     debugLog("dust:session", "Cancel request threw", { error: errorMessage(error), conversationId });
   }
+}
+
+/**
+ * Cancels the agent message Dust spawned for `userMessageSId`, looking it up
+ * first.
+ *
+ * Posting the user message is what starts the agent loop, so a turn cancelled
+ * between that POST and learning the agent message's id still has a loop
+ * running — with no id, the normal cancel path has nothing to send. Best effort
+ * throughout: the lookup runs on its own timeout (the turn's signal is already
+ * aborted) and every failure is logged rather than raised.
+ */
+export async function cancelPendingAgentMessage(
+  baseUrl: string,
+  getAuthHeaders: () => Record<string, string>,
+  conversationSId: string,
+  userMessageSId: string,
+  refreshAuth?: () => Promise<boolean>,
+): Promise<void> {
+  debugLog("dust:session", "Recovering agent message id to cancel", { conversationSId, userMessageSId });
+  let agentMessageSId: string;
+  try {
+    agentMessageSId = await fetchConversationAgentMessageId(
+      baseUrl,
+      getAuthHeaders(),
+      AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+      conversationSId,
+      userMessageSId,
+    );
+  } catch (error) {
+    if (isSessionExpiredError(error) && refreshAuth && await refreshAuth()) {
+      try {
+        agentMessageSId = await fetchConversationAgentMessageId(
+          baseUrl,
+          getAuthHeaders(),
+          AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+          conversationSId,
+          userMessageSId,
+        );
+      } catch (retryError) {
+        debugLog("dust:session", "Agent message lookup failed after refresh", { error: errorMessage(retryError) });
+        return;
+      }
+    } else {
+      debugLog("dust:session", "Agent message lookup for cancel failed", { error: errorMessage(error) });
+      return;
+    }
+  }
+  await cancelMessageGeneration(baseUrl, getAuthHeaders, conversationSId, [agentMessageSId], refreshAuth);
 }
 
 async function createConversation(
@@ -354,6 +421,8 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
     let cancelTurnOnAbort: (() => void) | null = null;
     let abortListenerSignal: AbortSignal | null = null;
     let endTurn: (() => void) | null = null;
+    /** Set once a user message is posted but the turn has not started yet. */
+    let cancelPendingSetup: (() => void) | null = null;
 
     (async () => {
       try {
@@ -433,9 +502,9 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           .join("\n\n");
         debugLog("dust:session", "Prepared user message", { userText, systemPrompt, currentConversationId: runtime.conversationId });
 
+        let agentMessageSId: string;
         let conversationSId: string;
         let userMessageSId: string;
-        let agentMessageSId: string;
 
         if (!runtime.conversationId) {
           ({ conversationSId, userMessageSId, agentMessageSId } = await createConversation(
@@ -462,6 +531,21 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             username,
             timezone,
           );
+          // The user message is posted, so Dust has already spawned the agent
+          // message and started its loop. Cancelling before we learn that id
+          // still has to stop it — otherwise escaping in this window leaves the
+          // orphaned loop this whole change exists to prevent.
+          const pendingConversationSId = conversationSId;
+          const pendingUserMessageSId = userMessageSId;
+          cancelPendingSetup = () => {
+            void cancelPendingAgentMessage(
+              baseUrl,
+              getAuthHeaders,
+              pendingConversationSId,
+              pendingUserMessageSId,
+              refreshAuth,
+            );
+          };
           agentMessageSId = await fetchConversationAgentMessageId(
             baseUrl,
             authHeaders,
@@ -473,15 +557,17 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
 
         // From here on there is a Dust agent loop to stop, so escape becomes a
         // real cancellation rather than a client-side disconnect.
+        cancelPendingSetup = null;
         const turn = runtime.beginTurn(conversationSId, agentMessageSId);
         cancelTurnOnAbort = () => {
           const cancelled = runtime.cancelActiveTurn();
           if (!cancelled) return;
           void cancelMessageGeneration(
             baseUrl,
-            getAuthHeaders(),
+            getAuthHeaders,
             cancelled.conversationSId,
             [cancelled.agentMessageSId],
+            refreshAuth,
           );
         };
         if (signal) {
@@ -516,6 +602,9 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         // a rejected fetch. That is the user cancelling, not a failure.
         const aborted = options?.signal?.aborted === true;
         debugLog("dust:session", aborted ? "Dust stream aborted" : "Dust stream failed", { error: errorMessage(error) });
+        if (aborted) {
+          cancelPendingSetup?.();
+        }
         if (!aborted && isSessionExpiredError(error)) {
           invalidateRuntimeCredentials(runtime, liveCred);
         }
