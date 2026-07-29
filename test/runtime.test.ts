@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as dustAuth from "../src/dust-auth.js";
 import { fetchCreditsJson } from "../src/dust-credits.js";
 import {
   applyRuntimeContext,
@@ -247,6 +248,7 @@ describe("dust runtime", () => {
 
     afterEach(() => {
       globalThis.fetch = originalFetch;
+      vi.restoreAllMocks();
     });
 
     it("prefers the host's resolveAccessToken and holds the result", async () => {
@@ -325,6 +327,7 @@ describe("dust runtime", () => {
       const runtime = new DustSessionRuntime();
       const fetchMock = vi.fn();
       globalThis.fetch = fetchMock as never;
+      const refreshTokenSpy = vi.spyOn(dustAuth, "refreshToken");
       runtime.sessionContext = makeSessionContext({
         getCredentials: () => null,
         resolveAccessToken: async () => null,
@@ -332,6 +335,12 @@ describe("dust runtime", () => {
 
       await expect(runtime.refreshAccessToken()).resolves.toBe(false);
       expect(fetchMock).not.toHaveBeenCalled();
+      // Proves the `!credentials` guard actually short-circuits before ever
+      // attempting a refresh — without this, a deleted guard would still
+      // fall through to `refreshToken(null)` throwing inside a try/catch
+      // that also swallows the error and returns false, leaving the
+      // assertions above green for the wrong reason.
+      expect(refreshTokenSpy).not.toHaveBeenCalled();
     });
 
     it("single-flights concurrent callers into one refresh", async () => {

@@ -48,12 +48,6 @@ type CustomUi = <T>(
  * `/status` runs before any `session_start` has done so (see the comment on
  * that assignment below). Idempotent and safe to call more than once per
  * command, which is what both callers below do.
- *
- * Live figures (seat balance, spend cap, reset date) are refetched whenever the
- * session has advanced since the last read — a user who just ran a few turns
- * must see those turns reflected, so caching them is only ever an optimisation
- * for a session that has not moved. The 30-day breakdowns are cached outright:
- * they are month-scale aggregates that cannot shift within one session.
  */
 export function resolveStatusTarget(
   runtime: DustSessionRuntime,
@@ -82,6 +76,13 @@ export function resolveStatusTarget(
   };
 }
 
+/**
+ * Live figures (seat balance, spend cap, reset date) are refetched whenever the
+ * session has advanced since the last read — a user who just ran a few turns
+ * must see those turns reflected, so caching them is only ever an optimisation
+ * for a session that has not moved. The 30-day breakdowns are cached outright:
+ * they are month-scale aggregates that cannot shift within one session.
+ */
 export async function collectStatusData(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,

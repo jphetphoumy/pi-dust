@@ -25,16 +25,16 @@ const THEME = {
   inverse: (text: string) => text,
 } as never;
 
-const SESSION_CONTEXT = makeSessionContext({
-  getCredentials: () => ({ type: "oauth", access: "tok", refresh: "r", expires: Date.now() + 1e6 }) as never,
-});
+const SESSION_CONTEXT = makeSessionContext();
 
 // StatusLoader reads through a runtime (so credit fetches share the in-memory
 // refreshed-token holder and single-flight guard with the rest of the
-// extension), not a bare session controller — wire one up with the same
-// behavior the old inline stub had. Rebuilt fresh in `beforeEach` below so
-// mutable runtime state (a held refreshed token, an in-flight refresh) never
-// leaks from one test into the next.
+// extension), not a bare session controller — wire one up via the factory's
+// plain defaults. The loader under test only ever reads `baseUrl` off the
+// runtime, never a credential or a refresh, so no override is needed here.
+// Rebuilt fresh in `beforeEach` below so mutable runtime state (a held
+// refreshed token, an in-flight refresh) never leaks from one test into the
+// next.
 let RUNTIME: DustSessionRuntime;
 
 const OVERVIEW: DustStatusData = {

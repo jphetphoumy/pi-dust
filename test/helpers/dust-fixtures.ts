@@ -159,7 +159,7 @@ export function makeSessionContext(overrides: Partial<SessionContextController> 
   return {
     getSessionFile: () => undefined,
     saveConversationId: () => {},
-    getCredentials: () => makeCredentials() as never,
+    getCredentials: () => makeCredentials(),
     setCredentials: () => {},
     resolveAccessToken: async () => "tok",
     getAccessToken: () => "tok",
