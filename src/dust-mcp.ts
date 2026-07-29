@@ -85,11 +85,12 @@ interface ListenMcpRequestsOptions {
   getPendingApprovalPromise: () => Promise<void> | null;
   preApprovedActions: Map<string, boolean>;
   /**
-   * True once the user cancelled the turn the tool call belongs to. Required
+   * True when the tool call belongs to a turn the user cancelled — matched on
+   * the request id where possible, falling back to the current turn. Required
    * rather than defaulted: a missing check here means tool calls from a
    * cancelled turn run on the user's machine, so it must not fail open.
    */
-  isTurnCancelled: () => boolean;
+  isCancelledRequest: (requestId: unknown) => boolean;
 }
 
 export async function listenMcpRequests({
@@ -103,7 +104,7 @@ export async function listenMcpRequests({
   getConfirmFn,
   getPendingApprovalPromise,
   preApprovedActions,
-  isTurnCancelled,
+  isCancelledRequest,
 }: ListenMcpRequestsOptions): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
@@ -240,7 +241,7 @@ export async function listenMcpRequests({
                 // them up front also keeps the approval prompt from popping up
                 // for a turn the user just stopped.
                 let allowed: boolean;
-                const cancelled = isTurnCancelled();
+                const cancelled = isCancelledRequest(request.id);
                 if (cancelled) {
                   debugLog("dust:mcp", "Refusing tool call from a cancelled turn", { toolName });
                   allowed = false;

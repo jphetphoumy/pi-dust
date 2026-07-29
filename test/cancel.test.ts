@@ -209,7 +209,7 @@ describe("cancellation", () => {
 
       await expect(
         cancelPendingAgentMessage(BASE_URL, () => ({}), "conv-1", "umsg-1"),
-      ).resolves.toBeUndefined();
+      ).resolves.toBeNull();
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
@@ -238,6 +238,31 @@ describe("cancellation", () => {
       runtime.cancelActiveTurn();
 
       expect(runtime.preApprovedActions.size).toBe(0);
+    });
+
+    // Dust's cancel is asynchronous (a Temporal signal), so a cancelled loop can
+    // still emit a tool call after the user has started the next turn — by which
+    // point the current-turn verdict has moved on.
+    it("refuses a late tool call from a cancelled turn during a later turn", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
+      runtime.cancelActiveTurn();
+      runtime.beginTurn("conv-1", "umsg-2", "amsg-2");
+
+      expect(runtime.isTurnCancelled()).toBe(false);
+      expect(runtime.isCancelledRequest("mcp_req_conv-1_amsg-1_11111111-2222-3333-4444-555555555555_1")).toBe(true);
+      expect(runtime.isCancelledRequest("mcp_req_conv-1_amsg-2_11111111-2222-3333-4444-555555555555_2")).toBe(false);
+    });
+
+    // An id we cannot attribute must not be treated as belonging to a live turn.
+    it("falls back to the current turn for unrecognised request ids", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.beginTurn("conv-1", "umsg-1", "amsg-1");
+
+      expect(runtime.isCancelledRequest("something-else")).toBe(false);
+      runtime.cancelActiveTurn();
+      expect(runtime.isCancelledRequest("something-else")).toBe(true);
+      expect(runtime.isCancelledRequest(42)).toBe(true);
     });
 
     it("cancels a turn only once", () => {
@@ -556,6 +581,78 @@ describe("cancellation", () => {
       const posted = await waitForMcpResult(fetchMock, "req-mid-setup");
       expect(posted.result.result.isError).toBe(true);
       expect(posted.result.result.content[0].text).toBe("Tool execution cancelled by user.");
+    });
+
+    // Approving spans two awaits (dialog, then validate-action). Cancelling
+    // underneath it must not leave an approval behind: the queue is positional,
+    // so a leftover would approve some later turn's tool call.
+    it("does not let a pre-approval that resolved after the cancel approve the next turn", async () => {
+      const confirmFn = vi.fn(async (_title: string, _message: string) => true);
+      const streamSimple = await makeStreamSimpleFnWithConfirm(confirmFn);
+      const controller = new AbortController();
+      const encoder = new TextEncoder();
+      let mcpController!: ReadableStreamDefaultController<Uint8Array>;
+      const mcpBody = new ReadableStream<Uint8Array>({ start(c) { mcpController = c; } });
+      const approveEvent = {
+        type: "tool_approve_execution",
+        actionId: "action-late",
+        conversationId: "conv-cancel-7",
+        messageId: "amsg-7",
+        stake: "medium",
+        inputs: { command: "ls" },
+        metadata: { toolName: "bash" },
+      };
+      let eventStreams = 0;
+
+      const fetchMock = vi.fn(async (url: string) => {
+        const target = String(url);
+        if (target.endsWith("/mcp/register")) {
+          return { ok: true, json: () => Promise.resolve({ serverId: "mcp-cancel-7", expiresAt: new Date(Date.now() + 300_000).toISOString() }) };
+        }
+        if (target.includes("/mcp/requests")) return { ok: true, body: mcpBody };
+        if (target.endsWith("/assistant/conversations")) {
+          return { ok: true, json: () => Promise.resolve(makeConversationResponse("conv-cancel-7", "umsg-7", "amsg-7")) };
+        }
+        if (target.includes("/validate-action")) {
+          // The user escapes while this turn's approval is being posted.
+          controller.abort();
+          return { ok: true, json: () => Promise.resolve({}) };
+        }
+        if (target.endsWith("/cancel")) return { ok: true, status: 200, json: () => Promise.resolve({ success: true }) };
+        if (target.endsWith("/messages")) {
+          return { ok: true, json: () => Promise.resolve({ message: { sId: "umsg-8" } }) };
+        }
+        if (target.includes("/events")) {
+          eventStreams += 1;
+          // Turn one asks for approval; turn two just completes.
+          return eventStreams === 1
+            ? { ok: true, body: makeSseStream([approveEvent]) }
+            : { ok: true, body: makeSseStream([{ type: "agent_message_success" }]) };
+        }
+        return { ok: true, json: () => Promise.resolve(makeConversationGetResponse("conv-cancel-7", "umsg-8", "amsg-8")) };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const first = streamSimple(makeModel(), { messages: [{ role: "user", content: "Hello" }] }, { signal: controller.signal });
+      await expect(first.result()).resolves.toMatchObject({ stopReason: "aborted" });
+
+      const second = streamSimple(makeModel(), { messages: [{ role: "user", content: "Again" }] }, {});
+      await expect(second.result()).resolves.toMatchObject({ stopReason: "stop" });
+
+      // Turn two's own tool call must still be prompted for. A pre-approval left
+      // behind by turn one would be consumed here instead, running it silently.
+      const request = {
+        jsonrpc: "2.0",
+        id: "mcp_req_conv-cancel-7_amsg-8_11111111-2222-3333-4444-555555555555_1",
+        method: "tools/call",
+        params: { name: "bash", arguments: { command: "echo hi" } },
+      };
+      mcpController.enqueue(encoder.encode(`data: ${JSON.stringify({ eventId: "mcp-e0", data: request })}\n\n`));
+
+      await waitForCall(
+        () => confirmFn.mock.calls.find(([title]) => String(title).includes("Dust agent wants to run")),
+        "the approval prompt for turn two's tool call",
+      );
     });
 
     // A tool call that arrives mid-turn parks on the approval gate. Cancelling

@@ -44,7 +44,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
-      isTurnCancelled: () => false,
+      isCancelledRequest: () => false,
     });
 
     await Promise.resolve();
@@ -73,7 +73,7 @@ describe("dust MCP runtime helpers", () => {
         getConfirmFn: () => async () => true,
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
-        isTurnCancelled: () => false,
+        isCancelledRequest: () => false,
       }),
     ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
 
@@ -96,7 +96,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
-      isTurnCancelled: () => false,
+      isCancelledRequest: () => false,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -121,7 +121,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
-      isTurnCancelled: () => false,
+      isCancelledRequest: () => false,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(0);
@@ -143,7 +143,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
-      isTurnCancelled: () => false,
+      isCancelledRequest: () => false,
     });
 
     await Promise.resolve();
@@ -188,7 +188,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
-      isTurnCancelled: () => false,
+      isCancelledRequest: () => false,
     });
 
     expect(postedBodies).toHaveLength(1);
@@ -242,7 +242,7 @@ describe("dust MCP listener shutdown", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
-      isTurnCancelled: () => false,
+      isCancelledRequest: () => false,
     });
 
     await Promise.resolve();

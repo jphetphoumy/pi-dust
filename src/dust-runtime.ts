@@ -7,6 +7,7 @@ import {
   saveConversationId as persistConversationId,
 } from "./dust-state.js";
 import type { DustCredentials, PiRuntimeContext } from "./dust-types.js";
+import { agentMessageIdFromMcpRequestId } from "./dust-validation.js";
 
 export interface SessionContextController {
   getSessionFile: () => string | undefined;
@@ -37,6 +38,8 @@ const NOOP_SESSION_CONTEXT: SessionContextController = {
 };
 
 const NOOP_CONFIRM = async () => true;
+/** Enough to cover any turn whose tool calls could still be in flight. */
+const MAX_REMEMBERED_CANCELLED_MESSAGES = 50;
 
 /**
  * The Dust-side half of one pi turn.
@@ -86,6 +89,8 @@ export class DustSessionRuntime {
    * itself; the next turn clears it.
    */
   private lastTurnCancelled = false;
+  /** Agent messages the user cancelled, for correlating late tool calls. */
+  private cancelledAgentMessages = new Set<string>();
 
   beginTurn(
     conversationSId: string,
@@ -122,6 +127,9 @@ export class DustSessionRuntime {
     }
     turn.cancelled = true;
     this.lastTurnCancelled = true;
+    if (turn.agentMessageSId) {
+      this.markAgentMessageCancelled(turn.agentMessageSId);
+    }
     turn.toolAbortController.abort();
     // Pre-approvals belong to the turn that collected them. A tool call refused
     // for being cancelled never consumes its entry, so leaving the queue in
@@ -135,6 +143,37 @@ export class DustSessionRuntime {
 
   isTurnCancelled(): boolean {
     return this.activeTurn ? this.activeTurn.cancelled : this.lastTurnCancelled;
+  }
+
+  /**
+   * Records an agent message whose loop the user cancelled.
+   *
+   * Cancelling is asynchronous on Dust's side, so a cancelled loop can still
+   * emit tool calls after the user has started another turn — by which point
+   * the current-turn check has moved on and would let them through.
+   */
+  markAgentMessageCancelled(agentMessageSId: string): void {
+    this.cancelledAgentMessages.add(agentMessageSId);
+    // Bounded: only recent turns can still have requests in flight, and this
+    // set lives for the whole session.
+    while (this.cancelledAgentMessages.size > MAX_REMEMBERED_CANCELLED_MESSAGES) {
+      const oldest = this.cancelledAgentMessages.values().next();
+      if (oldest.done) break;
+      this.cancelledAgentMessages.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Whether this MCP request should be refused: either it names an agent
+   * message the user cancelled, or — when the request carries no usable id —
+   * the current turn is cancelled.
+   */
+  isCancelledRequest(requestId: unknown): boolean {
+    const agentMessageSId = agentMessageIdFromMcpRequestId(requestId);
+    if (agentMessageSId !== null && this.cancelledAgentMessages.has(agentMessageSId)) {
+      return true;
+    }
+    return this.isTurnCancelled();
   }
 
   createApprovalGate(): void {
@@ -156,6 +195,7 @@ export class DustSessionRuntime {
     // local tools must not keep running against the old session.
     this.cancelActiveTurn();
     this.activeTurn = null;
+    this.cancelledAgentMessages.clear();
     if (this.mcpHeartbeatTimer) {
       clearInterval(this.mcpHeartbeatTimer);
       this.mcpHeartbeatTimer = null;

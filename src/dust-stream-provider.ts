@@ -144,7 +144,7 @@ async function ensureMcpServer(
     getConfirmFn: () => runtime.confirmFn,
     getPendingApprovalPromise: () => runtime.pendingApprovalPromise,
     preApprovedActions: runtime.preApprovedActions,
-    isTurnCancelled: () => runtime.isTurnCancelled(),
+    isCancelledRequest: (requestId) => runtime.isCancelledRequest(requestId),
   }).catch((err) => {
     // Shutting the session down aborts the listener; that is not a failure.
     if (isAbortError(err, abortController.signal)) {
@@ -253,7 +253,7 @@ export async function cancelPendingAgentMessage(
   conversationSId: string,
   userMessageSId: string,
   refreshAuth?: () => Promise<boolean>,
-): Promise<void> {
+): Promise<string | null> {
   debugLog("dust:session", "Recovering agent message id to cancel", { conversationSId, userMessageSId });
 
   const lookup = async (): Promise<string> => fetchConversationAgentMessageId(
@@ -280,7 +280,7 @@ export async function cancelPendingAgentMessage(
         error: errorMessage(error),
         reason: isMissingAgentMessageError(error) ? "not-materialized" : "transport",
       });
-      return;
+      return null;
     }
     try {
       agentMessageSId = await lookup();
@@ -289,10 +289,11 @@ export async function cancelPendingAgentMessage(
         error: errorMessage(retryError),
         reason: isMissingAgentMessageError(retryError) ? "not-materialized" : "transport",
       });
-      return;
+      return null;
     }
   }
   await cancelMessageGeneration(baseUrl, getAuthHeaders, conversationSId, [agentMessageSId], refreshAuth);
+  return agentMessageSId;
 }
 
 async function createConversation(
@@ -542,14 +543,19 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
                 refreshAuth,
               );
             } else {
-              // Cancelled before the lookup resolved: find the message first.
+              // Cancelled before the lookup resolved: find the message first,
+              // then remember it, so tool calls it emits later are refused too.
               void cancelPendingAgentMessage(
                 baseUrl,
                 getAuthHeaders,
                 cancelled.conversationSId,
                 cancelled.userMessageSId,
                 refreshAuth,
-              );
+              ).then((agentMessageSId) => {
+                if (agentMessageSId) {
+                  runtime.markAgentMessageCancelled(agentMessageSId);
+                }
+              });
             }
           };
           turnCleanup.onAbort = onAbort;
@@ -619,7 +625,17 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
             postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
-          recordPreApproval: (actionId, approved) => runtime.preApprovedActions.set(actionId, approved),
+          // Approving is two awaits long (the dialog, then validate-action), so
+          // the turn can be cancelled underneath it. Recording then would put an
+          // entry back into a queue `cancelActiveTurn` had just cleared, where
+          // it would positionally approve some later turn's tool call.
+          recordPreApproval: (actionId, approved) => {
+            if (runtime.isTurnCancelled()) {
+              debugLog("dust:session", "Dropping pre-approval for a cancelled turn", { actionId });
+              return;
+            }
+            runtime.preApprovedActions.set(actionId, approved);
+          },
           resolveApprovalGate: () => runtime.resolveApprovalGate(),
           // Dust stopped the loop itself; no cancel request to send, but the
           // turn is over and any tool call still in flight must be refused.
