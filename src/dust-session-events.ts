@@ -153,6 +153,10 @@ function attachConversation(
   // server registered for that one must not be reused, and its pending
   // approvals belong to a conversation we are leaving.
   runtime.clearMcpState();
+  // Same reasoning for the credit figures: the elapsed clock, the message
+  // count and the session credit baseline all describe the session being left,
+  // and the cached breakdowns may even belong to another workspace.
+  runtime.credits.reset();
 
   const attachment = resolveAttachment({
     reason,

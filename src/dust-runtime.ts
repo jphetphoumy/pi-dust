@@ -6,7 +6,17 @@ import {
   persistCredentialState,
   saveConversationId as persistConversationId,
 } from "./dust-state.js";
-import type { DustCredentials, PiRuntimeContext } from "./dust-types.js";
+import type {
+  DustCredentials,
+  FairUseCredits,
+  MemberUsage,
+  CreditTotals,
+  DustStatusData,
+  PiRuntimeContext,
+  TopConversations,
+  UsageAnalytics,
+} from "./dust-types.js";
+import { agentMessageIdFromMcpRequestId } from "./dust-validation.js";
 
 export interface SessionContextController {
   getSessionFile: () => string | undefined;
@@ -37,6 +47,111 @@ const NOOP_SESSION_CONTEXT: SessionContextController = {
 };
 
 const NOOP_CONFIRM = async () => true;
+/** Enough to cover any turn whose tool calls could still be in flight. */
+const MAX_REMEMBERED_CANCELLED_MESSAGES = 50;
+
+/**
+ * The Dust-side half of one pi turn.
+ *
+ * Cancelling a turn needs the agent message the Dust agent loop is running
+ * under, and a way to kill local tool work that the (session-lifetime) MCP
+ * listener started on its behalf.
+ */
+export interface ActiveDustTurn {
+  conversationSId: string;
+  userMessageSId: string;
+  /**
+   * Null until the lookup that follows the user message resolves. Posting that
+   * message is what starts the agent loop, so a turn exists — and can be
+   * cancelled — before its agent message is known.
+   */
+  agentMessageSId: string | null;
+  /** Aborted when the user cancels, so in-flight local tools stop too. */
+  toolAbortController: AbortController;
+  cancelled: boolean;
+}
+
+/**
+ * Per-session counters and caches behind `/status`.
+ *
+ * Dust reports credits per *billing period*, never per session, so the session
+ * figure is a delta against a baseline sample — approximate by construction, and
+ * labelled as such in the panel.
+ */
+export class DustCreditTracker {
+  startedAt = Date.now();
+  messagesSent = 0;
+  /**
+   * First `consumedAwuCredits` observed this session, with when it was taken.
+   * Sampled on the first live read rather than at session start, so a user who
+   * never opens `/status` never pays for the request.
+   */
+  baselineCredits: number | null = null;
+  baselineAt: number | null = null;
+  /**
+   * Set when a turn completes, cleared when live figures are refetched. Live
+   * data is only served from memory while this is false — i.e. while nothing has
+   * happened that could have moved the numbers.
+   */
+  dirty = false;
+  /** Last live read, reused only while `dirty` is false. */
+  lastConsumedCredits: number | null = null;
+  cachedUsage: MemberUsage | null = null;
+  cachedFairUse: FairUseCredits | null = null;
+  cachedTotals: CreditTotals = { month: null, week: null, day: null };
+  /** Last fully-built overview, repainted instantly when the session has not moved. */
+  lastOverview: DustStatusData | null = null;
+  /** 30-day aggregates; they do not meaningfully move within one session. */
+  analytics: UsageAnalytics | null = null;
+  topConversations: TopConversations | null = null;
+
+  recordMessageSent(): void {
+    this.messagesSent++;
+  }
+
+  recordTurnCompleted(): void {
+    this.dirty = true;
+  }
+
+  /** Folds a fresh `consumedAwuCredits` reading in, returning the session delta. */
+  observeConsumedCredits(consumed: number | null): number | null {
+    this.dirty = false;
+    if (consumed === null) return null;
+
+    this.lastConsumedCredits = consumed;
+    if (this.baselineCredits === null) {
+      this.baselineCredits = consumed;
+      this.baselineAt = Date.now();
+    }
+    return Math.max(0, consumed - this.baselineCredits);
+  }
+
+  /** The delta implied by the last reading, without issuing a new one. */
+  sessionDelta(): number | null {
+    if (this.lastConsumedCredits === null || this.baselineCredits === null) return null;
+    return Math.max(0, this.lastConsumedCredits - this.baselineCredits);
+  }
+
+  /**
+   * Drops everything derived from the workspace or the credential. The elapsed
+   * clock restarts too: a switched workspace is, for credit purposes, a new
+   * session.
+   */
+  reset(): void {
+    this.startedAt = Date.now();
+    this.messagesSent = 0;
+    this.baselineCredits = null;
+    this.baselineAt = null;
+    this.dirty = false;
+    this.lastConsumedCredits = null;
+    this.cachedUsage = null;
+    this.cachedFairUse = null;
+    this.cachedTotals = { month: null, week: null, day: null };
+    this.lastOverview = null;
+    this.analytics = null;
+    this.topConversations = null;
+  }
+}
 
 interface HeldAccessToken {
   token: string;
@@ -112,9 +227,105 @@ export class DustSessionRuntime {
    * default, so a fresh session never silently executes tools.
    */
   autoApprove = false;
+  /** Session counters and credit caches read by `/status`. */
+  credits = new DustCreditTracker();
   preApprovedActions = new Map<string, boolean>();
   pendingApprovalPromise: Promise<void> | null = null;
   private resolveApprovalGateFn: (() => void) | null = null;
+  /** The turn currently streaming, if any. */
+  activeTurn: ActiveDustTurn | null = null;
+  /**
+   * Whether the most recent turn was cancelled. Dust tool calls can arrive
+   * after the stream has already closed, so the verdict has to outlive the turn
+   * itself; the next turn clears it.
+   */
+  private lastTurnCancelled = false;
+  /** Agent messages the user cancelled, for correlating late tool calls. */
+  private cancelledAgentMessages = new Set<string>();
+
+  beginTurn(
+    conversationSId: string,
+    userMessageSId: string,
+    agentMessageSId: string | null = null,
+  ): ActiveDustTurn {
+    this.lastTurnCancelled = false;
+    const turn: ActiveDustTurn = {
+      conversationSId,
+      userMessageSId,
+      agentMessageSId,
+      toolAbortController: new AbortController(),
+      cancelled: false,
+    };
+    this.activeTurn = turn;
+    return turn;
+  }
+
+  /** Clears `activeTurn` only if `turn` is still the current one. */
+  endTurn(turn: ActiveDustTurn): void {
+    if (this.activeTurn === turn) {
+      this.activeTurn = null;
+    }
+  }
+
+  /**
+   * Marks the current turn cancelled and aborts its local tool work. Returns
+   * the turn so the caller can tell Dust to stop it, or null if none is live.
+   */
+  cancelActiveTurn(): ActiveDustTurn | null {
+    const turn = this.activeTurn;
+    if (!turn || turn.cancelled) {
+      return null;
+    }
+    turn.cancelled = true;
+    this.lastTurnCancelled = true;
+    if (turn.agentMessageSId) {
+      this.markAgentMessageCancelled(turn.agentMessageSId);
+    }
+    turn.toolAbortController.abort();
+    // Pre-approvals belong to the turn that collected them. A tool call refused
+    // for being cancelled never consumes its entry, so leaving the queue in
+    // place would auto-approve an unrelated tool call in a later turn.
+    this.preApprovedActions.clear();
+    // A tool waiting on approval must not block the MCP listener forever once
+    // the turn it belonged to is gone.
+    this.resolveApprovalGate();
+    return turn;
+  }
+
+  isTurnCancelled(): boolean {
+    return this.activeTurn ? this.activeTurn.cancelled : this.lastTurnCancelled;
+  }
+
+  /**
+   * Records an agent message whose loop the user cancelled.
+   *
+   * Cancelling is asynchronous on Dust's side, so a cancelled loop can still
+   * emit tool calls after the user has started another turn — by which point
+   * the current-turn check has moved on and would let them through.
+   */
+  markAgentMessageCancelled(agentMessageSId: string): void {
+    this.cancelledAgentMessages.add(agentMessageSId);
+    // Bounded: only recent turns can still have requests in flight, and this
+    // set lives for the whole session.
+    while (this.cancelledAgentMessages.size > MAX_REMEMBERED_CANCELLED_MESSAGES) {
+      const oldest = this.cancelledAgentMessages.values().next();
+      if (oldest.done) break;
+      this.cancelledAgentMessages.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Whether this MCP request should be refused: either it names an agent
+   * message the user cancelled, or — when the request carries no usable id —
+   * the current turn is cancelled.
+   */
+  isCancelledRequest(requestId: unknown): boolean {
+    const agentMessageSId = agentMessageIdFromMcpRequestId(requestId);
+    if (agentMessageSId !== null && this.cancelledAgentMessages.has(agentMessageSId)) {
+      return true;
+    }
+    return this.isTurnCancelled();
+  }
 
   /** Publishes a freshly refreshed token, valid until `expiresAt` (ms epoch). */
   setRefreshedAccessToken(token: string, expiresAt: number): void {
@@ -163,6 +374,11 @@ export class DustSessionRuntime {
   }
 
   clearMcpState(): void {
+    // Switching session or losing credentials ends any turn in flight; its
+    // local tools must not keep running against the old session.
+    this.cancelActiveTurn();
+    this.activeTurn = null;
+    this.cancelledAgentMessages.clear();
     if (this.mcpHeartbeatTimer) {
       clearInterval(this.mcpHeartbeatTimer);
       this.mcpHeartbeatTimer = null;
@@ -184,6 +400,7 @@ export class DustSessionRuntime {
 
   resetSessionState(): void {
     this.conversationId = null;
+    this.credits.reset();
     this.clearRefreshedAccessToken();
     this.clearMcpState();
   }
@@ -206,6 +423,9 @@ export function invalidateRuntimeCredentials(runtime: DustSessionRuntime, creden
   runtime.sessionContext.setCredentials(invalidateCredentials(credentials));
   markInvalidated();
   runtime.conversationId = null;
+  // The credit figures belong to the dead credential; keeping them would show
+  // another account's numbers after a re-login.
+  runtime.credits.reset();
   runtime.clearRefreshedAccessToken();
   runtime.clearMcpState();
 }

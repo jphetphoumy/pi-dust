@@ -1,4 +1,4 @@
-import { DUST_MCP_PROTOCOL_VERSION, MCP_REGISTRATION_LOST_MESSAGE, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { CANCELLED_TOOL_MESSAGE, DUST_MCP_PROTOCOL_VERSION, MCP_REGISTRATION_LOST_MESSAGE, MCP_SERVER_NAME, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
@@ -135,6 +135,13 @@ interface ListenMcpRequestsOptions {
   getConfirmFn: () => (title: string, message: string) => Promise<boolean>;
   getPendingApprovalPromise: () => Promise<void> | null;
   preApprovedActions: Map<string, boolean>;
+  /**
+   * True when the tool call belongs to a turn the user cancelled — matched on
+   * the request id where possible, falling back to the current turn. Required
+   * rather than defaulted: a missing check here means tool calls from a
+   * cancelled turn run on the user's machine, so it must not fail open.
+   */
+  isCancelledRequest: (requestId: unknown) => boolean;
 }
 
 export async function listenMcpRequests({
@@ -149,6 +156,7 @@ export async function listenMcpRequests({
   getConfirmFn,
   getPendingApprovalPromise,
   preApprovedActions,
+  isCancelledRequest,
 }: ListenMcpRequestsOptions): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
@@ -316,14 +324,26 @@ export async function listenMcpRequests({
                 // tool call regardless, then POST the result to a
                 // registration that's already gone (or, on a session switch,
                 // to whatever session is live now instead of the one that
-                // asked).
+                // asked). This is distinct from a cancelled *turn* below: the
+                // listener itself is done for, so there is no one left to
+                // post a result to either way.
                 if (abortController.signal.aborted) {
                   debugLog("dust:mcp", "MCP listener aborted while parked on the approval gate, skipping tool execution", { toolName });
                   return;
                 }
 
+                // A cancelled turn can still have tool calls in flight: Dust
+                // queued them before our cancel reached the agent loop. Refusing
+                // them up front also keeps the approval prompt from popping up
+                // for a turn the user just stopped. The listener itself is
+                // still alive here (the check above already returned if not),
+                // so this still POSTs a real refusal result back to Dust.
                 let allowed: boolean;
-                if (preApprovedActions.size > 0) {
+                const cancelled = isCancelledRequest(request.id);
+                if (cancelled) {
+                  debugLog("dust:mcp", "Refusing tool call from a cancelled turn", { toolName });
+                  allowed = false;
+                } else if (preApprovedActions.size > 0) {
                   const firstEntry = preApprovedActions.entries().next();
                   if (firstEntry.done) {
                     allowed = await getConfirmFn()(
@@ -342,9 +362,10 @@ export async function listenMcpRequests({
                   );
                 }
 
+                const refusalText = cancelled ? CANCELLED_TOOL_MESSAGE : "Tool execution denied by user.";
                 const toolResult = allowed
                   ? await executeMcpTool(toolName, toolArgs)
-                  : { content: [{ type: "text", text: "Tool execution denied by user." }], isError: true };
+                  : { content: [{ type: "text", text: refusalText }], isError: true };
 
                 const responseMsg = {
                   jsonrpc: "2.0",

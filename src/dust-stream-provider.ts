@@ -1,16 +1,24 @@
-import { DUST_HEADERS, MCP_REGISTRATION_LOST_MESSAGE, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
+import { CANCELLED_MESSAGE, CANCELLED_TOOL_MESSAGE, DUST_HEADERS, MCP_REGISTRATION_LOST_MESSAGE, MCP_TOOL_PREFIX, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
-import { createEventStream, findAgentMessageSId, makeEmptyMessage, streamEvents } from "./dust-stream.js";
+import { createEventStream, findAgentMessageSId, isMissingAgentMessageError, makeEmptyMessage, streamEvents } from "./dust-stream.js";
 import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
-import { errorMessage, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
+import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
 import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
-import type { DustSessionRuntime } from "./dust-runtime.js";
+import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
+const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
+/** Grace for Dust to attach the agent message before the recovery re-reads. */
+const AGENT_MESSAGE_RETRY_DELAY_MS = 500;
+
+async function waitBeforeRetry(): Promise<true> {
+  await new Promise((resolve) => setTimeout(resolve, AGENT_MESSAGE_RETRY_DELAY_MS));
+  return true;
+}
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
@@ -132,8 +140,20 @@ async function ensureMcpServer(
     buildConfirmMessage,
     getTools: () => getMcpTools(runtime.extensionContext as never),
     executeMcpTool: async (name, args) => {
+      // Second line of defence behind the listener's own check: the turn can be
+      // cancelled while a tool sits at the approval prompt, and running it then
+      // would touch the user's machine for a turn they just stopped.
+      if (runtime.isTurnCancelled()) {
+        debugLog("dust:mcp", "Dropping tool call from a cancelled turn", { name });
+        return { content: [{ type: "text", text: CANCELLED_TOOL_MESSAGE }], isError: true };
+      }
       const startedAt = Date.now();
-      const result = await executeMcpTool(name, args, runtime.extensionContext as never);
+      const result = await executeMcpTool(
+        name,
+        args,
+        runtime.extensionContext as never,
+        runtime.activeTurn?.toolAbortController.signal,
+      );
       // Dust tool calls bypass pi's tool pipeline, so nothing would appear in
       // the transcript. Record the call so it renders like a native one.
       if (runtime.pi) {
@@ -151,6 +171,7 @@ async function ensureMcpServer(
     getConfirmFn: () => runtime.confirmFn,
     getPendingApprovalPromise: () => runtime.pendingApprovalPromise,
     preApprovedActions: runtime.preApprovedActions,
+    isCancelledRequest: (requestId) => runtime.isCancelledRequest(requestId),
   }).catch((err) => {
     // Shutting the session down aborts the listener; that is not a failure.
     if (isAbortError(err, abortController.signal)) {
@@ -219,6 +240,127 @@ async function postValidateAction(
     // side of it is what failed to record.
     debugLog("dust:session", "Post validate-action failed", { status: res.status, conversationId, messageId, actionId });
   }
+}
+
+/**
+ * Hard-stops the Dust agent loop running under `messageIds`.
+ *
+ * Dust signals the agent's workflow, marks the messages cancelled and publishes
+ * `agent_generation_cancelled`. Without this the loop keeps running server-side
+ * after the user hits escape — still burning tokens and, worse, still asking our
+ * MCP server to run local tools.
+ *
+ * Deliberately not tied to the turn's abort signal: it is sent *because* that
+ * signal fired, so it must outlive it. Failures are logged, never thrown — the
+ * turn is already over and there is nothing the user could do about them.
+ */
+export async function cancelMessageGeneration(
+  baseUrl: string,
+  getAuthHeaders: () => Record<string, string>,
+  conversationId: string,
+  messageIds: string[],
+  refreshAuth?: () => Promise<boolean>,
+): Promise<void> {
+  const url = `${baseUrl}/assistant/conversations/${conversationId}/cancel`;
+  debugLog("dust:session", "Cancelling message generation", { conversationId, messageIds, url });
+
+  const post = async (): Promise<Response> => fetch(url, {
+    method: "POST",
+    headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ messageIds }),
+    signal: AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+  });
+
+  try {
+    let res = await post();
+    // The turns most worth cancelling are the long ones, which are also the
+    // ones most likely to have outlived the ~15 minute access token. Giving up
+    // on the 401 would fail exactly when this matters most.
+    if (res.status === 401 && refreshAuth && await refreshAuth()) {
+      debugLog("dust:session", "Refreshed token after 401, retrying cancel", { conversationId });
+      res = await post();
+    }
+    if (!res.ok) {
+      debugLog("dust:session", "Cancel request failed", { status: res.status, conversationId, messageIds });
+      return;
+    }
+    // Dust answers `{ success: true }`; anything else means the agent loop was
+    // not signalled, which would otherwise pass silently as a 200.
+    const body = await res.json().catch(() => null);
+    if (!isRecord(body) || body.success !== true) {
+      debugLog("dust:session", "Cancel request returned an unexpected body", { conversationId, body });
+      return;
+    }
+    debugLog("dust:session", "Cancel request accepted", { conversationId, messageIds });
+  } catch (error) {
+    debugLog("dust:session", "Cancel request threw", { error: errorMessage(error), conversationId });
+  }
+}
+
+/**
+ * Cancels the agent message Dust spawned for `userMessageSId`, looking it up
+ * first.
+ *
+ * Posting the user message is what starts the agent loop, so a turn cancelled
+ * between that POST and learning the agent message's id still has a loop
+ * running — with no id, the normal cancel path has nothing to send. Best effort
+ * throughout: the lookup runs on its own timeout (the turn's signal is already
+ * aborted) and every failure is logged rather than raised.
+ */
+export async function cancelPendingAgentMessage(
+  baseUrl: string,
+  getAuthHeaders: () => Record<string, string>,
+  conversationSId: string,
+  userMessageSId: string,
+  refreshAuth?: () => Promise<boolean>,
+  /**
+   * Called the moment the id is known, before the cancel is dispatched. The
+   * cancel POST can take seconds, and the caller needs the id to start refusing
+   * that loop's tool calls immediately — not once Dust has answered.
+   */
+  onAgentMessageResolved?: (agentMessageSId: string) => void,
+): Promise<string | null> {
+  debugLog("dust:session", "Recovering agent message id to cancel", { conversationSId, userMessageSId });
+
+  const lookup = async (): Promise<string> => fetchConversationAgentMessageId(
+    baseUrl,
+    getAuthHeaders(),
+    AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+    conversationSId,
+    userMessageSId,
+  );
+
+  let agentMessageSId: string;
+  try {
+    agentMessageSId = await lookup();
+  } catch (error) {
+    // Two failures worth telling apart. An expired token is fixable by
+    // refreshing; a conversation that does not carry the agent message yet just
+    // needs a moment, and that is exactly the window this recovery exists for,
+    // so retrying beats giving up. Anything else is a transport failure.
+    const retryable = isMissingAgentMessageError(error)
+      ? await waitBeforeRetry()
+      : isSessionExpiredError(error) && refreshAuth !== undefined && await refreshAuth();
+    if (!retryable) {
+      debugLog("dust:session", "Agent message lookup for cancel failed", {
+        error: errorMessage(error),
+        reason: isMissingAgentMessageError(error) ? "not-materialized" : "transport",
+      });
+      return null;
+    }
+    try {
+      agentMessageSId = await lookup();
+    } catch (retryError) {
+      debugLog("dust:session", "Agent message lookup failed on retry", {
+        error: errorMessage(retryError),
+        reason: isMissingAgentMessageError(retryError) ? "not-materialized" : "transport",
+      });
+      return null;
+    }
+  }
+  onAgentMessageResolved?.(agentMessageSId);
+  await cancelMessageGeneration(baseUrl, getAuthHeaders, conversationSId, [agentMessageSId], refreshAuth);
+  return agentMessageSId;
 }
 
 async function createConversation(
@@ -360,6 +502,12 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
   ) {
     const stream = createEventStream();
     let liveCred: DustCredentials = runtime.sessionContext.getCredentials() ?? cred;
+    /** Filled in once the turn is armed; drained in `finally`. */
+    const turnCleanup: {
+      abortSignal: AbortSignal | null;
+      onAbort: (() => void) | null;
+      endTurn: (() => void) | null;
+    } = { abortSignal: null, onAbort: null, endTurn: null };
 
     (async () => {
       try {
@@ -479,9 +627,60 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           .join("\n\n");
         debugLog("dust:session", "Prepared user message", { userText, systemPrompt, currentConversationId: runtime.conversationId });
 
+        let agentMessageSId: string;
         let conversationSId: string;
         let userMessageSId: string;
-        let agentMessageSId: string;
+
+        /**
+         * Arms cancellation for this turn. Called as soon as the user message is
+         * accepted, because that POST is what starts the agent loop: from here
+         * on escape has something real to stop, whether or not the agent message
+         * id is known yet.
+         */
+        /** The turn this stream owns, once armed. */
+        let currentTurn: ActiveDustTurn;
+
+        const startTurn = (turn: ActiveDustTurn): void => {
+          currentTurn = turn;
+          const onAbort = () => {
+            const cancelled = runtime.cancelActiveTurn();
+            if (!cancelled) return;
+            if (cancelled.agentMessageSId) {
+              void cancelMessageGeneration(
+                baseUrl,
+                getAuthHeaders,
+                cancelled.conversationSId,
+                [cancelled.agentMessageSId],
+                refreshAuth,
+              );
+            } else {
+              // Cancelled before the lookup resolved: find the message first.
+              // It is recorded as the lookup lands rather than when the cancel
+              // POST returns — that request can stall for seconds, and until the
+              // id is known its loop's tool calls cannot be told apart.
+              void cancelPendingAgentMessage(
+                baseUrl,
+                getAuthHeaders,
+                cancelled.conversationSId,
+                cancelled.userMessageSId,
+                refreshAuth,
+                (agentMessageSId) => runtime.markAgentMessageCancelled(agentMessageSId),
+              );
+            }
+          };
+          turnCleanup.onAbort = onAbort;
+          if (signal) {
+            // The turn may already have been cancelled while we were setting the
+            // conversation up; addEventListener alone would never fire then.
+            if (signal.aborted) {
+              onAbort();
+            } else {
+              turnCleanup.abortSignal = signal;
+              signal.addEventListener("abort", onAbort, { once: true });
+            }
+          }
+          turnCleanup.endTurn = () => runtime.endTurn(turn);
+        };
 
         if (!runtime.conversationId) {
           ({ conversationSId, userMessageSId, agentMessageSId } = await createConversation(
@@ -495,6 +694,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             timezone,
             systemPrompt || undefined,
           ));
+          startTurn(runtime.beginTurn(conversationSId, userMessageSId, agentMessageSId));
         } else {
           conversationSId = runtime.conversationId;
           userMessageSId = await postMessageToConversation(
@@ -508,6 +708,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             username,
             timezone,
           );
+          // Posting the user message is what starts the agent loop, so the turn
+          // begins here rather than after the lookup below: escaping during that
+          // lookup has to count as a cancellation, not as a turn that never was.
+          const turn = runtime.beginTurn(conversationSId, userMessageSId);
+          startTurn(turn);
           agentMessageSId = await fetchConversationAgentMessageId(
             baseUrl,
             resolveAuthHeaders(),
@@ -515,7 +720,10 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             conversationSId,
             userMessageSId,
           );
+          turn.agentMessageSId = agentMessageSId;
         }
+
+        runtime.credits.recordMessageSent();
 
         await streamEvents({
           baseUrl,
@@ -529,21 +737,48 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
             postValidateAction(baseUrl, resolveAuthHeaders(), conversationId, messageId, actionId, approved),
-          recordPreApproval: (actionId, approved) => runtime.preApprovedActions.set(actionId, approved),
+          // Approving is two awaits long (the dialog, then validate-action, the
+          // latter not tied to the turn's signal), so it can outlive the turn
+          // entirely. The check is against *this* turn rather than whichever is
+          // current: by the time a late approval lands the next turn may have
+          // started, and writing the entry then would positionally approve that
+          // turn's first tool call out of a queue `cancelActiveTurn` had cleared.
+          recordPreApproval: (actionId, approved) => {
+            if (currentTurn.cancelled) {
+              debugLog("dust:session", "Dropping pre-approval for a cancelled turn", { actionId });
+              return;
+            }
+            runtime.preApprovedActions.set(actionId, approved);
+          },
           resolveApprovalGate: () => runtime.resolveApprovalGate(),
+          // Dust stopped the loop itself; no cancel request to send, but the
+          // turn is over and any tool call still in flight must be refused.
+          onCancelled: () => { runtime.cancelActiveTurn(); },
         });
       } catch (error) {
-        debugLog("dust:session", "Dust stream failed", { error: errorMessage(error) });
-        if (isSessionExpiredError(error)) {
+        // Aborting mid-setup (before the SSE stream owns the abort) surfaces as
+        // a rejected fetch. That is the user cancelling, not a failure.
+        const aborted = options?.signal?.aborted === true;
+        debugLog("dust:session", aborted ? "Dust stream aborted" : "Dust stream failed", { error: errorMessage(error) });
+        if (!aborted && isSessionExpiredError(error)) {
           invalidateRuntimeCredentials(runtime, liveCred);
         }
         const message = makeEmptyMessage(model);
-        message.stopReason = "error";
-        message.errorMessage = error instanceof Error ? error.message : String(error);
-        stream.push({ type: "error", reason: "error", error: message });
+        message.stopReason = aborted ? "aborted" : "error";
+        message.errorMessage = aborted ? CANCELLED_MESSAGE : errorMessage(error);
+        stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
         stream.end();
       } finally {
         runtime.resolveApprovalGate();
+        const { abortSignal, onAbort, endTurn } = turnCleanup;
+        if (abortSignal && onAbort) {
+          abortSignal.removeEventListener("abort", onAbort);
+        }
+        endTurn?.();
+        // A turn burns credits whether or not it ended cleanly — an aborted or
+        // failed turn still ran tools — so `/status` must re-read afterwards
+        // rather than answer from what it cached before the turn.
+        runtime.credits.recordTurnCompleted();
       }
     })();
 

@@ -50,6 +50,7 @@ describe("dust stream runtime helpers", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
 
     const reader = (async () => {
@@ -91,6 +92,7 @@ describe("dust stream runtime helpers", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
 
     await Promise.resolve();
@@ -118,6 +120,7 @@ describe("dust stream runtime helpers", () => {
         postValidateAction: async () => undefined,
         recordPreApproval: () => undefined,
         resolveApprovalGate: () => undefined,
+        onCancelled: () => undefined,
       }),
     ).rejects.toThrow(/session expired/i);
   });
@@ -139,6 +142,7 @@ describe("dust stream runtime helpers", () => {
         postValidateAction: async () => undefined,
         recordPreApproval: () => undefined,
         resolveApprovalGate: () => undefined,
+        onCancelled: () => undefined,
       }),
     ).rejects.toThrow("Failed to stream events: HTTP 404");
   });
@@ -160,6 +164,7 @@ describe("dust stream runtime helpers", () => {
         postValidateAction: async () => undefined,
         recordPreApproval: () => undefined,
         resolveApprovalGate: () => undefined,
+        onCancelled: () => undefined,
       }),
     ).rejects.toThrow("SSE response has no body");
   });
@@ -193,6 +198,7 @@ describe("dust stream runtime helpers", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
     await read;
 
@@ -231,6 +237,7 @@ describe("dust stream runtime helpers", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
     await read;
 
@@ -267,6 +274,7 @@ describe("dust stream runtime helpers", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
 
     await Promise.resolve();
@@ -329,6 +337,7 @@ describe("dust stream resumption", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
 
     await Promise.resolve();
@@ -377,6 +386,7 @@ describe("dust stream auth recovery", () => {
       postValidateAction: async () => undefined,
       recordPreApproval: () => undefined,
       resolveApprovalGate: () => undefined,
+      onCancelled: () => undefined,
     });
 
     await Promise.resolve();
@@ -406,6 +416,7 @@ describe("dust stream auth recovery", () => {
         postValidateAction: async () => undefined,
         recordPreApproval: () => undefined,
         resolveApprovalGate: () => undefined,
+        onCancelled: () => undefined,
       }),
     ).rejects.toThrow(/session expired/i);
   });

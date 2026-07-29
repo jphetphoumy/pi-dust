@@ -60,6 +60,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     await Promise.resolve();
@@ -94,6 +95,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
@@ -122,6 +124,7 @@ describe("dust MCP runtime helpers", () => {
         getConfirmFn: () => async () => true,
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
+        isCancelledRequest: () => false,
       }),
     ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
 
@@ -153,6 +156,7 @@ describe("dust MCP runtime helpers", () => {
         getConfirmFn: () => async () => true,
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
+        isCancelledRequest: () => false,
       }),
     ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
 
@@ -193,6 +197,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     // Enough real elapsed time for the exponential backoff between the 503s
@@ -243,6 +248,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     // No real time needs to pass between the two 401s — the reset happens on
@@ -300,6 +306,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => confirmFn,
       getPendingApprovalPromise,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     // getPendingApprovalPromise() and the await right after it are adjacent
@@ -338,6 +345,7 @@ describe("dust MCP runtime helpers", () => {
         getConfirmFn: () => async () => true,
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
+        isCancelledRequest: () => false,
       }),
     ).rejects.toThrow(MCP_REGISTRATION_LOST_MESSAGE);
 
@@ -363,6 +371,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(0);
@@ -385,6 +394,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     await Promise.resolve();
@@ -430,6 +440,7 @@ describe("dust MCP runtime helpers", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     expect(postedBodies).toHaveLength(1);
@@ -548,6 +559,7 @@ describe("dust MCP listener shutdown", () => {
       getConfirmFn: () => async () => true,
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
+      isCancelledRequest: () => false,
     });
 
     await Promise.resolve();
