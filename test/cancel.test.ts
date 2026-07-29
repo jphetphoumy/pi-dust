@@ -35,6 +35,7 @@ function makeStreamEventsOptions(overrides: Record<string, unknown> = {}) {
     postValidateAction: async () => undefined,
     recordPreApproval: () => undefined,
     resolveApprovalGate: () => undefined,
+    onCancelled: () => undefined,
     ...overrides,
   };
 }
@@ -178,6 +179,28 @@ describe("cancellation", () => {
       const [cancelUrl, cancelInit] = fetchMock.mock.calls[1] as [string, { body: string }];
       expect(cancelUrl).toBe(`${BASE_URL}/assistant/conversations/conv-1/cancel`);
       expect(JSON.parse(cancelInit.body)).toEqual({ messageIds: ["amsg-1"] });
+    });
+
+    // The recovery runs right after the user message was accepted, which is
+    // exactly when Dust may not have attached the agent message yet.
+    it("retries once when the agent message has not materialized yet", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ conversation: { sId: "conv-1", content: [[{ type: "user_message", sId: "umsg-1" }]] } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationGetResponse("conv-1", "umsg-1", "amsg-late")),
+        })
+        .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve({ success: true }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await cancelPendingAgentMessage(BASE_URL, () => ({}), "conv-1", "umsg-1");
+
+      const cancelCall = (fetchMock.mock.calls as [string, { body?: string }][]).find(([url]) => String(url).endsWith("/cancel"));
+      expect(cancelCall).toBeDefined();
+      expect(JSON.parse(cancelCall![1].body!)).toEqual({ messageIds: ["amsg-late"] });
     });
 
     it("gives up quietly when the lookup fails", async () => {
@@ -553,6 +576,46 @@ describe("cancellation", () => {
       expect(posted.result.result.content[0].text).toBe("Tool execution cancelled by user.");
       // Never prompted: the user escaped, so there was nothing left to approve.
       expect(confirmFn).not.toHaveBeenCalled();
+    });
+
+    // Dust can cancel the generation itself (web UI, another client). The local
+    // abort signal never fires there, so the runtime has to learn about it some
+    // other way — otherwise a late tool call would still run.
+    it("refuses later tool calls when Dust reports the generation cancelled", async () => {
+      const streamSimple = await makeStreamSimpleFn();
+      const encoder = new TextEncoder();
+      let mcpController!: ReadableStreamDefaultController<Uint8Array>;
+      const mcpBody = new ReadableStream<Uint8Array>({ start(c) { mcpController = c; } });
+
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-cancel-6", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        .mockResolvedValueOnce({ ok: true, body: mcpBody })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationResponse("conv-cancel-6", "umsg-6", "amsg-cancel-6")),
+        })
+        .mockResolvedValueOnce({ ok: true, body: makeSseStream([{ type: "agent_generation_cancelled" }]) })
+        .mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({}) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = streamSimple(makeModel(), { messages: [{ role: "user", content: "Hello" }] }, {});
+      await expect(stream.result()).resolves.toMatchObject({ stopReason: "aborted" });
+
+      const request = {
+        jsonrpc: "2.0",
+        id: "req-after-dust-cancel",
+        method: "tools/call",
+        params: { name: "bash", arguments: { command: "touch /tmp/pi-dust-should-not-exist" } },
+      };
+      mcpController.enqueue(encoder.encode(`data: ${JSON.stringify({ eventId: "mcp-e0", data: request })}\n\n`));
+      mcpController.close();
+
+      const posted = await waitForMcpResult(fetchMock, "req-after-dust-cancel");
+      expect(posted.result.result.isError).toBe(true);
+      expect(posted.result.result.content[0].text).toBe("Tool execution cancelled by user.");
     });
 
     it("does not cancel a turn that already completed", async () => {

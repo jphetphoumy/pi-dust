@@ -20,6 +20,7 @@ import {
 const INITIAL_STREAM_RETRY_DELAY_MS = 1_000;
 const MAX_STREAM_RETRY_DELAY_MS = 30_000;
 const MAX_IDLE_RECONNECTS = 3;
+const NO_AGENT_MESSAGE_ERROR = "No agent message found in conversation content";
 
 function streamRetryDelay(attempt: number): number {
   return Math.min(INITIAL_STREAM_RETRY_DELAY_MS * 2 ** attempt, MAX_STREAM_RETRY_DELAY_MS);
@@ -132,7 +133,12 @@ export function findAgentMessageSId(content: unknown[], userMessageSId: string):
       return getStringField(latest, "sId", "agent message");
     }
   }
-  throw new Error("No agent message found in conversation content");
+  throw new Error(NO_AGENT_MESSAGE_ERROR);
+}
+
+/** True when the conversation had no agent message for that user message yet. */
+export function isMissingAgentMessageError(error: unknown): boolean {
+  return error instanceof Error && error.message === NO_AGENT_MESSAGE_ERROR;
 }
 
 interface StreamEventsOptions {
@@ -149,6 +155,12 @@ interface StreamEventsOptions {
   postValidateAction: (conversationId: string, messageId: string, actionId: string, approved: boolean) => Promise<void>;
   recordPreApproval: (actionId: string, approved: boolean) => void;
   resolveApprovalGate: () => void;
+  /**
+   * Dust reported the generation as cancelled. This is the one way a turn ends
+   * cancelled without the local abort signal firing, so the runtime has to be
+   * told separately or it would still treat late tool calls as live.
+   */
+  onCancelled: () => void;
 }
 
 export async function streamEvents({
@@ -164,6 +176,7 @@ export async function streamEvents({
   postValidateAction,
   recordPreApproval,
   resolveApprovalGate,
+  onCancelled,
 }: StreamEventsOptions): Promise<void> {
   const baseSseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
   let fullText = "";
@@ -356,7 +369,9 @@ export async function streamEvents({
                 // Dust says the generation was cancelled — by our own cancel
                 // request, or from the web UI or another client. Either way the
                 // turn was stopped, not completed, so it must not render as a
-                // clean finish.
+                // clean finish, and the runtime has to hear about it: the local
+                // abort signal never fired on this path.
+                onCancelled();
                 finishAborted(stream, model, fullText, resolveApprovalGate);
                 return;
               } else if (eventType === "agent_error") {

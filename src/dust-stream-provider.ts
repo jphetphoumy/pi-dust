@@ -2,7 +2,7 @@ import { CANCELLED_MESSAGE, CANCELLED_TOOL_MESSAGE, DUST_HEADERS, MCP_TOOL_PREFI
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
-import { createEventStream, findAgentMessageSId, makeEmptyMessage, streamEvents } from "./dust-stream.js";
+import { createEventStream, findAgentMessageSId, isMissingAgentMessageError, makeEmptyMessage, streamEvents } from "./dust-stream.js";
 import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
@@ -12,6 +12,13 @@ import type { DustSessionRuntime } from "./dust-runtime.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
 const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
+/** Grace for Dust to attach the agent message before the recovery re-reads. */
+const AGENT_MESSAGE_RETRY_DELAY_MS = 500;
+
+async function waitBeforeRetry(): Promise<true> {
+  await new Promise((resolve) => setTimeout(resolve, AGENT_MESSAGE_RETRY_DELAY_MS));
+  return true;
+}
 
 function isSessionExpiredError(error: unknown): boolean {
   return error instanceof Error && error.message === SESSION_EXPIRED_MESSAGE;
@@ -248,31 +255,40 @@ export async function cancelPendingAgentMessage(
   refreshAuth?: () => Promise<boolean>,
 ): Promise<void> {
   debugLog("dust:session", "Recovering agent message id to cancel", { conversationSId, userMessageSId });
+
+  const lookup = async (): Promise<string> => fetchConversationAgentMessageId(
+    baseUrl,
+    getAuthHeaders(),
+    AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
+    conversationSId,
+    userMessageSId,
+  );
+
   let agentMessageSId: string;
   try {
-    agentMessageSId = await fetchConversationAgentMessageId(
-      baseUrl,
-      getAuthHeaders(),
-      AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
-      conversationSId,
-      userMessageSId,
-    );
+    agentMessageSId = await lookup();
   } catch (error) {
-    if (isSessionExpiredError(error) && refreshAuth && await refreshAuth()) {
-      try {
-        agentMessageSId = await fetchConversationAgentMessageId(
-          baseUrl,
-          getAuthHeaders(),
-          AbortSignal.timeout(CANCEL_REQUEST_TIMEOUT_MS),
-          conversationSId,
-          userMessageSId,
-        );
-      } catch (retryError) {
-        debugLog("dust:session", "Agent message lookup failed after refresh", { error: errorMessage(retryError) });
-        return;
-      }
-    } else {
-      debugLog("dust:session", "Agent message lookup for cancel failed", { error: errorMessage(error) });
+    // Two failures worth telling apart. An expired token is fixable by
+    // refreshing; a conversation that does not carry the agent message yet just
+    // needs a moment, and that is exactly the window this recovery exists for,
+    // so retrying beats giving up. Anything else is a transport failure.
+    const retryable = isMissingAgentMessageError(error)
+      ? await waitBeforeRetry()
+      : isSessionExpiredError(error) && refreshAuth !== undefined && await refreshAuth();
+    if (!retryable) {
+      debugLog("dust:session", "Agent message lookup for cancel failed", {
+        error: errorMessage(error),
+        reason: isMissingAgentMessageError(error) ? "not-materialized" : "transport",
+      });
+      return;
+    }
+    try {
+      agentMessageSId = await lookup();
+    } catch (retryError) {
+      debugLog("dust:session", "Agent message lookup failed on retry", {
+        error: errorMessage(retryError),
+        reason: isMissingAgentMessageError(retryError) ? "not-materialized" : "transport",
+      });
       return;
     }
   }
@@ -596,6 +612,9 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
           recordPreApproval: (actionId, approved) => runtime.preApprovedActions.set(actionId, approved),
           resolveApprovalGate: () => runtime.resolveApprovalGate(),
+          // Dust stopped the loop itself; no cancel request to send, but the
+          // turn is over and any tool call still in flight must be refused.
+          onCancelled: () => { runtime.cancelActiveTurn(); },
         });
       } catch (error) {
         // Aborting mid-setup (before the SSE stream owns the abort) surfaces as
