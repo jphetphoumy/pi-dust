@@ -42,7 +42,7 @@ function makeStreamEventsOptions(overrides: Record<string, unknown> = {}) {
 
 /**
  * Same wiring as `makeStreamSimpleFn`, but with the approval dialog injected
- * through `session_switch` — the path pi uses to hand the extension its UI.
+ * through the session context — the path pi uses to hand the extension its UI.
  */
 async function makeStreamSimpleFnWithConfirm(
   confirmFn: (title: string, message: string) => Promise<boolean>,
@@ -51,7 +51,6 @@ async function makeStreamSimpleFnWithConfirm(
   seedLoggedIn(creds);
   let capturedStreamSimple: (model: unknown, context: unknown, options?: unknown) => PiEventStream;
   let sessionStartHandler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  let sessionSwitchHandler: ((event: unknown, ctx: unknown) => void) | undefined;
 
   const mockApi = {
     registerProvider: vi.fn((_name: string, config: Record<string, never>) => {
@@ -60,7 +59,6 @@ async function makeStreamSimpleFnWithConfirm(
     registerCommand: vi.fn(),
     on: vi.fn((event: string, handler: never) => {
       if (event === "session_start") sessionStartHandler = handler;
-      if (event === "session_switch") sessionSwitchHandler = handler;
     }),
   };
 
@@ -84,7 +82,6 @@ async function makeStreamSimpleFnWithConfirm(
 
   await sessionStartHandler!({}, makeCtx());
   vi.unstubAllGlobals();
-  sessionSwitchHandler!({ reason: "new" }, makeCtx());
 
   return capturedStreamSimple!;
 }

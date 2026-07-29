@@ -2,15 +2,23 @@ import type {
   AgentConfigurationsResponse,
   ConversationCreateResponse,
   ConversationFetchResponse,
+  ConversationSummaryResponse,
+  CreditBreakdownEntry,
+  CreditBucket,
+  CreditSeries,
   DeviceCodeResponse,
   DustAgent,
+  FairUseCredits,
   JsonObject,
   McpRegisterResponse,
   McpRequestLike,
+  MemberUsage,
   MeResponse,
   PostMessageResponse,
   TokenResponse,
   ToolApproveExecutionEvent,
+  TopConversations,
+  UsageAnalytics,
   Workspace,
 } from "./dust-types.js";
 
@@ -219,6 +227,17 @@ export function parseConversationCreateResponse(value: unknown): ConversationCre
   };
 }
 
+export function parseConversationSummaryResponse(value: unknown): ConversationSummaryResponse {
+  const data = parseJsonObject(value, "conversation summary response");
+  const conversation = getRecordField(data, "conversation", "conversation summary response");
+  return {
+    conversation: {
+      sId: getStringField(conversation, "sId", "conversation summary response"),
+      title: getOptionalStringField(conversation, "title"),
+    },
+  };
+}
+
 export function parseConversationFetchResponse(value: unknown): ConversationFetchResponse {
   const data = parseJsonObject(value, "conversation fetch response");
   const conversation = getRecordField(data, "conversation", "conversation fetch response");
@@ -297,6 +316,211 @@ export function parseToolApproveExecutionEvent(value: unknown): ToolApproveExecu
           mcpServerName: getOptionalStringField(metadata, "mcpServerName"),
         }
       : undefined,
+  };
+}
+
+/**
+ * Credit endpoints below are Dust's *private* API — the same routes the web app
+ * calls, not the versioned `/api/v1` surface. They can change shape without a
+ * deprecation, so nothing here throws: a missing or wrongly-typed field becomes
+ * `null` and the corresponding row of `/status` is skipped.
+ */
+function optionalNumber(obj: JsonObject, key: string): number | null {
+  const value = obj[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function optionalString(obj: JsonObject, key: string): string | null {
+  const value = obj[key];
+  return typeof value === "string" ? value : null;
+}
+
+function optionalBoolean(obj: JsonObject, key: string): boolean | null {
+  const value = obj[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+/** First key that carries a finite number, or null. Shields against renames. */
+function firstNumber(obj: JsonObject, keys: readonly string[]): number | null {
+  for (const key of keys) {
+    const value = optionalNumber(obj, key);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+/**
+ * First key that carries a non-empty string, or null.
+ *
+ * Labels are user content — a conversation title is the first line(s) of a
+ * prompt — so newlines and runs of whitespace are collapsed. Left alone, a
+ * multi-line title would break a table row across several lines.
+ */
+function firstString(obj: JsonObject, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = optionalString(obj, key);
+    if (value === null) continue;
+    const collapsed = value.replace(/\s+/g, " ").trim();
+    if (collapsed !== "") return collapsed;
+  }
+  return null;
+}
+
+// `conversationId` is last so an untitled conversation still gets a row rather
+// than being dropped: `my-top-conversations` returns `title: string | null`.
+const LABEL_KEYS = ["name", "label", "title", "agentName", "groupKey", "key", "sId", "id", "conversationId"] as const;
+// `totalCredits` is what `my-top-conversations` calls its amount; the grouped
+// breakdowns carry no amount at all and are summed from the time series.
+const CREDIT_KEYS = [
+  "credits",
+  "totalCredits",
+  "awuCredits",
+  "consumedAwuCredits",
+  "creditsConsumed",
+  "value",
+  "total",
+] as const;
+/**
+ * Dust returns `{ groupKey, name }` per group and keeps the numbers in the
+ * time series, so `groupKey` is the join key that matters — a group row itself
+ * carries no credits at all.
+ */
+const GROUP_KEY_KEYS = ["groupKey", "key", "id", "sId"] as const;
+
+export function parseMyUsageResponse(value: unknown): MemberUsage | null {
+  if (!isRecord(value)) return null;
+  const member = value.member;
+  if (!isRecord(member)) return null;
+
+  return {
+    consumedAwuCredits: optionalNumber(member, "consumedAwuCredits"),
+    consumedFromAllowanceAwuCredits: optionalNumber(member, "consumedFromAllowanceAwuCredits"),
+    consumedFromPoolAwuCredits: optionalNumber(member, "consumedFromPoolAwuCredits"),
+    memberUsageLimit: optionalNumber(member, "memberUsageLimit"),
+    seatBalanceAwu: optionalNumber(member, "seatBalanceAwu"),
+    spendLimitAwuCredits: optionalNumber(member, "spendLimitAwuCredits"),
+    spendLimitSource: optionalString(member, "spendLimitSource"),
+    nextCreditResetAt: optionalString(member, "nextCreditResetAt"),
+    billingFrequency: optionalString(member, "billingFrequency"),
+    seatType: optionalString(member, "seatType"),
+    creditState: optionalString(member, "creditState"),
+    nearLimit: optionalBoolean(member, "nearLimit"),
+  };
+}
+
+export function parseFairUseCreditsResponse(value: unknown): FairUseCredits | null {
+  if (!isRecord(value)) return null;
+  const state = value.fairUseAwuCreditsState;
+  if (!isRecord(state)) return null;
+
+  return {
+    limit: optionalNumber(state, "limit"),
+    timeframe: optionalString(state, "timeframe"),
+    count: optionalNumber(state, "count"),
+  };
+}
+
+/**
+ * Sums a group's credits out of the time series when the group row itself
+ * carries no total. Points are `{ …, values: { <groupKey>: n } }` or flat
+ * `{ <groupKey>: n }`; anything else contributes nothing.
+ */
+function sumPointsForGroup(points: unknown[], groupKey: string | null): number | null {
+  if (!groupKey) return null;
+  let total = 0;
+  let matched = false;
+
+  for (const point of points) {
+    if (!isRecord(point)) continue;
+    const bucket = isRecord(point.values) ? point.values : point;
+    const value = optionalNumber(bucket, groupKey);
+    if (value !== null) {
+      total += value;
+      matched = true;
+    }
+  }
+
+  return matched ? total : null;
+}
+
+function parseBreakdownEntry(value: unknown, points: unknown[]): CreditBreakdownEntry | null {
+  if (!isRecord(value)) return null;
+  const label = firstString(value, LABEL_KEYS);
+  if (!label) return null;
+
+  const credits = firstNumber(value, CREDIT_KEYS) ?? sumPointsForGroup(points, firstString(value, GROUP_KEY_KEYS));
+  if (credits === null) return null;
+
+  return { label, credits };
+}
+
+export function parseMyUsageAnalyticsResponse(value: unknown): UsageAnalytics | null {
+  if (!isRecord(value)) return null;
+  const rawGroups = Array.isArray(value.groups) ? value.groups : null;
+  if (!rawGroups) return null;
+  const points = Array.isArray(value.points) ? value.points : [];
+
+  return {
+    granularity: optionalString(value, "granularity"),
+    groups: rawGroups
+      .map((group) => parseBreakdownEntry(group, points))
+      .filter((group): group is CreditBreakdownEntry => group !== null),
+  };
+}
+
+/**
+ * Reduces a total-series analytics response to one point per bucket.
+ *
+ * Requested without `groupBy`, Dust answers with a single `total` series and
+ * `fillWindow: true`, so buckets are calendar-aligned (UTC) and empty ones are
+ * still emitted. That makes the *last* point the current, in-progress period —
+ * the number `/status` leads with.
+ */
+export function parseCreditSeriesResponse(value: unknown): CreditSeries | null {
+  if (!isRecord(value)) return null;
+  const rawPoints = Array.isArray(value.points) ? value.points : null;
+  if (!rawPoints) return null;
+
+  const granularity = optionalString(value, "granularity");
+  const rawGroups = Array.isArray(value.groups) ? value.groups : [];
+  // Without groupBy the series is keyed "total", but read the key back off the
+  // response rather than assuming it.
+  const seriesKey = rawGroups.length === 1 && isRecord(rawGroups[0])
+    ? firstString(rawGroups[0], GROUP_KEY_KEYS) ?? "total"
+    : "total";
+
+  const buckets: CreditBucket[] = [];
+  for (const point of rawPoints) {
+    if (!isRecord(point)) continue;
+    const startMs = optionalNumber(point, "timestamp");
+    if (startMs === null) continue;
+
+    const values = isRecord(point.values) ? point.values : point;
+    // A grouped response reaching here would carry several series; summing
+    // keeps the bucket total right either way.
+    const credits = optionalNumber(values, seriesKey)
+      ?? Object.values(values).reduce<number>(
+        (sum, entry) => sum + (typeof entry === "number" && Number.isFinite(entry) ? entry : 0),
+        0,
+      );
+
+    buckets.push({ startMs, credits });
+  }
+
+  if (buckets.length === 0) return null;
+  buckets.sort((a, b) => a.startMs - b.startMs);
+  return { granularity, buckets };
+}
+
+export function parseMyTopConversationsResponse(value: unknown): TopConversations | null {
+  if (!isRecord(value)) return null;
+  const rawConversations = Array.isArray(value.conversations) ? value.conversations : null;
+  if (!rawConversations) return null;
+
+  return {
+    conversations: rawConversations
+      .map((conversation) => parseBreakdownEntry(conversation, []))
+      .filter((conversation): conversation is CreditBreakdownEntry => conversation !== null),
   };
 }
 

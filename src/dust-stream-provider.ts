@@ -623,6 +623,8 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           turn.agentMessageSId = agentMessageSId;
         }
 
+        runtime.credits.recordMessageSent();
+
         await streamEvents({
           baseUrl,
           conversationSId,
@@ -673,6 +675,10 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           abortSignal.removeEventListener("abort", onAbort);
         }
         endTurn?.();
+        // A turn burns credits whether or not it ended cleanly — an aborted or
+        // failed turn still ran tools — so `/status` must re-read afterwards
+        // rather than answer from what it cached before the turn.
+        runtime.credits.recordTurnCompleted();
       }
     })();
 

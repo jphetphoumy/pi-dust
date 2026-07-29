@@ -15,7 +15,6 @@ describe("dust extension", () => {
       seedLoggedIn(creds);
       let capturedStreamSimple: any;
       let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
-      let sessionSwitchHandler: ((event: unknown, ctx: any) => void) | undefined;
 
       const mockApi = {
         registerProvider: vi.fn((_name: string, config: Record<string, any>) => {
@@ -24,7 +23,6 @@ describe("dust extension", () => {
         registerCommand: vi.fn(),
         on: vi.fn((event: string, handler: any) => {
           if (event === "session_start") sessionStartHandler = handler;
-          if (event === "session_switch") sessionSwitchHandler = handler;
         }),
       };
 
@@ -49,7 +47,17 @@ describe("dust extension", () => {
       await sessionStartHandler!({}, makeCtx());
       vi.unstubAllGlobals();
 
-      return { capturedStreamSimple, sessionSwitchHandler, makeCtx, creds };
+      /** Replays pi's session_start for an in-process switch (/new, /resume, fork). */
+      const switchSession = async (event: { reason: string; previousSessionFile?: string }, file?: string) => {
+        vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+          ok: true,
+          json: () => Promise.resolve({ agentConfigurations: creds.agents }),
+        }));
+        await sessionStartHandler!(event, makeCtx(file));
+        vi.unstubAllGlobals();
+      };
+
+      return { capturedStreamSimple, switchSession, makeCtx, creds };
     }
 
     const model = {
@@ -201,8 +209,8 @@ describe("dust extension", () => {
       expect(mcpRegisterCalls).toHaveLength(1);
     });
 
-    it("registers a new MCP server after session_switch reason=new", async () => {
-      const { capturedStreamSimple, sessionSwitchHandler, makeCtx } = await setupWithMcp();
+    it("registers a new MCP server after session_start reason=new", async () => {
+      const { capturedStreamSimple, switchSession } = await setupWithMcp();
 
       const fetchMock1 = makeMcpConvFetch("conv-1", "msg-1", "amsg-1", "mcp-server-old");
       vi.stubGlobal("fetch", fetchMock1);
@@ -211,7 +219,7 @@ describe("dust extension", () => {
       vi.unstubAllGlobals();
 
       // /new resets conversation
-      sessionSwitchHandler!({ reason: "new" }, makeCtx());
+      await switchSession({ reason: "new" });
 
       const fetchMock2 = makeMcpConvFetch("conv-2", "msg-2", "amsg-2", "mcp-server-new");
       vi.stubGlobal("fetch", fetchMock2);
