@@ -76,6 +76,48 @@ export interface DustModel {
 export interface MessageContentBlock {
   type?: string;
   text?: string;
+  /** Set on `image` blocks — pi's `ImageContent` carries base64 bytes here. */
+  mimeType?: string;
+  data?: string;
+}
+
+/** A file pi inlined into the user message that we upload to Dust instead. */
+export interface PendingAttachment {
+  /** Absolute local path, as written in the `<file name="...">` marker. */
+  path: string;
+  /** Basename sent to Dust as the file title. */
+  fileName: string;
+  contentType: string;
+  bytes: Uint8Array<ArrayBuffer>;
+  /** Content hash, used to skip re-uploading the same file in one conversation. */
+  hash: string;
+  /** The exact marker text to replace once the file is attached. */
+  marker: string;
+}
+
+export interface ParsedUserMessage {
+  text: string;
+  attachments: PendingAttachment[];
+}
+
+/** A file uploaded to Dust and ready to be referenced by a content fragment. */
+export interface AttachedFile {
+  attachment: PendingAttachment;
+  fileId: string;
+  /**
+   * True when the file was already uploaded and attached earlier in this
+   * conversation, so it needs no new content fragment.
+   */
+  reused: boolean;
+}
+
+export interface DustContentFragment {
+  title: string;
+  fileId: string;
+}
+
+export interface FileUploadResponse {
+  file: { sId: string; uploadUrl: string };
 }
 
 export interface ChatMessageLike {

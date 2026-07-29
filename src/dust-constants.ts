@@ -22,3 +22,14 @@ export const DUST_HEADERS = {
 };
 
 export const DUST_MCP_PROTOCOL_VERSION = "2025-06-18";
+
+/**
+ * Below this, inlining a text file is cheaper than uploading it: Dust bills the
+ * agent's `cat` round trip, and the attachment still costs a 256-character
+ * snippet in every rendered turn.
+ */
+export const ATTACHMENT_MIN_TEXT_BYTES = 4096;
+
+/** Dust's per-category upload ceilings (`front/types/files.ts`). */
+export const ATTACHMENT_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+export const ATTACHMENT_MAX_TEXT_BYTES = 50 * 1024 * 1024;

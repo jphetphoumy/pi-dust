@@ -248,6 +248,9 @@ export class DustSessionRuntime {
   private lastTurnCancelled = false;
   /** Agent messages the user cancelled, for correlating late tool calls. */
   private cancelledAgentMessages = new Set<string>();
+  /** Content hash → Dust file id, for `@` files attached to `attachmentCacheConversationId`. */
+  private attachmentFileIds = new Map<string, string>();
+  private attachmentCacheConversationId: string | null = null;
 
   beginTurn(
     conversationSId: string,
@@ -457,6 +460,32 @@ export class DustSessionRuntime {
     }
   }
 
+  /**
+   * The upload cache for `conversationSId`, emptied when the conversation
+   * changes: a Dust file id only means "already attached" inside the one
+   * conversation it was attached to.
+   */
+  attachmentCacheFor(conversationSId: string | null): Map<string, string> {
+    if (this.attachmentCacheConversationId !== conversationSId) {
+      this.attachmentFileIds.clear();
+      this.attachmentCacheConversationId = conversationSId;
+    }
+    return this.attachmentFileIds;
+  }
+
+  /**
+   * Records files that were uploaded before the conversation existed, once it
+   * does. Deliberately not done at upload time: if the conversation creation
+   * that carries them fails, the files are attached to nothing, and a later
+   * turn reusing their ids would point the agent at what it cannot read.
+   */
+  rememberAttachments(conversationSId: string, files: Iterable<[string, string]>): void {
+    const cache = this.attachmentCacheFor(conversationSId);
+    for (const [hash, fileId] of files) {
+      cache.set(hash, fileId);
+    }
+  }
+
   clearMcpState(): void {
     // Switching session or losing credentials ends any turn in flight; its
     // local tools must not keep running against the old session.
@@ -484,6 +513,7 @@ export class DustSessionRuntime {
 
   resetSessionState(): void {
     this.conversationId = null;
+    this.attachmentCacheFor(null);
     this.credits.reset();
     this.clearRefreshedAccessToken();
     this.clearMcpState();

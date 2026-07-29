@@ -9,6 +9,7 @@ import type {
   DeviceCodeResponse,
   DustAgent,
   FairUseCredits,
+  FileUploadResponse,
   JsonObject,
   McpRegisterResponse,
   McpRequestLike,
@@ -255,6 +256,17 @@ export function parsePostMessageResponse(value: unknown): PostMessageResponse {
   return {
     message: {
       sId: getStringField(message, "sId", "post message response"),
+    },
+  };
+}
+
+export function parseFileUploadResponse(value: unknown): FileUploadResponse {
+  const data = parseJsonObject(value, "file upload response");
+  const file = getRecordField(data, "file", "file upload response");
+  return {
+    file: {
+      sId: getStringField(file, "sId", "file upload response"),
+      uploadUrl: getStringField(file, "uploadUrl", "file upload response"),
     },
   };
 }

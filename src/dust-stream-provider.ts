@@ -5,7 +5,9 @@ import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat }
 import { createEventStream, findAgentMessageSId, isMissingAgentMessageError, makeEmptyMessage, streamEvents } from "./dust-stream.js";
 import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
-import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
+import { applyAttachmentPointers, parseUserMessage } from "./dust-attachments.js";
+import { attachFilesToConversation, toContentFragments } from "./dust-files.js";
+import type { DustContentFragment, DustCredentials, DustModel, ParsedUserMessage, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
 import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
@@ -35,17 +37,10 @@ function buildAuthHeaders(accessToken: string): Record<string, string> {
   };
 }
 
-function extractMessageText(message: ChatMessageLike): string {
-  const rawContent = message.content ?? "";
-  return Array.isArray(rawContent)
-    ? rawContent.filter((block) => block.type === "text").map((block) => block.text ?? "").join("")
-    : String(rawContent);
-}
-
-function extractUserText(context: StreamContextLike): string {
+function extractUserMessage(context: StreamContextLike): ParsedUserMessage {
   const messages = context?.messages ?? [];
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-  return lastUserMessage ? extractMessageText(lastUserMessage) : "";
+  return lastUserMessage ? parseUserMessage(lastUserMessage) : { text: "", attachments: [] };
 }
 
 function extractSystemPrompt(context: StreamContextLike): string {
@@ -68,10 +63,25 @@ function buildToolGuidance(cwd: string): string {
     `- Files the user asks for are LOCAL files. Always use the \`${MCP_TOOL_PREFIX}__*\` tools:`,
     `  \`${MCP_TOOL_PREFIX}__write\` to create or overwrite, \`${MCP_TOOL_PREFIX}__edit\` to modify,`,
     `  \`${MCP_TOOL_PREFIX}__read\` to read, \`${MCP_TOOL_PREFIX}__bash\` to run commands.`,
-    "- NEVER use `files__create`, `files__edit` or any other `files__*` tool for the user's files:",
+    "- NEVER use `files__create`, `files__edit` or any other `files__*` tool to write the user's files:",
     "  those write to Dust conversation storage, not to the user's machine, and the user cannot use them.",
     "- Do not create files with bash heredocs; use the write tool.",
+    "- A `<file name=\"...\" attached=\"fil_...\" />` tag means the user attached that local file to this",
+    "  conversation. Read it with `conversation_files__cat` (or `files__cat`) using the attached id —",
+    `  that copy is a snapshot, so edit the local path with \`${MCP_TOOL_PREFIX}__edit\`.`,
   ].join("\n");
+}
+
+/**
+ * A title from what the user typed, not from the files they attached.
+ *
+ * The first 50 characters of an `@`-mentioned message are the attachment
+ * pointers, which would leave every such conversation titled `<file name=...`.
+ */
+function buildConversationTitle(userText: string): string {
+  const typed = userText.replace(/<file name="[^"]*"[^>]*\/>\n?/g, "").trim();
+  const title = typed || userText;
+  return title.substring(0, 50) + (title.length > 50 ? "..." : "");
 }
 
 function buildConversationContext(username: string, timezone: string, runtime: DustSessionRuntime) {
@@ -373,16 +383,19 @@ async function createConversation(
   username: string,
   timezone: string,
   systemPrompt?: string,
+  contentFragments: DustContentFragment[] = [],
 ): Promise<{ conversationSId: string; userMessageSId: string; agentMessageSId: string }> {
   const messageContent = systemPrompt ? `${systemPrompt}\n\n${userText}` : userText;
   const reqBody = {
-    title: userText.substring(0, 50) + (userText.length > 50 ? "..." : ""),
+    title: buildConversationTitle(userText),
     visibility: "unlisted",
     message: {
       content: messageContent,
       mentions: [{ configurationId: agentSId }],
       context: buildConversationContext(username, timezone, runtime),
     },
+    // Files uploaded before the conversation existed are bound to it here.
+    ...(contentFragments.length > 0 ? { contentFragments } : {}),
   };
   debugLog("dust:session", "Creating Dust conversation", reqBody);
 
@@ -588,11 +601,38 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
 
         await ensureMcpServer(runtime, baseUrl, resolveAuthHeaders(), refreshAuth);
 
-        const userText = extractUserText(context);
+        const { text: inlinedUserText, attachments } = extractUserMessage(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
         const systemPrompt = [extractSystemPrompt(context), buildToolGuidance(cwd)]
           .filter((part) => part.length > 0)
           .join("\n\n");
+
+        // Files pi inlined go to Dust as conversation attachments instead: the
+        // message then carries a pointer rather than the whole body, which
+        // would otherwise be re-sent as prompt tokens on every later turn.
+        // Whatever fails to attach simply stays inline.
+        let userText = inlinedUserText;
+        let contentFragments: DustContentFragment[] = [];
+        // Files uploaded for a conversation that does not exist yet are only
+        // remembered once it does — see `rememberAttachments`.
+        const pendingAttachments = new Map<string, string>();
+        if (attachments.length > 0) {
+          const attached = await attachFilesToConversation({
+            baseUrl,
+            getAuthHeaders: resolveAuthHeaders,
+            signal,
+            conversationSId: runtime.conversationId,
+            attachments,
+            cache: runtime.conversationId
+              ? runtime.attachmentCacheFor(runtime.conversationId)
+              : pendingAttachments,
+          });
+          userText = applyAttachmentPointers(inlinedUserText, attached);
+          if (!runtime.conversationId) {
+            contentFragments = toContentFragments(attached);
+          }
+        }
+
         debugLog("dust:session", "Prepared user message", { userText, systemPrompt, currentConversationId: runtime.conversationId });
 
         let agentMessageSId: string;
@@ -661,7 +701,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             username,
             timezone,
             systemPrompt || undefined,
+            contentFragments,
           ));
+          // The files uploaded above belong to this conversation now; keep
+          // their ids so re-attaching one later in the session is free.
+          runtime.rememberAttachments(conversationSId, pendingAttachments);
           startTurn(runtime.beginTurn(conversationSId, userMessageSId, agentMessageSId));
         } else {
           conversationSId = runtime.conversationId;
