@@ -1,6 +1,6 @@
 import { fetchTopConversations, fetchUsageBreakdown } from "./dust-credits.js";
 import { debugLog } from "./dust-debug.js";
-import type { DustSessionRuntime } from "./dust-runtime.js";
+import type { SessionContextController } from "./dust-runtime.js";
 import { type StatusPeriod, type StatusTab, tabCacheKey } from "./dust-status-tabs.js";
 import type { CreditBreakdownEntry, DustStatusData } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
@@ -30,7 +30,7 @@ export class StatusLoader {
   private readonly inFlight = new Set<string>();
 
   constructor(
-    private readonly runtime: DustSessionRuntime,
+    private readonly session: SessionContextController,
     private readonly baseUrl: string,
     private readonly onChange: () => void,
     private readonly signal?: AbortSignal,
@@ -91,13 +91,13 @@ export class StatusLoader {
     debugLog("dust:status", "Loading breakdown", { tab: tab.id, days: period.days });
 
     if (tab.id === "conversations") {
-      const result = await fetchTopConversations(this.runtime, this.baseUrl, this.signal);
+      const result = await fetchTopConversations(this.session, this.baseUrl, this.signal);
       return result === null
         ? { status: "error", message: "Could not load conversations." }
         : { status: "ready", value: { entries: result.conversations } };
     }
 
-    const result = await fetchUsageBreakdown(this.runtime, this.baseUrl, tab.groupBy!, period.days, this.signal);
+    const result = await fetchUsageBreakdown(this.session, this.baseUrl, tab.groupBy!, period.days, this.signal);
     return result === null
       ? { status: "error", message: "Could not load this breakdown." }
       : { status: "ready", value: { entries: result.groups } };

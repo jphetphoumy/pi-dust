@@ -1,7 +1,7 @@
 import { DUST_HEADERS, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
-import { HOST_TOKEN_ASSUMED_TTL_MS, type DustSessionRuntime } from "./dust-runtime.js";
+import type { SessionContextController } from "./dust-runtime.js";
 import type {
   CreditGroupBy,
   CreditTotals,
@@ -43,22 +43,15 @@ function authHeaders(accessToken: string): Record<string, string> {
  * `/status` can easily be run with a stale one. Refresh goes through pi first
  * (`resolveAccessToken`) because pi persists the rotated refresh token; a direct
  * refresh is only the fallback for hosts without that API.
- *
- * Reads through `runtime.currentAccessToken()` rather than storage directly:
- * several of these run concurrently (`Promise.all` in `collectStatusData`), and
- * a direct refresh from any one of them — or from the MCP listener/heartbeat, or
- * the event stream, all sharing the same runtime — lives only in
- * `runtime.refreshedAccessToken` until it naturally expires (see its doc on
- * `DustSessionRuntime`); storage alone would miss it and 401 needlessly.
  */
 export async function fetchCreditsJson(
-  runtime: DustSessionRuntime,
+  session: SessionContextController,
   url: string,
   signal?: AbortSignal,
 ): Promise<unknown | null> {
   const request = (token: string) => fetch(url, { headers: authHeaders(token), signal });
 
-  let token = runtime.currentAccessToken();
+  let token = session.getAccessToken();
   if (!token) {
     debugLog("dust:credits", "No access token available", { url });
     return null;
@@ -68,7 +61,7 @@ export async function fetchCreditsJson(
 
   if (res.status === 401) {
     debugLog("dust:credits", "Credit request unauthorized, refreshing", { url });
-    const refreshed = await refreshAccessToken(runtime);
+    const refreshed = await refreshAccessToken(session);
     if (!refreshed) {
       debugLog("dust:credits", "Credit request refresh failed", { url });
       return null;
@@ -90,66 +83,45 @@ export async function fetchCreditsJson(
   }
 }
 
-/**
- * Single-flighted on `runtime.refreshInFlight` — the same field the event
- * stream, the MCP listener and the MCP heartbeat share (dust-stream-provider.ts)
- * — so a 401 here concurrent with one of theirs (or with another of the
- * `Promise.all`'d credit fetches above) awaits the one attempt already under
- * way instead of racing it with a second direct refresh against the same
- * rotating refresh token.
- */
-async function refreshAccessToken(runtime: DustSessionRuntime): Promise<string | null> {
-  runtime.refreshInFlight ??= (async (): Promise<boolean> => {
-    const hostToken = await runtime.sessionContext.resolveAccessToken();
-    if (hostToken) {
-      runtime.setRefreshedAccessToken(hostToken, Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
-      return true;
-    }
+async function refreshAccessToken(session: SessionContextController): Promise<string | null> {
+  const hostToken = await session.resolveAccessToken();
+  if (hostToken) return hostToken;
 
-    const credentials = runtime.sessionContext.getCredentials();
-    if (!credentials) return false;
+  const credentials = session.getCredentials();
+  if (!credentials) return null;
 
-    try {
-      const refreshed = await refreshToken(credentials);
-      runtime.sessionContext.setCredentials(refreshed);
-      if (refreshed.access) {
-        runtime.setRefreshedAccessToken(refreshed.access, refreshed.expires || Date.now() + HOST_TOKEN_ASSUMED_TTL_MS);
-      }
-      return Boolean(refreshed.access);
-    } catch (err) {
-      // An expired refresh token is reported by the stream path already; here it
-      // just means the panel renders without credit figures.
-      debugLog("dust:credits", "Direct refresh failed", {
-        expired: errorMessage(err) === SESSION_EXPIRED_MESSAGE,
-        error: errorMessage(err),
-      });
-      return false;
-    }
-  })().finally(() => {
-    runtime.refreshInFlight = null;
-  });
-
-  const refreshed = await runtime.refreshInFlight;
-  return refreshed ? runtime.currentAccessToken() || null : null;
+  try {
+    const refreshed = await refreshToken(credentials);
+    session.setCredentials(refreshed);
+    return refreshed.access || null;
+  } catch (err) {
+    // An expired refresh token is reported by the stream path already; here it
+    // just means the panel renders without credit figures.
+    debugLog("dust:credits", "Direct refresh failed", {
+      expired: errorMessage(err) === SESSION_EXPIRED_MESSAGE,
+      error: errorMessage(err),
+    });
+    return null;
+  }
 }
 
 /** Live seat/spend figures. Cheap enough to refetch whenever the session moved. */
 export async function fetchMemberUsage(
-  runtime: DustSessionRuntime,
+  session: SessionContextController,
   baseUrl: string,
   signal?: AbortSignal,
 ): Promise<MemberUsage | null> {
-  const json = await fetchCreditsJson(runtime, `${baseUrl}/credits/my-usage`, signal);
+  const json = await fetchCreditsJson(session, `${baseUrl}/credits/my-usage`, signal);
   return json === null ? null : parseMyUsageResponse(json);
 }
 
 /** Fair-use allowance, the only credit ceiling free plans expose. */
 export async function fetchFairUseCredits(
-  runtime: DustSessionRuntime,
+  session: SessionContextController,
   baseUrl: string,
   signal?: AbortSignal,
 ): Promise<FairUseCredits | null> {
-  const json = await fetchCreditsJson(runtime, `${baseUrl}/fair-use-credits`, signal);
+  const json = await fetchCreditsJson(session, `${baseUrl}/fair-use-credits`, signal);
   return json === null ? null : parseFairUseCreditsResponse(json);
 }
 
@@ -177,14 +149,14 @@ const PERIOD_WINDOWS = {
  * asynchronously, so they can trail the last turn by a short delay.
  */
 export async function fetchCreditTotals(
-  runtime: DustSessionRuntime,
+  session: SessionContextController,
   baseUrl: string,
   signal?: AbortSignal,
 ): Promise<CreditTotals> {
   const series = await Promise.all(
     (Object.keys(PERIOD_WINDOWS) as (keyof CreditTotals)[]).map(async (granularity) => {
       const url = `${baseUrl}/credits/my-usage-analytics?days=${PERIOD_WINDOWS[granularity]}&granularity=${granularity}`;
-      const json = await fetchCreditsJson(runtime, url, signal);
+      const json = await fetchCreditsJson(session, url, signal);
       return [granularity, json === null ? null : parseCreditSeriesResponse(json)] as const;
     }),
   );
@@ -200,7 +172,7 @@ export async function fetchCreditTotals(
  * not tokens, and the credit index carries no model field.
  */
 export async function fetchUsageBreakdown(
-  runtime: DustSessionRuntime,
+  session: SessionContextController,
   baseUrl: string,
   groupBy: CreditGroupBy,
   days: number,
@@ -208,7 +180,7 @@ export async function fetchUsageBreakdown(
 ): Promise<UsageAnalytics | null> {
   const url = `${baseUrl}/credits/my-usage-analytics`
     + `?days=${days}&granularity=day&groupBy=${groupBy}&groupByCount=${BREAKDOWN_GROUP_COUNT}`;
-  const json = await fetchCreditsJson(runtime, url, signal);
+  const json = await fetchCreditsJson(session, url, signal);
   return json === null ? null : parseMyUsageAnalyticsResponse(json);
 }
 
@@ -217,10 +189,10 @@ const BREAKDOWN_GROUP_COUNT = 10;
 
 /** Top conversations by credits over the last 30 days. */
 export async function fetchTopConversations(
-  runtime: DustSessionRuntime,
+  session: SessionContextController,
   baseUrl: string,
   signal?: AbortSignal,
 ): Promise<TopConversations | null> {
-  const json = await fetchCreditsJson(runtime, `${baseUrl}/credits/my-top-conversations`, signal);
+  const json = await fetchCreditsJson(session, `${baseUrl}/credits/my-top-conversations`, signal);
   return json === null ? null : parseMyTopConversationsResponse(json);
 }

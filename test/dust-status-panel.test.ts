@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DustSessionRuntime, type SessionContextController } from "../src/dust-runtime.js";
+import type { SessionContextController } from "../src/dust-runtime.js";
 import { StatusLoader } from "../src/dust-status-loader.js";
 import { DustStatusPanel, panelHeight, truncate } from "../src/dust-status-panel.js";
 import { renderBreakdownRows, renderBreakdownTab, renderOverviewTab, spinnerFrame } from "../src/dust-status-tab-render.js";
@@ -25,7 +25,7 @@ const THEME = {
   inverse: (text: string) => text,
 } as never;
 
-const SESSION_CONTEXT: SessionContextController = {
+const SESSION: SessionContextController = {
   getSessionFile: () => undefined,
   saveConversationId: () => {},
   getCredentials: () => ({ type: "oauth", access: "tok", refresh: "r", expires: Date.now() + 1e6 }),
@@ -33,13 +33,6 @@ const SESSION_CONTEXT: SessionContextController = {
   resolveAccessToken: async () => "tok",
   getAccessToken: () => "tok",
 };
-
-// StatusLoader reads through a runtime (so credit fetches share the
-// in-memory refreshed-token holder and single-flight guard with the rest of
-// the extension), not a bare session controller — wire one up with the same
-// behavior the old inline stub had.
-const SESSION = new DustSessionRuntime();
-SESSION.sessionContext = SESSION_CONTEXT;
 
 const OVERVIEW: DustStatusData = {
   workspaceName: "Acme", region: "us-central1", agentName: "@dust",
