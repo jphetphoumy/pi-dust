@@ -89,6 +89,22 @@ export function seedLoggedIn(credentials: Record<string, unknown>): void {
   seedState(state);
 }
 
+/**
+ * An absolute path to a session file that really exists on disk.
+ *
+ * The conversation map is keyed by session file, and stale keys are swept when
+ * a new one is written, so a test that names a session file it never created
+ * would be asserting on an entry the extension is entitled to drop. Real files
+ * under the temp agent dir keep the tests honest about that.
+ */
+export function sessionPath(name: string): string {
+  const dir = join(agentDir(), "sessions");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  writeFileSync(path, "", "utf8");
+  return path;
+}
+
 type Workspace = { sId: string; name: string; role: string };
 type DustAgent = { sId: string; name: string; description: string };
 
