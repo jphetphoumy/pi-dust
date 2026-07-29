@@ -111,9 +111,54 @@ Responsibilities:
 
 Responsibilities:
 
-- expose the read-only `/status` credit panel
-- assemble session counters and the four credit endpoints into one payload
+- expose the read-only `/status` panel, interactive where the host supports it
+- resolve the credit API target synchronously, so a not-logged-in run opens nothing
+- assemble session counters and the credit endpoints into one payload
 - decide what is refetched live and what is served from the session cache
+- fall back to a one-shot transcript panel when there is no custom-UI surface
+
+### `src/dust-status-tabs.ts`
+
+Tab and window definitions for the interactive panel.
+
+Responsibilities:
+
+- define the tabs: Overview plus one per Dust analytics dimension
+- define the `d`/`w`/`m` windows and the per-tab cache keys
+
+There is no "by model" tab: Dust meters credits (AWU) per message, and its
+analytics dimensions are `usage_type | agent | user | origin | api_key` only.
+There is no "by user" tab either — `my-usage-analytics` is already scoped to you.
+
+### `src/dust-status-loader.ts`
+
+Async state behind the panel.
+
+Responsibilities:
+
+- hold each tab as a loading/ready/error slice
+- fetch a tab the first time it is opened, once per tab and window
+- notify the component so it can repaint as data lands
+
+### `src/dust-status-panel.ts`
+
+The interactive overlay component.
+
+Responsibilities:
+
+- draw the tab bar, the scroll indicator and the footer hints
+- handle ←/→/tab, ↑/↓, PgUp/PgDn, `d`/`w`/`m`, `r` and Esc
+- animate a spinner only while something is pending
+- truncate styled lines so the panel never reflows mid-gauge
+
+### `src/dust-status-tab-render.ts`
+
+Per-tab bodies.
+
+Responsibilities:
+
+- rank a breakdown, show shares and bars scaled to the largest row
+- render the loading, error and empty states
 
 ### `src/dust-status-render.ts`
 
@@ -272,7 +317,11 @@ src/
   dust-session-events.ts
   dust-state.ts
   dust-status.ts
+  dust-status-loader.ts
+  dust-status-panel.ts
   dust-status-render.ts
+  dust-status-tab-render.ts
+  dust-status-tabs.ts
   dust-stream.ts
   dust-stream-provider.ts
   dust-tools.ts
@@ -298,5 +347,5 @@ Current suites cover:
 - stream parsing and reconnection
 - tool approval flow
 - workspace behavior
-- credit status panel: fetching, caching and rendering
+- credit status panel: fetching, caching, tabs and rendering
 - debug logging and redaction

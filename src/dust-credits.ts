@@ -2,7 +2,14 @@ import { DUST_HEADERS, SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import type { SessionContextController } from "./dust-runtime.js";
-import type { CreditTotals, FairUseCredits, MemberUsage, TopConversations, UsageAnalytics } from "./dust-types.js";
+import type {
+  CreditGroupBy,
+  CreditTotals,
+  FairUseCredits,
+  MemberUsage,
+  TopConversations,
+  UsageAnalytics,
+} from "./dust-types.js";
 import {
   errorMessage,
   parseCreditSeriesResponse,
@@ -157,16 +164,28 @@ export async function fetchCreditTotals(
   return Object.fromEntries(series) as unknown as CreditTotals;
 }
 
-/** 30-day per-agent breakdown, scoped to the current user. */
-export async function fetchUsageAnalytics(
+/**
+ * Credit breakdown along one dimension, scoped to the current user.
+ *
+ * `groupBy` is one of Dust's analytics dimensions — usage type, agent, source,
+ * or API key. There is deliberately no "by model": Dust meters credits (AWU),
+ * not tokens, and the credit index carries no model field.
+ */
+export async function fetchUsageBreakdown(
   session: SessionContextController,
   baseUrl: string,
+  groupBy: CreditGroupBy,
+  days: number,
   signal?: AbortSignal,
 ): Promise<UsageAnalytics | null> {
-  const url = `${baseUrl}/credits/my-usage-analytics?days=30&granularity=day&groupBy=agent`;
+  const url = `${baseUrl}/credits/my-usage-analytics`
+    + `?days=${days}&granularity=day&groupBy=${groupBy}&groupByCount=${BREAKDOWN_GROUP_COUNT}`;
   const json = await fetchCreditsJson(session, url, signal);
   return json === null ? null : parseMyUsageAnalyticsResponse(json);
 }
+
+/** Dust defaults to 5; the panel has room for more. */
+const BREAKDOWN_GROUP_COUNT = 10;
 
 /** Top conversations by credits over the last 30 days. */
 export async function fetchTopConversations(

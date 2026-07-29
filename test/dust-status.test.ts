@@ -444,6 +444,152 @@ describe("dust /status", () => {
     });
   });
 
+  describe("interactive panel", () => {
+    const THEME_STUB = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    };
+
+    interface PanelHandle {
+      component?: { render: (width: number) => string[]; dispose?: () => void };
+      close?: () => void;
+    }
+
+    type CustomFactory = (
+      tui: { requestRender: () => void },
+      theme: unknown,
+      keys: unknown,
+      done: (result: undefined) => void,
+    ) => PanelHandle["component"];
+
+    /**
+     * Stands in for pi's `ui.custom`: builds the component synchronously and
+     * keeps the `done` callback so a test can close the panel.
+     */
+    function customUiStub() {
+      const built: PanelHandle = {};
+      const custom = vi.fn((factory: never) => new Promise<undefined>((resolve) => {
+        built.component = (factory as unknown as CustomFactory)(
+          { requestRender: () => {} },
+          THEME_STUB,
+          {},
+          resolve,
+        );
+        built.close = () => resolve(undefined);
+      }));
+      return { custom, built };
+    }
+
+    function registerStatus(appendEntry = vi.fn()) {
+      let statusFn!: (args: string, ctx: unknown) => Promise<void>;
+      dustExtension({
+        registerProvider: vi.fn(),
+        registerCommand: vi.fn((name: string, config: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+          if (name === "status") statusFn = config.handler;
+        }),
+        appendEntry,
+      } as never);
+      return { statusFn, appendEntry };
+    }
+
+    it("opens the interactive panel instead of appending a static one", async () => {
+      seedLoggedIn(makeCredentials());
+      globalThis.fetch = creditsFetchMock() as never;
+      const { statusFn, appendEntry } = registerStatus();
+      const { custom, built } = customUiStub();
+
+      const running = statusFn("", makeCtx({ ui: { notify: vi.fn(), custom } }));
+      await vi.waitFor(() => expect(built.component).toBeDefined());
+
+      expect(custom).toHaveBeenCalledTimes(1);
+      expect(built.component!.render(120).join("\n")).toContain("Overview");
+
+      built.close!();
+      await running;
+      expect(appendEntry).not.toHaveBeenCalled();
+      built.component!.dispose?.();
+    });
+
+    it("paints before the network settles, then fills in", async () => {
+      seedLoggedIn(makeCredentials());
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const bodies = creditsFetchMock();
+      globalThis.fetch = vi.fn(async (url: string) => {
+        await gate;
+        return bodies(url);
+      }) as never;
+
+      const { statusFn } = registerStatus();
+      const { custom, built } = customUiStub();
+      const running = statusFn("", makeCtx({ ui: { notify: vi.fn(), custom } }));
+
+      // The panel exists and renders while every request is still blocked.
+      await vi.waitFor(() => expect(built.component).toBeDefined());
+      expect(built.component!.render(120).join("\n")).toContain("Reading your Dust credit usage…");
+
+      release();
+      await vi.waitFor(() => expect(built.component!.render(120).join("\n")).toContain("Acme Corp"));
+
+      built.close!();
+      await running;
+      built.component!.dispose?.();
+    });
+
+    it("falls back to the static panel when the host has no custom UI", async () => {
+      seedLoggedIn(makeCredentials());
+      globalThis.fetch = creditsFetchMock() as never;
+      const { statusFn, appendEntry } = registerStatus();
+
+      await statusFn("", makeCtx({ ui: { notify: vi.fn() } }));
+      expect(appendEntry).toHaveBeenCalledWith("dust-status", { lines: expect.any(Array) });
+    });
+
+    it("refuses before opening anything when not logged in", async () => {
+      seedAuth(null);
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock as never;
+      const { statusFn } = registerStatus();
+      const { custom } = customUiStub();
+      const ctx = makeCtx({ ui: { notify: vi.fn(), custom } });
+
+      await statusFn("", ctx);
+
+      expect(custom).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/log.?in/i), "warning");
+    });
+
+    it("reuses the cached overview when the session has not advanced", async () => {
+      seedLoggedIn(makeCredentials());
+      const fetchMock = creditsFetchMock();
+      globalThis.fetch = fetchMock as never;
+      const { statusFn } = registerStatus();
+
+      const first = customUiStub();
+      const running = statusFn("", makeCtx({ ui: { notify: vi.fn(), custom: first.custom } }));
+      await vi.waitFor(() => expect(first.built.component!.render(120).join("\n")).toContain("Acme Corp"));
+      first.built.close!();
+      await running;
+      first.built.component!.dispose?.();
+
+      const callsAfterFirst = fetchMock.mock.calls.length;
+
+      const second = customUiStub();
+      const reopened = statusFn("", makeCtx({ ui: { notify: vi.fn(), custom: second.custom } }));
+      await vi.waitFor(() => expect(second.built.component).toBeDefined());
+      // Nothing happened in between, so the figures are still current and the
+      // panel paints them without a single new request.
+      expect(second.built.component!.render(120).join("\n")).toContain("Acme Corp");
+      expect(fetchMock.mock.calls.length).toBe(callsAfterFirst);
+
+      second.built.close!();
+      await reopened;
+      second.built.component!.dispose?.();
+    });
+
+  });
+
   describe("period totals", () => {
     it("requests month, week and day windows that fully cover the current period", async () => {
       seedLoggedIn(makeCredentials());
@@ -638,6 +784,28 @@ describe("dust /status", () => {
         .toEqual({ conversations: [{ label: "Debug OAuth refresh", credits: 2.8 }] });
       expect(parseMyTopConversationsResponse({})).toBeNull();
     });
+
+    it("parses the real top-conversations row shape", () => {
+      // Dust returns { conversationId, title, totalCredits } — the amount is
+      // named `totalCredits` here and nowhere else.
+      expect(parseMyTopConversationsResponse({
+        conversations: [{ conversationId: "c1", title: "Refactor MCP bridge", totalCredits: 411.2 }],
+      })).toEqual({ conversations: [{ label: "Refactor MCP bridge", credits: 411.2 }] });
+    });
+
+    it("collapses newlines in a title so it cannot break a table row", () => {
+      // Titles are the opening lines of a prompt, so they can be multi-line.
+      expect(parseMyTopConversationsResponse({
+        conversations: [{ conversationId: "c1", title: "# HANDOFF\n\n   ## step one", totalCredits: 5 }],
+      })).toEqual({ conversations: [{ label: "# HANDOFF ## step one", credits: 5 }] });
+    });
+
+    it("falls back to the conversation id when a conversation has no title", () => {
+      // `title` is `string | null`; dropping those rows would silently lose usage.
+      expect(parseMyTopConversationsResponse({
+        conversations: [{ conversationId: "c-abc", title: null, totalCredits: 12 }],
+      })).toEqual({ conversations: [{ label: "c-abc", credits: 12 }] });
+    });
   });
 
   describe("rendering", () => {
@@ -668,9 +836,18 @@ describe("dust /status", () => {
     it("draws a proportional gauge, clamped at both ends", () => {
       expect(renderGauge(0, 20, 10)).toBe(`${" ".repeat(10)}   0% used`);
       expect(renderGauge(20, 20, 10)).toBe("██████████ 100% used");
-      expect(renderGauge(40, 20, 10)).toBe("██████████ 100% used");
+      // The bar clamps; the percentage does not — see the overage test below.
+      expect(renderGauge(40, 20, 10)).toBe("██████████ 200% used");
       expect(renderGauge(5, 20, 10).trimEnd()).toMatch(/^█{2}/);
       expect(renderGauge(5, 0, 10)).toContain("0% used");
+    });
+
+    it("reports overage past 100% even though the bar is full", () => {
+      // A pace target can be exceeded several times over; pegging the number at
+      // 100% would hide by how much.
+      expect(renderGauge(40, 20, 10)).toContain("200% used");
+      expect(renderGauge(1376, 258.06, 10, "of pace")).toContain("533% of pace");
+      expect(renderGauge(40, 20, 10).split(" ")[0]).toBe("█".repeat(10));
     });
 
     it("renders the seat gauge, spend cap, pool and both breakdowns", () => {

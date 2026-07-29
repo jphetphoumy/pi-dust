@@ -7,18 +7,43 @@ import {
   fetchFairUseCredits,
   fetchMemberUsage,
   fetchTopConversations,
-  fetchUsageAnalytics,
+  fetchUsageBreakdown,
 } from "./dust-credits.js";
 import { debugLog } from "./dust-debug.js";
-import { buildSessionContext, type DustSessionRuntime } from "./dust-runtime.js";
+import { buildSessionContext, type DustSessionRuntime, type SessionContextController } from "./dust-runtime.js";
 import { getStoredCredentials } from "./dust-state.js";
+import { StatusLoader } from "./dust-status-loader.js";
+import { DustStatusPanel } from "./dust-status-panel.js";
 import { renderStatusPanel } from "./dust-status-render.js";
-import type { DustAgent, DustModel, DustStatusData, PiRuntimeContext } from "./dust-types.js";
+import type { DustAgent, DustCredentials, DustModel, DustStatusData, PiRuntimeContext } from "./dust-types.js";
 
 export const DUST_STATUS_ENTRY = "dust-status";
 
 const NOT_LOGGED_IN = "Not logged in to Dust. Run /login first.";
 const NO_WORKSPACE = "No Dust workspace selected. Run /workspace first.";
+/** Window the Overview tab's inline breakdowns cover. */
+const OVERVIEW_BREAKDOWN_DAYS = 30;
+/** Overlay rows; the component pages the body inside this. */
+const PANEL_HEIGHT = 28;
+
+/** Everything needed to talk to the credit API, resolved without any network call. */
+export interface StatusTarget {
+  cred: DustCredentials;
+  workspaceId: string;
+  region: string;
+  baseUrl: string;
+  session: SessionContextController;
+}
+
+type CustomUi = <T>(
+  factory: (
+    tui: { requestRender: () => void },
+    theme: never,
+    keybindings: unknown,
+    done: (result: T) => void,
+  ) => unknown,
+  options?: unknown,
+) => Promise<T>;
 
 /**
  * Assembles the panel's data.
@@ -29,22 +54,37 @@ const NO_WORKSPACE = "No Dust workspace selected. Run /workspace first.";
  * for a session that has not moved. The 30-day breakdowns are cached outright:
  * they are month-scale aggregates that cannot shift within one session.
  */
-export async function collectStatusData(
+export function resolveStatusTarget(
   runtime: DustSessionRuntime,
   ctx: PiRuntimeContext,
-  signal?: AbortSignal,
-): Promise<DustStatusData | { error: string }> {
+): StatusTarget | { error: string } {
   const cred = getStoredCredentials();
   if (!cred?.access) return { error: NOT_LOGGED_IN };
   if (!cred.workspaceId) return { error: NO_WORKSPACE };
 
   const region = cred.region ?? "us-central1";
-  const baseUrl = creditsBaseUrl(region, cred.workspaceId);
-  // The command can run before any turn has wired the runtime up, so derive a
-  // session controller from the command context when there is none yet.
-  const session = runtime.sessionContext.getCredentials()
-    ? runtime.sessionContext
-    : buildSessionContext(ctx);
+  return {
+    cred,
+    workspaceId: cred.workspaceId,
+    region,
+    baseUrl: creditsBaseUrl(region, cred.workspaceId),
+    // The command can run before any turn has wired the runtime up, so derive a
+    // session controller from the command context when there is none yet.
+    session: runtime.sessionContext.getCredentials()
+      ? runtime.sessionContext
+      : buildSessionContext(ctx),
+  };
+}
+
+export async function collectStatusData(
+  runtime: DustSessionRuntime,
+  ctx: PiRuntimeContext,
+  signal?: AbortSignal,
+): Promise<DustStatusData | { error: string }> {
+  const target = resolveStatusTarget(runtime, ctx);
+  if ("error" in target) return target;
+
+  const { cred, workspaceId, region, baseUrl, session } = target;
   const tracker = runtime.credits;
 
   const needsLiveRead = tracker.dirty || tracker.lastConsumedCredits === null;
@@ -71,16 +111,16 @@ export async function collectStatusData(
     : tracker.sessionDelta();
 
   if (tracker.analytics === null) {
-    tracker.analytics = await fetchUsageAnalytics(session, baseUrl, signal);
+    tracker.analytics = await fetchUsageBreakdown(session, baseUrl, "agent", OVERVIEW_BREAKDOWN_DAYS, signal);
   }
   if (tracker.topConversations === null) {
     tracker.topConversations = await fetchTopConversations(session, baseUrl, signal);
   }
 
-  const workspace = cred.workspaces?.find((candidate) => candidate.sId === cred.workspaceId);
+  const workspace = cred.workspaces?.find((candidate) => candidate.sId === workspaceId);
 
-  return {
-    workspaceName: workspace?.name ?? cred.workspaceId,
+  const data: DustStatusData = {
+    workspaceName: workspace?.name ?? workspaceId,
     region,
     agentName: agentLabel(ctx, cred.agents),
     durationMs: Date.now() - tracker.startedAt,
@@ -95,6 +135,11 @@ export async function collectStatusData(
     analytics: tracker.analytics,
     topConversations: tracker.topConversations,
   };
+
+  // Kept so re-opening the panel can paint immediately; only ever shown again
+  // while the session has not advanced past it.
+  tracker.lastOverview = data;
+  return data;
 }
 
 /** The Dust agent backing the current model, named the way Dust names it. */
@@ -134,24 +179,82 @@ export function registerDustStatusCommand(pi: ExtensionAPI, runtime: DustSession
   }
 
   pi.registerCommand("status", {
-    description: "Show Dust credit usage for this session and the current billing period",
+    description: "Show Dust credit usage — session, month/week/day, and breakdowns by agent, type, source and API key",
     handler: async (_args, ctx) => {
       const runtimeCtx = ctx as PiRuntimeContext;
-      const result = await collectStatusData(runtime, runtimeCtx, (ctx as { signal?: AbortSignal }).signal)
-        .catch((err): { error: string } => {
-          debugLog("dust:status", "Status collection failed", { error: String(err) });
-          return { error: "Could not read Dust credit usage. See the debug log for details." };
-        });
+      const signal = (ctx as { signal?: AbortSignal }).signal;
+
+      // Cheap, synchronous, no network: refuse before opening anything.
+      const target = resolveStatusTarget(runtime, runtimeCtx);
+      if ("error" in target) {
+        runtimeCtx.ui?.notify?.(target.error, "warning");
+        return;
+      }
+
+      const opened = await openStatusPanel(runtime, runtimeCtx, target, signal);
+      if (opened) return;
+
+      // No interactive UI (headless, RPC, or a pi without ui.custom): fall back
+      // to the one-shot transcript panel.
+      debugLog("dust:status", "Interactive panel unavailable; rendering static panel");
+      const result = await collectStatusData(runtime, runtimeCtx, signal).catch((err): { error: string } => {
+        debugLog("dust:status", "Status collection failed", { error: String(err) });
+        return { error: "Could not read Dust credit usage. See the debug log for details." };
+      });
 
       if ("error" in result) {
         runtimeCtx.ui?.notify?.(result.error, "warning");
         return;
       }
-
-      const lines = renderStatusPanel(result);
-      emit(pi, runtimeCtx, lines);
+      emit(pi, runtimeCtx, renderStatusPanel(result));
     },
   });
+}
+
+/**
+ * Opens the interactive panel, returning false when the host offers no custom-UI
+ * surface to open it on.
+ *
+ * The panel is shown *before* any network call resolves. It starts from the
+ * cached overview when the session has not advanced since that read — the
+ * figures are current by definition then — and from a spinner when it has, so a
+ * stale number is never presented as live.
+ */
+async function openStatusPanel(
+  runtime: DustSessionRuntime,
+  ctx: PiRuntimeContext,
+  target: StatusTarget,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const custom = (ctx.ui as { custom?: CustomUi } | undefined)?.custom;
+  if (typeof custom !== "function") return false;
+
+  const tracker = runtime.credits;
+  let loader: StatusLoader | null = null;
+
+  const refresh = () => {
+    loader?.markOverviewRefreshing();
+    void collectStatusData(runtime, ctx, signal)
+      .then((result) => loader?.setOverview("error" in result ? new Error(result.error) : result))
+      .catch((err) => loader?.setOverview(err instanceof Error ? err : new Error(String(err))));
+  };
+
+  await custom<undefined>((tui, theme, _keybindings, done) => {
+    loader = new StatusLoader(
+      target.session,
+      target.baseUrl,
+      () => tui.requestRender(),
+      signal,
+      tracker.dirty ? null : tracker.lastOverview,
+    );
+    // Nothing has happened since the cached overview was read, so it is still
+    // current and no request is needed.
+    if (loader.overview.status === "loading") refresh();
+
+    return new DustStatusPanel(theme, loader, () => tui.requestRender(), done, refresh, PANEL_HEIGHT);
+  }, { overlay: true, overlayOptions: { width: "90%", maxHeight: "80%", anchor: "center" } });
+
+  return true;
 }
 
 function emit(pi: ExtensionAPI, ctx: PiRuntimeContext, lines: string[]): void {

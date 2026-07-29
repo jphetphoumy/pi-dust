@@ -316,17 +316,37 @@ function firstNumber(obj: JsonObject, keys: readonly string[]): number | null {
   return null;
 }
 
-/** First key that carries a non-empty string, or null. */
+/**
+ * First key that carries a non-empty string, or null.
+ *
+ * Labels are user content — a conversation title is the first line(s) of a
+ * prompt — so newlines and runs of whitespace are collapsed. Left alone, a
+ * multi-line title would break a table row across several lines.
+ */
 function firstString(obj: JsonObject, keys: readonly string[]): string | null {
   for (const key of keys) {
     const value = optionalString(obj, key);
-    if (value !== null && value.trim() !== "") return value.trim();
+    if (value === null) continue;
+    const collapsed = value.replace(/\s+/g, " ").trim();
+    if (collapsed !== "") return collapsed;
   }
   return null;
 }
 
-const LABEL_KEYS = ["name", "label", "title", "agentName", "groupKey", "key", "sId", "id"] as const;
-const CREDIT_KEYS = ["credits", "awuCredits", "consumedAwuCredits", "creditsConsumed", "value", "total"] as const;
+// `conversationId` is last so an untitled conversation still gets a row rather
+// than being dropped: `my-top-conversations` returns `title: string | null`.
+const LABEL_KEYS = ["name", "label", "title", "agentName", "groupKey", "key", "sId", "id", "conversationId"] as const;
+// `totalCredits` is what `my-top-conversations` calls its amount; the grouped
+// breakdowns carry no amount at all and are summed from the time series.
+const CREDIT_KEYS = [
+  "credits",
+  "totalCredits",
+  "awuCredits",
+  "consumedAwuCredits",
+  "creditsConsumed",
+  "value",
+  "total",
+] as const;
 /**
  * Dust returns `{ groupKey, name }` per group and keeps the numbers in the
  * time series, so `groupKey` is the join key that matters — a group row itself

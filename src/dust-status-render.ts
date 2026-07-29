@@ -75,8 +75,9 @@ export function formatResetDate(iso: string): string | null {
   return timezone ? `${date} (${timezone})` : date;
 }
 
-export function renderGauge(used: number, limit: number, width = GAUGE_WIDTH): string {
-  const fraction = limit > 0 ? Math.min(1, Math.max(0, used / limit)) : 0;
+export function renderGauge(used: number, limit: number, width = GAUGE_WIDTH, suffix = "used"): string {
+  const ratio = limit > 0 ? Math.max(0, used / limit) : 0;
+  const fraction = Math.min(1, ratio);
   const cells = fraction * width;
   const full = Math.floor(cells);
   const remainder = Math.round((cells - full) * 8);
@@ -85,7 +86,10 @@ export function renderGauge(used: number, limit: number, width = GAUGE_WIDTH): s
     ? "█".repeat(Math.min(width, full + 1))
     : "█".repeat(full) + PARTIAL_BLOCKS[remainder];
 
-  return `${bar.padEnd(width, " ")} ${String(Math.round(fraction * 100)).padStart(3, " ")}% used`;
+  // The bar clamps at full, but the number must not: a pace target can be
+  // exceeded several times over, and "100%" would hide by how much.
+  const percent = Math.round(ratio * 100);
+  return `${bar.padEnd(width, " ")} ${String(percent).padStart(3, " ")}% ${suffix}`;
 }
 
 function row(label: string, value: string): string {
@@ -148,7 +152,7 @@ function renderPeriodGauges(data: DustStatusData, now: Date): string[] {
     lines.push(
       "",
       `  This week (pace vs ${formatCredits(target)})`,
-      `  ${renderGauge(week.credits, target)}`,
+      `  ${renderGauge(week.credits, target, GAUGE_WIDTH, "of pace")}`,
       `  ${formatCredits(week.credits)} credits · ${formatBucketRange(week.startMs, "week", now)}`,
     );
   }
@@ -158,7 +162,7 @@ function renderPeriodGauges(data: DustStatusData, now: Date): string[] {
     lines.push(
       "",
       `  Today (pace vs ${formatCredits(target)})`,
-      `  ${renderGauge(day.credits, target)}`,
+      `  ${renderGauge(day.credits, target, GAUGE_WIDTH, "of pace")}`,
       `  ${formatCredits(day.credits)} credits · ${formatBucketRange(day.startMs, "day", now)}`,
     );
   }

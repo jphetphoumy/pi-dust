@@ -240,6 +240,9 @@ export interface CreditBreakdownEntry {
   credits: number;
 }
 
+/** Analytics dimensions Dust can group credit usage by. */
+export type CreditGroupBy = "usage_type" | "agent" | "origin" | "api_key";
+
 export interface UsageAnalytics {
   granularity: string | null;
   groups: CreditBreakdownEntry[];

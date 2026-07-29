@@ -11,6 +11,7 @@ import type {
   FairUseCredits,
   MemberUsage,
   CreditTotals,
+  DustStatusData,
   PiRuntimeContext,
   TopConversations,
   UsageAnalytics,
@@ -74,6 +75,8 @@ export class DustCreditTracker {
   cachedUsage: MemberUsage | null = null;
   cachedFairUse: FairUseCredits | null = null;
   cachedTotals: CreditTotals = { month: null, week: null, day: null };
+  /** Last fully-built overview, repainted instantly when the session has not moved. */
+  lastOverview: DustStatusData | null = null;
   /** 30-day aggregates; they do not meaningfully move within one session. */
   analytics: UsageAnalytics | null = null;
   topConversations: TopConversations | null = null;
@@ -120,6 +123,7 @@ export class DustCreditTracker {
     this.cachedUsage = null;
     this.cachedFairUse = null;
     this.cachedTotals = { month: null, week: null, day: null };
+    this.lastOverview = null;
     this.analytics = null;
     this.topConversations = null;
   }
