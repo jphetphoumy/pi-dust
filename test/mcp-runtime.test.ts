@@ -160,6 +160,53 @@ describe("dust MCP runtime helpers", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("still attempts a refresh on a 401 that arrives well after the last attempt, even with no successful connect in between (issue #32 defect 4)", async () => {
+    // A "have we refreshed yet" boolean that only resets on a successful
+    // connect would stay latched through a long run of retryable 503s, so a
+    // genuine 401 minutes later would be treated as fatal without ever trying
+    // a refresh that would have worked. The cooldown is time-based instead,
+    // so it must not matter that nothing in between ever connected cleanly.
+    const abortController = new AbortController();
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call += 1;
+      if (call === 1) return { ok: false, status: 401, body: null };
+      if (call <= 8) return { ok: false, status: 503, body: null };
+      if (call === 9) return { ok: false, status: 401, body: null };
+      // Park here once refreshed and reconnected, instead of an empty stream
+      // that would just cycle the loop into another immediate reconnect.
+      return { ok: true, body: makePendingRequestStream(abortController.signal) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const refreshAuth = vi.fn().mockResolvedValue(true);
+
+    const promise = listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth,
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool: async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false }),
+      getTools: () => [],
+      getConfirmFn: () => async () => true,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions: new Map(),
+    });
+
+    // Enough real elapsed time for the exponential backoff between the 503s
+    // (1s, 2s, 4s, 8s, 16s, 30s, 30s, ... ) to clear the refresh cooldown
+    // window well before the second 401 shows up.
+    await vi.advanceTimersByTimeAsync(200_000);
+
+    expect(call).toBeGreaterThanOrEqual(9);
+    expect(refreshAuth).toHaveBeenCalledTimes(2);
+
+    abortController.abort();
+    await promise;
+  });
+
   it.each([403, 404])("throws MCP_REGISTRATION_LOST_MESSAGE on terminal HTTP %i without retrying", async (status) => {
     const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status, body: null });
     vi.stubGlobal("fetch", fetchMock);

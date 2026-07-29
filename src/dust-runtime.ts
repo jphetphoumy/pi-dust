@@ -48,6 +48,19 @@ export class DustSessionRuntime {
   mcpHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   mcpRequestsAbortController: AbortController | null = null;
   sessionContext: SessionContextController = NOOP_SESSION_CONTEXT;
+  /**
+   * The most recently refreshed access token, held in memory.
+   *
+   * `setCredentials` (persistCredentialState) deliberately drops the token
+   * trio — auth.json is pi-owned, and we can no longer write it — so a
+   * refresh done through the direct WorkOS fallback (as opposed to pi's own
+   * `resolveAccessToken` host path, which pi persists itself) would otherwise
+   * vanish the instant it's stored: every later `getAuthHeaders()` call would
+   * keep reading the same stale token out of storage and loop back into the
+   * same 401. This is the one place that survives the round trip, and every
+   * getAuthHeaders() in dust-stream-provider.ts must prefer it over storage.
+   */
+  refreshedAccessToken: string | null = null;
   confirmFn: (title: string, message: string) => Promise<boolean> = NOOP_CONFIRM;
   /**
    * When true, tool calls run without prompting. Session-scoped and off by
@@ -83,8 +96,13 @@ export class DustSessionRuntime {
     }
     this.mcpServerId = null;
     this.preApprovedActions.clear();
-    this.pendingApprovalPromise = null;
-    this.resolveApprovalGateFn = null;
+    // A listener can be parked awaiting this gate (tools/call blocked on a
+    // pending tool_approve_execution). Discarding the resolver instead of
+    // calling it would leave that await pending forever: the listener never
+    // returns to reader.read(), so it never observes the abort above, and its
+    // ReadableStreamDefaultReader lock and response body leak for the
+    // process's lifetime.
+    this.resolveApprovalGate();
   }
 
   resetSessionState(): void {
@@ -110,6 +128,7 @@ export function invalidateRuntimeCredentials(runtime: DustSessionRuntime, creden
   runtime.sessionContext.setCredentials(invalidateCredentials(credentials));
   markInvalidated();
   runtime.conversationId = null;
+  runtime.refreshedAccessToken = null;
   runtime.clearMcpState();
 }
 

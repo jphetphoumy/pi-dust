@@ -46,6 +46,25 @@ describe("dust runtime", () => {
     expect(runtime.pendingApprovalPromise).toBeNull();
   });
 
+  it("clearMcpState resolves a pending approval gate instead of hanging it (issue #32 defect 5)", async () => {
+    // A listener can be parked awaiting this gate (tools/call blocked on a
+    // pending tool_approve_execution). If a registration is lost while that
+    // await is live, clearMcpState() nulling the resolver without calling it
+    // would leave the listener's await pending forever — it never returns to
+    // reader.read(), so it never observes the abort either, leaking its
+    // reader lock and response body for good.
+    const runtime = new DustSessionRuntime();
+    runtime.mcpServerId = "mcp-1";
+    runtime.mcpRequestsAbortController = new AbortController();
+    runtime.createApprovalGate();
+    const gate = runtime.pendingApprovalPromise;
+
+    runtime.clearMcpState();
+
+    await expect(gate).resolves.toBeUndefined();
+    expect(runtime.pendingApprovalPromise).toBeNull();
+  });
+
   it("buildSessionContext persists conversation ids in extension state", () => {
     const old = sessionPath("old.jsonl");
     const current = sessionPath("session-a.jsonl");

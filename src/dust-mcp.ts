@@ -7,19 +7,28 @@ import { type McpToolResult } from "./dust-tools.js";
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 
-// Dust closes the MCP requests SSE stream after ~5 minutes server-side
-// (src/dust-mcp.ts `data: done` handling below). A heartbeat interval equal
-// to that window races the boundary: the two loops jitter independently, so
-// either can fire microseconds after the other and look like the server
-// closed the registration out from under a live heartbeat. Keeping the
-// heartbeat comfortably shorter — with a bit of jitter so many sessions
-// started at once do not all beat in lockstep — keeps it clear of the edge.
+// Dust closes the MCP requests SSE stream after ~5 minutes server-side (see
+// the `data: done` handling below). A heartbeat interval equal to that window
+// races the boundary: the two loops jitter independently, so either can fire
+// microseconds after the other and look like the server closed the
+// registration out from under a live heartbeat. Keeping the heartbeat
+// comfortably shorter — with a bit of jitter so many sessions started at once
+// do not all beat in lockstep — keeps it clear of the edge.
 const HEARTBEAT_BASE_INTERVAL_MS = 4 * 60 * 1000;
 const HEARTBEAT_JITTER_MS = 30_000;
 
 function heartbeatIntervalMs(): number {
   return HEARTBEAT_BASE_INTERVAL_MS + Math.floor(Math.random() * HEARTBEAT_JITTER_MS);
 }
+
+// At most one refresh attempt per connect per this window. A plain "have we
+// refreshed yet" boolean only resets on a fully successful connect, so a run
+// of retryable failures (503s, empty bodies) between a refresh and the next
+// 401 would never reset it — minutes later, a genuine 401 would be treated as
+// fatal without ever trying a refresh that would have worked. Gating by
+// elapsed time instead means a 401 far enough past the last attempt always
+// gets a fresh try, while a tight double-401 still only refreshes once.
+const REFRESH_RETRY_COOLDOWN_MS = 60_000;
 
 /** True when an error is just this listener being shut down. */
 export function isAbortError(error: unknown, signal?: AbortSignal): boolean {
@@ -144,7 +153,7 @@ export async function listenMcpRequests({
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
   let reconnectAttempt = 0;
-  let refreshedAfterUnauthorized = false;
+  let lastRefreshAttemptAt = 0;
 
   while (!abortController.signal.aborted) {
     const reqUrl = lastEventId ? `${url}&lastEventId=${encodeURIComponent(lastEventId)}` : url;
@@ -172,11 +181,18 @@ export async function listenMcpRequests({
         // interval Dust closes this stream at, so a 401 here usually means
         // the token aged out rather than that the session is dead. Refresh
         // once through the same fallback chain streamEvents uses and retry
-        // the connect; only give up if the refresh itself fails.
-        if (!refreshedAfterUnauthorized && await refreshAuth()) {
-          refreshedAfterUnauthorized = true;
-          debugLog("dust:mcp", "Refreshed token after MCP SSE 401, retrying connect");
-          continue;
+        // the connect; only give up if the refresh itself fails. The cooldown
+        // is tracked by elapsed time rather than a "have we already tried"
+        // flag, so a 401 that shows up long after the last attempt (even one
+        // separated by a run of retryable 503s/empty bodies) still gets its
+        // own refresh instead of being declared fatal on the spot.
+        const now = Date.now();
+        if (now - lastRefreshAttemptAt > REFRESH_RETRY_COOLDOWN_MS) {
+          lastRefreshAttemptAt = now;
+          if (await refreshAuth()) {
+            debugLog("dust:mcp", "Refreshed token after MCP SSE 401, retrying connect");
+            continue;
+          }
         }
         debugLog("dust:mcp", "MCP SSE session expired", { status: res.status });
         throw new Error(SESSION_EXPIRED_MESSAGE);
@@ -204,7 +220,6 @@ export async function listenMcpRequests({
     }
 
     reconnectAttempt = 0;
-    refreshedAfterUnauthorized = false;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
