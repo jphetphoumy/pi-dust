@@ -203,6 +203,32 @@ describe("cancellation", () => {
       expect(JSON.parse(cancelCall![1].body!)).toEqual({ messageIds: ["amsg-late"] });
     });
 
+    // The cancel POST can stall for seconds. Until the id is recorded, tool
+    // calls from that loop cannot be told apart from a later turn's, so the
+    // caller has to learn it as the lookup lands, not when Dust answers.
+    it("reports the agent message id before dispatching the cancel", async () => {
+      const order: string[] = [];
+      const fetchMock = vi.fn(async (url: string) => {
+        if (String(url).endsWith("/cancel")) {
+          order.push("cancel-post");
+          return { ok: true, status: 200, json: () => Promise.resolve({ success: true }) };
+        }
+        return { ok: true, json: () => Promise.resolve(makeConversationGetResponse("conv-1", "umsg-1", "amsg-1")) };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await cancelPendingAgentMessage(
+        BASE_URL,
+        () => ({}),
+        "conv-1",
+        "umsg-1",
+        undefined,
+        (agentMessageSId) => order.push(`resolved:${agentMessageSId}`),
+      );
+
+      expect(order).toEqual(["resolved:amsg-1", "cancel-post"]);
+    });
+
     it("gives up quietly when the lookup fails", async () => {
       const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500 });
       vi.stubGlobal("fetch", fetchMock);
@@ -644,6 +670,89 @@ describe("cancellation", () => {
       const request = {
         jsonrpc: "2.0",
         id: "mcp_req_conv-cancel-7_amsg-8_11111111-2222-3333-4444-555555555555_1",
+        method: "tools/call",
+        params: { name: "bash", arguments: { command: "echo hi" } },
+      };
+      mcpController.enqueue(encoder.encode(`data: ${JSON.stringify({ eventId: "mcp-e0", data: request })}\n\n`));
+
+      await waitForCall(
+        () => confirmFn.mock.calls.find(([title]) => String(title).includes("Dust agent wants to run")),
+        "the approval prompt for turn two's tool call",
+      );
+    });
+
+    // `postValidateAction` is not tied to the turn's signal, so an approval can
+    // land after the *next* turn has started. Guarding on whichever turn is
+    // current would have stopped guarding by then.
+    it("drops a pre-approval that lands after the next turn has started", async () => {
+      const confirmFn = vi.fn(async (_title: string, _message: string) => true);
+      const streamSimple = await makeStreamSimpleFnWithConfirm(confirmFn);
+      const controller = new AbortController();
+      const encoder = new TextEncoder();
+      let mcpController!: ReadableStreamDefaultController<Uint8Array>;
+      const mcpBody = new ReadableStream<Uint8Array>({ start(c) { mcpController = c; } });
+      let releaseValidateAction!: () => void;
+      const validateActionLanded = new Promise<void>((resolve) => { releaseValidateAction = resolve; });
+      let eventStreams = 0;
+
+      const fetchMock = vi.fn(async (url: string) => {
+        const target = String(url);
+        if (target.endsWith("/mcp/register")) {
+          return { ok: true, json: () => Promise.resolve({ serverId: "mcp-cancel-8", expiresAt: new Date(Date.now() + 300_000).toISOString() }) };
+        }
+        if (target.includes("/mcp/requests")) return { ok: true, body: mcpBody };
+        if (target.endsWith("/assistant/conversations")) {
+          return { ok: true, json: () => Promise.resolve(makeConversationResponse("conv-cancel-8", "umsg-9", "amsg-9")) };
+        }
+        if (target.includes("/validate-action")) {
+          // Held open across the cancellation and the whole of turn two.
+          await validateActionLanded;
+          return { ok: true, json: () => Promise.resolve({}) };
+        }
+        if (target.endsWith("/cancel")) return { ok: true, status: 200, json: () => Promise.resolve({ success: true }) };
+        if (target.endsWith("/messages")) {
+          return { ok: true, json: () => Promise.resolve({ message: { sId: "umsg-10" } }) };
+        }
+        if (target.includes("/events")) {
+          eventStreams += 1;
+          return eventStreams === 1
+            ? {
+              ok: true,
+              body: makeSseStream([{
+                type: "tool_approve_execution",
+                actionId: "action-crossing",
+                conversationId: "conv-cancel-8",
+                messageId: "amsg-9",
+                stake: "medium",
+                inputs: { command: "ls" },
+                metadata: { toolName: "bash" },
+              }]),
+            }
+            : { ok: true, body: makeSseStream([{ type: "agent_message_success" }]) };
+        }
+        return { ok: true, json: () => Promise.resolve(makeConversationGetResponse("conv-cancel-8", "umsg-10", "amsg-10")) };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      // Turn one parks on validate-action, then the user escapes.
+      const first = streamSimple(makeModel(), { messages: [{ role: "user", content: "Hello" }] }, { signal: controller.signal });
+      await waitForCall(
+        () => (fetchMock.mock.calls as [string][]).find(([url]) => String(url).includes("/validate-action")),
+        "the validate-action POST",
+      );
+      controller.abort();
+
+      // Turn two runs and completes while turn one is still parked.
+      const second = streamSimple(makeModel(), { messages: [{ role: "user", content: "Again" }] }, {});
+      await expect(second.result()).resolves.toMatchObject({ stopReason: "stop" });
+
+      // Only now does turn one's approval land.
+      releaseValidateAction();
+      await first.result();
+
+      const request = {
+        jsonrpc: "2.0",
+        id: "mcp_req_conv-cancel-8_amsg-10_11111111-2222-3333-4444-555555555555_1",
         method: "tools/call",
         params: { name: "bash", arguments: { command: "echo hi" } },
       };

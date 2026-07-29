@@ -253,6 +253,12 @@ export async function cancelPendingAgentMessage(
   conversationSId: string,
   userMessageSId: string,
   refreshAuth?: () => Promise<boolean>,
+  /**
+   * Called the moment the id is known, before the cancel is dispatched. The
+   * cancel POST can take seconds, and the caller needs the id to start refusing
+   * that loop's tool calls immediately — not once Dust has answered.
+   */
+  onAgentMessageResolved?: (agentMessageSId: string) => void,
 ): Promise<string | null> {
   debugLog("dust:session", "Recovering agent message id to cancel", { conversationSId, userMessageSId });
 
@@ -292,6 +298,7 @@ export async function cancelPendingAgentMessage(
       return null;
     }
   }
+  onAgentMessageResolved?.(agentMessageSId);
   await cancelMessageGeneration(baseUrl, getAuthHeaders, conversationSId, [agentMessageSId], refreshAuth);
   return agentMessageSId;
 }
@@ -530,7 +537,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
          * on escape has something real to stop, whether or not the agent message
          * id is known yet.
          */
+        /** The turn this stream owns, once armed. */
+        let currentTurn: ActiveDustTurn;
+
         const startTurn = (turn: ActiveDustTurn): void => {
+          currentTurn = turn;
           const onAbort = () => {
             const cancelled = runtime.cancelActiveTurn();
             if (!cancelled) return;
@@ -543,19 +554,18 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
                 refreshAuth,
               );
             } else {
-              // Cancelled before the lookup resolved: find the message first,
-              // then remember it, so tool calls it emits later are refused too.
+              // Cancelled before the lookup resolved: find the message first.
+              // It is recorded as the lookup lands rather than when the cancel
+              // POST returns — that request can stall for seconds, and until the
+              // id is known its loop's tool calls cannot be told apart.
               void cancelPendingAgentMessage(
                 baseUrl,
                 getAuthHeaders,
                 cancelled.conversationSId,
                 cancelled.userMessageSId,
                 refreshAuth,
-              ).then((agentMessageSId) => {
-                if (agentMessageSId) {
-                  runtime.markAgentMessageCancelled(agentMessageSId);
-                }
-              });
+                (agentMessageSId) => runtime.markAgentMessageCancelled(agentMessageSId),
+              );
             }
           };
           turnCleanup.onAbort = onAbort;
@@ -625,12 +635,14 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           handleToolApproveExecution,
           postValidateAction: (conversationId, messageId, actionId, approved) =>
             postValidateAction(baseUrl, authHeaders, conversationId, messageId, actionId, approved),
-          // Approving is two awaits long (the dialog, then validate-action), so
-          // the turn can be cancelled underneath it. Recording then would put an
-          // entry back into a queue `cancelActiveTurn` had just cleared, where
-          // it would positionally approve some later turn's tool call.
+          // Approving is two awaits long (the dialog, then validate-action, the
+          // latter not tied to the turn's signal), so it can outlive the turn
+          // entirely. The check is against *this* turn rather than whichever is
+          // current: by the time a late approval lands the next turn may have
+          // started, and writing the entry then would positionally approve that
+          // turn's first tool call out of a queue `cancelActiveTurn` had cleared.
           recordPreApproval: (actionId, approved) => {
-            if (runtime.isTurnCancelled()) {
+            if (currentTurn.cancelled) {
               debugLog("dust:session", "Dropping pre-approval for a cancelled turn", { actionId });
               return;
             }
