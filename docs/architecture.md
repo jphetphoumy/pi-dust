@@ -103,6 +103,37 @@ Responsibilities:
 - expose the `/workspace` command
 - prompt the user for workspace switching
 - persist the selected workspace in extension state
+- drop the cached credit figures, which belong to the workspace being left
+
+### `src/dust-status.ts`
+
+`/status` command registration.
+
+Responsibilities:
+
+- expose the read-only `/status` credit panel
+- assemble session counters and the four credit endpoints into one payload
+- decide what is refetched live and what is served from the session cache
+
+### `src/dust-status-render.ts`
+
+Credit panel layout.
+
+Responsibilities:
+
+- draw the ASCII bar gauges
+- format credits, wall-clock durations and reset dates
+- omit sections whose data is missing or unusable
+
+### `src/dust-credits.ts`
+
+Private credit API client.
+
+Responsibilities:
+
+- resolve the `/api/w/:wId` base URL for the credential's region
+- fetch seat usage, fair-use allowance, the 30-day breakdown and top conversations
+- refresh the access token and retry once on 401
 
 ### `src/dust-auth.ts`
 
@@ -215,12 +246,15 @@ src/
   dust.ts
   dust-auth.ts
   dust-constants.ts
+  dust-credits.ts
   dust-debug.ts
   dust-mcp.ts
   dust-provider.ts
   dust-runtime.ts
   dust-session-events.ts
   dust-state.ts
+  dust-status.ts
+  dust-status-render.ts
   dust-stream.ts
   dust-stream-provider.ts
   dust-tools.ts
@@ -246,4 +280,5 @@ Current suites cover:
 - stream parsing and reconnection
 - tool approval flow
 - workspace behavior
+- credit status panel: fetching, caching and rendering
 - debug logging and redaction

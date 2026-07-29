@@ -2,15 +2,20 @@ import type {
   AgentConfigurationsResponse,
   ConversationCreateResponse,
   ConversationFetchResponse,
+  CreditBreakdownEntry,
   DeviceCodeResponse,
   DustAgent,
+  FairUseCredits,
   JsonObject,
   McpRegisterResponse,
   McpRequestLike,
+  MemberUsage,
   MeResponse,
   PostMessageResponse,
   TokenResponse,
   ToolApproveExecutionEvent,
+  TopConversations,
+  UsageAnalytics,
   Workspace,
 } from "./dust-types.js";
 
@@ -276,6 +281,141 @@ export function parseToolApproveExecutionEvent(value: unknown): ToolApproveExecu
           mcpServerName: getOptionalStringField(metadata, "mcpServerName"),
         }
       : undefined,
+  };
+}
+
+/**
+ * Credit endpoints below are Dust's *private* API — the same routes the web app
+ * calls, not the versioned `/api/v1` surface. They can change shape without a
+ * deprecation, so nothing here throws: a missing or wrongly-typed field becomes
+ * `null` and the corresponding row of `/status` is skipped.
+ */
+function optionalNumber(obj: JsonObject, key: string): number | null {
+  const value = obj[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function optionalString(obj: JsonObject, key: string): string | null {
+  const value = obj[key];
+  return typeof value === "string" ? value : null;
+}
+
+function optionalBoolean(obj: JsonObject, key: string): boolean | null {
+  const value = obj[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+/** First key that carries a finite number, or null. Shields against renames. */
+function firstNumber(obj: JsonObject, keys: readonly string[]): number | null {
+  for (const key of keys) {
+    const value = optionalNumber(obj, key);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+/** First key that carries a non-empty string, or null. */
+function firstString(obj: JsonObject, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = optionalString(obj, key);
+    if (value !== null && value.trim() !== "") return value.trim();
+  }
+  return null;
+}
+
+const LABEL_KEYS = ["label", "name", "title", "agentName", "key", "sId", "id"] as const;
+const CREDIT_KEYS = ["credits", "awuCredits", "consumedAwuCredits", "creditsConsumed", "value", "total"] as const;
+
+export function parseMyUsageResponse(value: unknown): MemberUsage | null {
+  if (!isRecord(value)) return null;
+  const member = value.member;
+  if (!isRecord(member)) return null;
+
+  return {
+    consumedAwuCredits: optionalNumber(member, "consumedAwuCredits"),
+    consumedFromAllowanceAwuCredits: optionalNumber(member, "consumedFromAllowanceAwuCredits"),
+    consumedFromPoolAwuCredits: optionalNumber(member, "consumedFromPoolAwuCredits"),
+    memberUsageLimit: optionalNumber(member, "memberUsageLimit"),
+    seatBalanceAwu: optionalNumber(member, "seatBalanceAwu"),
+    spendLimitAwuCredits: optionalNumber(member, "spendLimitAwuCredits"),
+    spendLimitSource: optionalString(member, "spendLimitSource"),
+    nextCreditResetAt: optionalString(member, "nextCreditResetAt"),
+    billingFrequency: optionalString(member, "billingFrequency"),
+    seatType: optionalString(member, "seatType"),
+    creditState: optionalString(member, "creditState"),
+    nearLimit: optionalBoolean(member, "nearLimit"),
+  };
+}
+
+export function parseFairUseCreditsResponse(value: unknown): FairUseCredits | null {
+  if (!isRecord(value)) return null;
+  const state = value.fairUseAwuCreditsState;
+  if (!isRecord(state)) return null;
+
+  return {
+    limit: optionalNumber(state, "limit"),
+    timeframe: optionalString(state, "timeframe"),
+    count: optionalNumber(state, "count"),
+  };
+}
+
+/**
+ * Sums a group's credits out of the time series when the group row itself
+ * carries no total. Points are `{ …, values: { <groupKey>: n } }` or flat
+ * `{ <groupKey>: n }`; anything else contributes nothing.
+ */
+function sumPointsForGroup(points: unknown[], groupKey: string | null): number | null {
+  if (!groupKey) return null;
+  let total = 0;
+  let matched = false;
+
+  for (const point of points) {
+    if (!isRecord(point)) continue;
+    const bucket = isRecord(point.values) ? point.values : point;
+    const value = optionalNumber(bucket, groupKey);
+    if (value !== null) {
+      total += value;
+      matched = true;
+    }
+  }
+
+  return matched ? total : null;
+}
+
+function parseBreakdownEntry(value: unknown, points: unknown[]): CreditBreakdownEntry | null {
+  if (!isRecord(value)) return null;
+  const label = firstString(value, LABEL_KEYS);
+  if (!label) return null;
+
+  const credits = firstNumber(value, CREDIT_KEYS) ?? sumPointsForGroup(points, firstString(value, ["key", "id", "sId"]));
+  if (credits === null) return null;
+
+  return { label, credits };
+}
+
+export function parseMyUsageAnalyticsResponse(value: unknown): UsageAnalytics | null {
+  if (!isRecord(value)) return null;
+  const rawGroups = Array.isArray(value.groups) ? value.groups : null;
+  if (!rawGroups) return null;
+  const points = Array.isArray(value.points) ? value.points : [];
+
+  return {
+    granularity: optionalString(value, "granularity"),
+    groups: rawGroups
+      .map((group) => parseBreakdownEntry(group, points))
+      .filter((group): group is CreditBreakdownEntry => group !== null),
+  };
+}
+
+export function parseMyTopConversationsResponse(value: unknown): TopConversations | null {
+  if (!isRecord(value)) return null;
+  const rawConversations = Array.isArray(value.conversations) ? value.conversations : null;
+  if (!rawConversations) return null;
+
+  return {
+    conversations: rawConversations
+      .map((conversation) => parseBreakdownEntry(conversation, []))
+      .filter((conversation): conversation is CreditBreakdownEntry => conversation !== null),
   };
 }
 

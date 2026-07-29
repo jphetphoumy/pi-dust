@@ -16,6 +16,7 @@ tool bridge (`bash`, `read`, `edit`) with local approval.
 - Dust agents exposed as Pi models
 - Conversation reuse across turns
 - SSE streaming with tool approval support
+- `/status` credit panel: seat credits, spend cap, reset date, and a 30-day breakdown
 - Local quality gates: lint, typecheck, tests, coverage
 - CI, changelog, release automation, Dependabot, and git hooks
 

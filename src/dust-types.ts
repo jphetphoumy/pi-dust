@@ -205,6 +205,65 @@ export interface PiEventStream {
   [Symbol.asyncIterator](): AsyncIterator<PiStreamEvent>;
 }
 
+/**
+ * Per-member credit usage, from `GET /api/w/:wId/credits/my-usage`.
+ *
+ * This is a private (session-authenticated) Dust endpoint, so every field is
+ * optional at runtime: a shape change upstream must blank a row of the panel,
+ * not throw.
+ */
+export interface MemberUsage {
+  consumedAwuCredits: number | null;
+  consumedFromAllowanceAwuCredits: number | null;
+  consumedFromPoolAwuCredits: number | null;
+  memberUsageLimit: number | null;
+  seatBalanceAwu: number | null;
+  spendLimitAwuCredits: number | null;
+  spendLimitSource: string | null;
+  nextCreditResetAt: string | null;
+  billingFrequency: string | null;
+  seatType: string | null;
+  creditState: string | null;
+  nearLimit: boolean | null;
+}
+
+/** Fair-use allowance for free plans, where `my-usage` reports no seat allocation. */
+export interface FairUseCredits {
+  /** -1 means unlimited. */
+  limit: number | null;
+  timeframe: string | null;
+  count: number | null;
+}
+
+export interface CreditBreakdownEntry {
+  label: string;
+  credits: number;
+}
+
+export interface UsageAnalytics {
+  granularity: string | null;
+  groups: CreditBreakdownEntry[];
+}
+
+export interface TopConversations {
+  conversations: CreditBreakdownEntry[];
+}
+
+/** Everything `/status` renders, assembled from up to four endpoints. */
+export interface DustStatusData {
+  workspaceName: string;
+  region: string;
+  agentName: string | null;
+  durationMs: number;
+  messagesSent: number;
+  sessionCredits: number | null;
+  sessionBaselineAt: number | null;
+  usage: MemberUsage | null;
+  fairUse: FairUseCredits | null;
+  analytics: UsageAnalytics | null;
+  topConversations: TopConversations | null;
+}
+
 export interface LoginCallbacks {
   onAuth: (params: { url: string; instructions: string }) => void;
   onProgress?: (message: string) => void;

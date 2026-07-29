@@ -110,6 +110,9 @@ export function registerDustSessionEvents(
       const sessionFile = ctx.sessionManager?.getSessionFile?.();
       const cred = getStoredCredentials();
       runtime.conversationId = (sessionFile && cred?.conversations?.[sessionFile]) ?? null;
+      // Resuming enters a different conversation, so the session credit
+      // baseline and the 30-day caches no longer describe it.
+      runtime.credits.reset();
       runtime.clearMcpState();
       debugLog("dust:session", "Resumed session", { currentConversationId: runtime.conversationId });
       return;

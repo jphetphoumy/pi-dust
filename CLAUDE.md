@@ -27,7 +27,7 @@ npx vitest run test/dust-auth.test.ts
 
 ## Architecture
 
-The project is organized as 15 TypeScript modules in `src/`, each with a single responsibility:
+The project is organized as 21 TypeScript modules in `src/`, each with a single responsibility:
 
 | Module | Role |
 |--------|------|
@@ -37,6 +37,9 @@ The project is organized as 15 TypeScript modules in `src/`, each with a single 
 | `dust-runtime.ts` | In-memory session state (conversation ID, MCP server ID, heartbeats) |
 | `dust-session-events.ts` | Hooks into Pi session lifecycle events |
 | `dust-workspace.ts` | `/workspace` command registration |
+| `dust-status.ts` | `/status` credit panel command |
+| `dust-status-render.ts` | ASCII layout for the credit panel |
+| `dust-credits.ts` | Private credit API client (usage, fair-use, breakdowns) |
 | `dust-auth.ts` | OAuth token flow, token refresh, workspace discovery, agent retrieval |
 | `dust-stream.ts` | Parses Dust SSE events and emits Pi stream chunks |
 | `dust-mcp.ts` | Client-side MCP server integration |

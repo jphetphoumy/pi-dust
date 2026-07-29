@@ -6,7 +6,14 @@ import {
   persistCredentialState,
   saveConversationId as persistConversationId,
 } from "./dust-state.js";
-import type { DustCredentials, PiRuntimeContext } from "./dust-types.js";
+import type {
+  DustCredentials,
+  FairUseCredits,
+  MemberUsage,
+  PiRuntimeContext,
+  TopConversations,
+  UsageAnalytics,
+} from "./dust-types.js";
 
 export interface SessionContextController {
   getSessionFile: () => string | undefined;
@@ -38,6 +45,83 @@ const NOOP_SESSION_CONTEXT: SessionContextController = {
 
 const NOOP_CONFIRM = async () => true;
 
+/**
+ * Per-session counters and caches behind `/status`.
+ *
+ * Dust reports credits per *billing period*, never per session, so the session
+ * figure is a delta against a baseline sample — approximate by construction, and
+ * labelled as such in the panel.
+ */
+export class DustCreditTracker {
+  startedAt = Date.now();
+  messagesSent = 0;
+  /**
+   * First `consumedAwuCredits` observed this session, with when it was taken.
+   * Sampled on the first live read rather than at session start, so a user who
+   * never opens `/status` never pays for the request.
+   */
+  baselineCredits: number | null = null;
+  baselineAt: number | null = null;
+  /**
+   * Set when a turn completes, cleared when live figures are refetched. Live
+   * data is only served from memory while this is false — i.e. while nothing has
+   * happened that could have moved the numbers.
+   */
+  dirty = false;
+  /** Last live read, reused only while `dirty` is false. */
+  lastConsumedCredits: number | null = null;
+  cachedUsage: MemberUsage | null = null;
+  cachedFairUse: FairUseCredits | null = null;
+  /** 30-day aggregates; they do not meaningfully move within one session. */
+  analytics: UsageAnalytics | null = null;
+  topConversations: TopConversations | null = null;
+
+  recordMessageSent(): void {
+    this.messagesSent++;
+  }
+
+  recordTurnCompleted(): void {
+    this.dirty = true;
+  }
+
+  /** Folds a fresh `consumedAwuCredits` reading in, returning the session delta. */
+  observeConsumedCredits(consumed: number | null): number | null {
+    this.dirty = false;
+    if (consumed === null) return null;
+
+    this.lastConsumedCredits = consumed;
+    if (this.baselineCredits === null) {
+      this.baselineCredits = consumed;
+      this.baselineAt = Date.now();
+    }
+    return Math.max(0, consumed - this.baselineCredits);
+  }
+
+  /** The delta implied by the last reading, without issuing a new one. */
+  sessionDelta(): number | null {
+    if (this.lastConsumedCredits === null || this.baselineCredits === null) return null;
+    return Math.max(0, this.lastConsumedCredits - this.baselineCredits);
+  }
+
+  /**
+   * Drops everything derived from the workspace or the credential. The elapsed
+   * clock restarts too: a switched workspace is, for credit purposes, a new
+   * session.
+   */
+  reset(): void {
+    this.startedAt = Date.now();
+    this.messagesSent = 0;
+    this.baselineCredits = null;
+    this.baselineAt = null;
+    this.dirty = false;
+    this.lastConsumedCredits = null;
+    this.cachedUsage = null;
+    this.cachedFairUse = null;
+    this.analytics = null;
+    this.topConversations = null;
+  }
+}
+
 export class DustSessionRuntime {
   /** Extension API handle, used to append tool-call entries to the transcript. */
   pi: ExtensionAPI | null = null;
@@ -54,6 +138,8 @@ export class DustSessionRuntime {
    * default, so a fresh session never silently executes tools.
    */
   autoApprove = false;
+  /** Session counters and credit caches read by `/status`. */
+  credits = new DustCreditTracker();
   preApprovedActions = new Map<string, boolean>();
   pendingApprovalPromise: Promise<void> | null = null;
   private resolveApprovalGateFn: (() => void) | null = null;
@@ -89,6 +175,7 @@ export class DustSessionRuntime {
 
   resetSessionState(): void {
     this.conversationId = null;
+    this.credits.reset();
     this.clearMcpState();
   }
 }
@@ -110,6 +197,9 @@ export function invalidateRuntimeCredentials(runtime: DustSessionRuntime, creden
   runtime.sessionContext.setCredentials(invalidateCredentials(credentials));
   markInvalidated();
   runtime.conversationId = null;
+  // The credit figures belong to the dead credential; keeping them would show
+  // another account's numbers after a re-login.
+  runtime.credits.reset();
   runtime.clearMcpState();
 }
 
