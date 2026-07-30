@@ -120,6 +120,21 @@ export async function listPods(api: PodApi): Promise<PodRef[]> {
     .map((space) => ({ sId: space.sId, name: space.name, archivedAt: space.archivedAt ?? null }));
 }
 
+/**
+ * Deletes the pod outright.
+ *
+ * Dust soft-deletes the space and launches a scrub workflow, so unlike
+ * `archivePod` this is not something the user can undo from the UI. Callers
+ * must confirm first.
+ */
+export async function deletePod(api: PodApi, podId: string): Promise<void> {
+  const res = await request(api, `/spaces/${podId}`, { method: "DELETE" });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Pod delete failed: HTTP ${res.status} — ${body.slice(0, 200)}`);
+  }
+}
+
 export async function unarchivePod(api: PodApi, podId: string): Promise<void> {
   const res = await request(api, `/spaces/${podId}/project_metadata`, {
     method: "PATCH",

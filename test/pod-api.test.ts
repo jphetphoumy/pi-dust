@@ -3,6 +3,7 @@ import { SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
 import {
   archivePod,
   createPod,
+  deletePod,
   deletePodFile,
   downloadPodFile,
   listPodFiles,
@@ -330,6 +331,17 @@ describe("dust pod API client", () => {
       .rejects.toThrow(/Pod upload failed for main.py: HTTP 413/);
   });
 
+  it("deletes a pod outright, which Dust scrubs rather than archives", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deletePod(makeApi(), "vlt_1");
+
+    const [url, init] = calls(fetchMock)[0];
+    expect(url).toBe(`${BASE}/spaces/vlt_1`);
+    expect(init.method).toBe("DELETE");
+  });
+
   it("archives a pod through project_metadata", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
     vi.stubGlobal("fetch", fetchMock);
@@ -392,12 +404,13 @@ describe("dust pod API client", () => {
     ["delete", () => deletePodFile(makeApi(), "vlt_1", "main.py"), /Pod delete failed for main.py: HTTP 403/],
     ["move", () => movePodFile(makeApi(), "vlt_1", "a.py", "b.py"), /Pod move failed a.py -> b.py: HTTP 400/],
     ["archive", () => archivePod(makeApi(), "vlt_1"), /Pod archive failed: HTTP 500/],
+    ["delete-pod", () => deletePod(makeApi(), "vlt_1"), /Pod delete failed: HTTP 500/],
     ["unarchive", () => unarchivePod(makeApi(), "vlt_1"), /Pod unarchive failed: HTTP 500/],
   ])("reports a failed %s with the status and body", async (_name, call, expected) => {
     // Every one of these is a step in a sync. Swallowing the failure would let
     // the watermark advance past a change that never landed, which silently
     // desynchronises the two copies.
-    const status = { download: 404, delete: 403, move: 400, archive: 500, unarchive: 500 }[_name] ?? 500;
+    const status = { download: 404, delete: 403, move: 400, archive: 500, unarchive: 500, "delete-pod": 500 }[_name] ?? 500;
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(textResponse("nope", status)));
 
     await expect(call()).rejects.toThrow(expected);

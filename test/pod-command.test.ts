@@ -7,6 +7,7 @@ import * as podApi from "../src/dust-pod.js";
 import { registerDustIngestCommand } from "../src/dust-pod-command.js";
 import * as podRuntime from "../src/dust-pod-runtime.js";
 import * as podSync from "../src/dust-pod-sync.js";
+import * as podUi from "../src/dust-pod-ui.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
 import { getPodBinding, savePodBinding } from "../src/dust-state.js";
 import { useTempAgentDir } from "./helpers/dust-fixtures.js";
@@ -22,6 +23,8 @@ describe("/ingest command", () => {
   let notices: Array<[string, string]>;
   let confirmAnswer: boolean;
   let confirmCalls: Array<[string, string]>;
+  let pickerResult: Awaited<ReturnType<typeof podUi.openListPanel>>;
+  let pickerOptions: Parameters<typeof podUi.openListPanel>[1] | null;
 
   function ctx() {
     return {
@@ -57,6 +60,14 @@ describe("/ingest command", () => {
     vi.spyOn(podRuntime, "podApiFor").mockReturnValue({
       baseUrl: "https://x/api/w/w1",
       getAuthHeaders: () => ({}),
+    });
+    // Default to no panel surface, so these tests exercise the dialog fallback.
+    // The picker gets its own block below.
+    pickerResult = null;
+    pickerOptions = null;
+    vi.spyOn(podUi, "openListPanel").mockImplementation(async (_ctx, options) => {
+      pickerOptions = options;
+      return pickerResult;
     });
 
     const registerCommand = vi.fn((_name: string, config: { handler: Handler }) => {
@@ -458,5 +469,73 @@ describe("/ingest command", () => {
     await handler("status", ctx());
 
     expect(messages()[0]).toContain("Not logged in");
+  });
+  describe("file picker", () => {
+    it("offers every candidate ticked, so one enter ingests the lot", async () => {
+      // The reverse default would make ingesting a whole project a chore.
+      write("main.py", "print(1)");
+      write("src/util.py", "x = 1");
+      pickerResult = [{ label: "main.py", value: "main.py", selected: true }];
+      vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+      vi.spyOn(podSync, "ingestFiles")
+        .mockResolvedValue({ pushed: ["main.py"], pulled: [], conflicted: [], skipped: [] });
+
+      await handler("", ctx());
+
+      expect(pickerOptions?.selectable).toBe(true);
+      expect(pickerOptions?.rows.map((row) => row.label)).toEqual(["main.py", "src/util.py"]);
+      expect(pickerOptions?.rows.every((row) => row.selected)).toBe(true);
+    });
+
+    it("uploads only what the user left ticked", async () => {
+      write("main.py", "print(1)");
+      write("src/util.py", "x = 1");
+      pickerResult = [{ label: "src/util.py", value: "src/util.py", selected: true }];
+      vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+      const ingest = vi.spyOn(podSync, "ingestFiles")
+        .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [], skipped: [] });
+
+      await handler("", ctx());
+
+      expect(ingest.mock.calls[0][3]).toEqual(["src/util.py"]);
+    });
+
+    it("creates no pod when the picker is cancelled", async () => {
+      // Cancelling must not be read as "an empty selection", which would bind a
+      // pod the user never asked for.
+      write("main.py", "print(1)");
+      pickerResult = undefined;
+      const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod");
+
+      await handler("", ctx());
+
+      expect(resolveOrCreate).not.toHaveBeenCalled();
+      expect(getPodBinding(root)).toBeNull();
+    });
+
+    it("binds an empty pod when everything was unticked", async () => {
+      // Distinct from cancelling: the user confirmed, they just chose nothing.
+      write("main.py", "print(1)");
+      pickerResult = [];
+      vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+      vi.spyOn(podSync, "ingestFiles")
+        .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+      await handler("", ctx());
+
+      expect(getPodBinding(root)).not.toBeNull();
+    });
+
+    it("skips the picker for an empty directory and confirms instead", async () => {
+      // There is nothing to choose between, so a list would be an empty box.
+      vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+      vi.spyOn(podSync, "ingestFiles")
+        .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+      await handler("", ctx());
+
+      expect(pickerOptions).toBeNull();
+      expect(confirmCalls[0][0]).toContain("Create empty Dust pod");
+    });
   });
 });

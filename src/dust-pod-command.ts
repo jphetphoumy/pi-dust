@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import { archivePod, type PodApi, resolveOrCreatePod } from "./dust-pod.js";
 import { MAX_INGEST_FILES, selectIngestableFiles } from "./dust-pod-files.js";
 import { clearPodStatus, podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
+import { openListPanel } from "./dust-pod-ui.js";
 import { describeReport, ingestFiles, isEmptyReport, syncPod } from "./dust-pod-sync.js";
 import { podApiFor } from "./dust-pod-runtime.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
@@ -12,6 +13,57 @@ import { errorMessage } from "./dust-validation.js";
 
 function podNameFor(root: string): string {
   return basename(root);
+}
+
+/**
+ * Asks which of the candidate files to upload.
+ *
+ * Everything starts ticked, so the common case is one Enter and the rare case is
+ * unticking a few — the reverse would make ingesting a whole project a chore.
+ *
+ * Hosts without a panel surface (headless, RPC) fall back to the all-or-nothing
+ * confirm this replaced, since a list is the only way to express a partial
+ * choice and a dialog cannot show one.
+ *
+ * Returns undefined when the user cancels, which must not be confused with an
+ * empty selection: cancelling leaves no pod, whereas confirming an empty
+ * directory deliberately creates one.
+ */
+async function chooseFilesToIngest(
+  ctx: PiRuntimeContext,
+  root: string,
+  podName: string,
+  candidates: string[],
+): Promise<string[] | undefined> {
+  if (candidates.length === 0) {
+    const confirmed = await ctx.ui?.confirm?.(
+      `Create empty Dust pod "${podName}"`,
+      `${root} has nothing to upload yet.\n\nCreating the pod now lets the agent write new ` +
+        "files with its free tools instead of the billed local ones; they are synced down " +
+        "to this directory as it goes.",
+    );
+    return confirmed ? [] : undefined;
+  }
+
+  const picked = await openListPanel(ctx, {
+    title: `Upload to Dust pod "${podName}" — ${candidates.length} files found`,
+    rows: candidates.map((rel) => ({ label: rel, selected: true, value: rel })),
+    selectable: true,
+  });
+
+  if (picked === null) {
+    const preview = candidates.slice(0, 20).join("\n");
+    const more = candidates.length > 20 ? `\n… and ${candidates.length - 20} more` : "";
+    const confirmed = await ctx.ui?.confirm?.(
+      `Upload ${candidates.length} files to Dust pod "${podName}"`,
+      `${preview}${more}\n\nThese files are copied to your Dust workspace so the agent can ` +
+        "read and edit them with its free tools.",
+    );
+    return confirmed ? candidates : undefined;
+  }
+
+  if (picked === undefined) return undefined;
+  return picked.map((row) => String(row.value));
 }
 
 export function registerDustIngestCommand(pi: ExtensionAPI, runtime: DustSessionRuntime): void {
@@ -119,21 +171,8 @@ export function registerDustIngestCommand(pi: ExtensionAPI, runtime: DustSession
         return;
       }
 
-      const preview = candidates.slice(0, 20).join("\n");
-      const more = candidates.length > 20 ? `\n… and ${candidates.length - 20} more` : "";
-      const confirmed = candidates.length === 0
-        ? await runtimeCtx.ui?.confirm?.(
-            `Create empty Dust pod "${podNameFor(root)}"`,
-            `${root} has nothing to upload yet.\n\nCreating the pod now lets the agent write new ` +
-              "files with its free tools instead of the billed local ones; they are synced down " +
-              "to this directory as it goes.",
-          )
-        : await runtimeCtx.ui?.confirm?.(
-            `Upload ${candidates.length} files to Dust pod "${podNameFor(root)}"`,
-            `${preview}${more}\n\nThese files are copied to your Dust workspace so the agent can ` +
-              "read and edit them with its free tools.",
-          );
-      if (!confirmed) return;
+      const chosen = await chooseFilesToIngest(runtimeCtx, root, podNameFor(root), candidates);
+      if (chosen === undefined) return;
 
       try {
         const pod = await resolveOrCreatePod(api, podNameFor(root));
@@ -149,12 +188,12 @@ export function registerDustIngestCommand(pi: ExtensionAPI, runtime: DustSession
           api,
           root,
           binding,
-          candidates,
+          chosen,
           podProgressReporter(runtime, pod.name),
         );
         refreshPodStatus(runtime, root, report);
         notify(
-          candidates.length === 0
+          chosen.length === 0
             ? `Created empty pod "${pod.name}". New files the agent writes will sync here.`
             : `Ingested ${report.pushed.length} files into pod "${pod.name}".`,
           "info",
