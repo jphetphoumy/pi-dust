@@ -9,6 +9,9 @@ import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, St
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
 import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
+import { podApiFor } from "./dust-pod-runtime.js";
+import { describeReport, isEmptyReport, syncPod } from "./dust-pod-sync.js";
+import { getPodBinding } from "./dust-state.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
 const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
@@ -73,6 +76,77 @@ function buildToolGuidance(cwd: string): string {
     "- Do not create files with bash heredocs; use the write tool.",
   ].join("\n");
 }
+
+/**
+ * The pod-mode counterpart of `buildToolGuidance`, and a deliberate inversion
+ * of it.
+ *
+ * With the project ingested into a Pod, the same files are reachable two ways:
+ * through our MCP server (3 AWU per call, billed as an external server) or
+ * through Dust's internal `files__*` toolset against the pod mount (free). The
+ * agent has to be told to prefer the free path, or the ingest buys nothing.
+ *
+ * `bash` stays local — it is the one thing the pod sandbox cannot do, since the
+ * user's toolchain, dependencies and environment live on their machine. We sync
+ * the tree down before each bash call so it sees the agent's edits.
+ */
+function buildPodToolGuidance(cwd: string, podId: string): string {
+  return [
+    "Tool usage rules for this session:",
+    `- You are driving a CLI on the user's machine, working directory: ${cwd}.`,
+    `- The user's project is mounted in your sandbox at \`/files/pod-${podId}\`.`,
+    "- To read, search, create or modify the user's project files, ALWAYS use the `files__*` tools",
+    `  against that mount (\`files__cat\`, \`files__edit\`, \`files__create\`, \`files__grep\`, \`files__list\`).`,
+    "  Edits there are synced back to the user's machine automatically.",
+    `- Use \`${MCP_TOOL_PREFIX}__bash\` ONLY to run commands (tests, builds, git). It executes on the`,
+    "  user's real machine and already sees your `files__*` edits.",
+    `- Do NOT use \`${MCP_TOOL_PREFIX}__read\`, \`${MCP_TOOL_PREFIX}__write\` or \`${MCP_TOOL_PREFIX}__edit\`:`,
+    "  they cost the user credits that the `files__*` tools do not.",
+  ].join("\n");
+}
+
+/**
+ * Pod syncs are best-effort on purpose.
+ *
+ * A sync failure means the two copies drifted, which is worth telling the user
+ * about, but it is not a reason to fail a turn that otherwise worked — the
+ * agent's answer is still valid and the next sync will reconcile. Throwing here
+ * would turn a transient 500 on a file listing into a lost turn.
+ */
+async function syncPodQuietly(
+  runtime: DustSessionRuntime,
+  cwd: string,
+  options: { push?: boolean; pull?: boolean },
+  phase: string,
+): Promise<void> {
+  // Re-read the binding at every sync point rather than reusing one captured
+  // at the top of the turn. `seen` is a watermark that each sync advances, and
+  // a turn can run several: a mid-turn pull before bash, then the post-turn
+  // pull. Handing the later one a stale snapshot makes it compare the pod
+  // against watermarks that predate its own earlier pull, so a file it already
+  // reconciled reads as changed on both sides and is reported as a conflict.
+  const binding = getPodBinding(cwd);
+  if (!binding) return;
+
+  try {
+    const report = await syncPod(podApiFor(runtime), cwd, binding, options);
+    if (!isEmptyReport(report)) {
+      debugLog("dust:pod", `Pod sync ${phase}`, report);
+      console.error(`[dust] pod sync ${phase}: ${describeReport(report)}`);
+    }
+    for (const rel of report.conflicted) {
+      console.error(`[dust] pod conflict, left untouched: ${rel}`);
+    }
+  } catch (err) {
+    console.error(`[dust] pod sync ${phase} failed: ${errorMessage(err)}`);
+  }
+}
+
+const syncPodBeforeTurn = (runtime: DustSessionRuntime, cwd: string) =>
+  syncPodQuietly(runtime, cwd, { push: true, pull: false }, "before turn");
+
+const syncPodAfterTurn = (runtime: DustSessionRuntime, cwd: string) =>
+  syncPodQuietly(runtime, cwd, { push: false, pull: true }, "after turn");
 
 function buildConversationContext(username: string, timezone: string, runtime: DustSessionRuntime) {
   return {
@@ -146,6 +220,14 @@ async function ensureMcpServer(
       if (runtime.isTurnCancelled()) {
         debugLog("dust:mcp", "Dropping tool call from a cancelled turn", { name });
         return { content: [{ type: "text", text: CANCELLED_TOOL_MESSAGE }], isError: true };
+      }
+      // In pod mode the agent edits files server-side, so the local tree is
+      // stale until the post-turn pull. A command run mid-turn — `pytest`, a
+      // build — would then execute against the old code and report a failure
+      // the agent has already fixed. Pull first so bash sees current files.
+      if (name === "bash") {
+        const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
+        await syncPodQuietly(runtime, cwd, { push: false, pull: true }, "before bash");
       }
       const startedAt = Date.now();
       const result = await executeMcpTool(
@@ -373,11 +455,16 @@ async function createConversation(
   username: string,
   timezone: string,
   systemPrompt?: string,
+  spaceId?: string,
 ): Promise<{ conversationSId: string; userMessageSId: string; agentMessageSId: string }> {
   const messageContent = systemPrompt ? `${systemPrompt}\n\n${userText}` : userText;
   const reqBody = {
     title: userText.substring(0, 50) + (userText.length > 50 ? "..." : ""),
     visibility: "unlisted",
+    // Binds the conversation to the Pod, which is what puts the pod's files on
+    // the agent's sandbox mount. It can only be set at creation time — there is
+    // no way to move a live conversation into a pod through this API.
+    ...(spaceId ? { spaceId } : {}),
     message: {
       content: messageContent,
       mentions: [{ configurationId: agentSId }],
@@ -590,9 +677,19 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
 
         const userText = extractUserText(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
-        const systemPrompt = [extractSystemPrompt(context), buildToolGuidance(cwd)]
+        const podBinding = getPodBinding(cwd);
+        const systemPrompt = [
+          extractSystemPrompt(context),
+          podBinding ? buildPodToolGuidance(cwd, podBinding.podId) : buildToolGuidance(cwd),
+        ]
           .filter((part) => part.length > 0)
           .join("\n\n");
+
+        // Push local edits made since the last turn, so the agent reads the tree
+        // the user is actually looking at rather than the ingest-time snapshot.
+        if (podBinding) {
+          await syncPodBeforeTurn(runtime, cwd);
+        }
         debugLog("dust:session", "Prepared user message", { userText, systemPrompt, currentConversationId: runtime.conversationId });
 
         let agentMessageSId: string;
@@ -661,6 +758,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             username,
             timezone,
             systemPrompt || undefined,
+            podBinding?.podId,
           ));
           startTurn(runtime.beginTurn(conversationSId, userMessageSId, agentMessageSId));
         } else {
@@ -723,6 +821,13 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           // turn is over and any tool call still in flight must be refused.
           onCancelled: () => { runtime.cancelActiveTurn(); },
         });
+
+        // The agent's `files__*` edits landed in the pod, not on disk. Pull them
+        // down now the turn is over, so the user's tree matches what the agent
+        // just told them it did.
+        if (podBinding) {
+          await syncPodAfterTurn(runtime, cwd);
+        }
       } catch (error) {
         // Aborting mid-setup (before the SSE stream owns the abort) surfaces as
         // a rejected fetch. That is the user cancelling, not a failure.

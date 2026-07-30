@@ -24,12 +24,28 @@ export interface DustState {
   region?: string;
   username?: string;
   conversations?: Record<string, string>;
+  /** Pod binding per project root, keyed by absolute path. See `DustPodBinding`. */
+  pods?: Record<string, DustPodBinding>;
   /**
    * Set when we detect the stored session is dead (refresh rejected, or Dust
    * answered 401). pi still holds a token-shaped blob in auth.json, so this is
    * how we force the "logged out" path until the next successful login.
    */
   invalidated?: boolean;
+}
+
+/**
+ * A project root ingested into a Dust Pod.
+ *
+ * `seen` is the sync watermark: for each relative path, the pod-side
+ * `lastModifiedMs` and the SHA-256 of the content as of the last time the two
+ * sides agreed. Both halves are needed to tell the three cases apart — pod
+ * changed (download), local changed (upload), or both (conflict, leave alone).
+ */
+export interface DustPodBinding {
+  podId: string;
+  name: string;
+  seen: Record<string, { podMs: number; hash: string }>;
 }
 
 const STATE_KEYS = [
@@ -39,6 +55,7 @@ const STATE_KEYS = [
   "region",
   "username",
   "conversations",
+  "pods",
   "invalidated",
 ] as const satisfies readonly (keyof DustState)[];
 
@@ -255,6 +272,21 @@ export function forgetConversationId(sessionFile: string): void {
   if (!(sessionFile in conversations)) return;
   delete conversations[sessionFile];
   patchDustState({ conversations });
+}
+
+export function getPodBinding(root: string): DustPodBinding | null {
+  return readDustState().pods?.[root] ?? null;
+}
+
+export function savePodBinding(root: string, binding: DustPodBinding): void {
+  patchDustState({ pods: { ...(readDustState().pods ?? {}), [root]: binding } });
+}
+
+export function forgetPodBinding(root: string): void {
+  const pods = { ...(readDustState().pods ?? {}) };
+  if (!(root in pods)) return;
+  delete pods[root];
+  patchDustState({ pods });
 }
 
 export function saveConversationId(sessionFile: string, conversationId: string): void {
