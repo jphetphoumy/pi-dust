@@ -10,6 +10,7 @@ import type { DustCredentials, ExtensionAPIWithEvents } from "./dust-types.js";
 import { registerDustApprovalMode } from "./dust-approval.js";
 import { registerDustIngestCommand } from "./dust-pod-command.js";
 import { registerDustPodFsCommand, registerDustPodsCommand } from "./dust-podfs.js";
+import { registerDustSkillsCommand } from "./dust-skills-command.js";
 import { registerDustStatusCommand } from "./dust-status.js";
 import { registerDustToolRenderer } from "./dust-tool-render.js";
 import { registerDustWorkspaceCommand } from "./dust-workspace.js";
@@ -52,5 +53,6 @@ export default function (pi: ExtensionAPI) {
   registerDustIngestCommand(pi, runtime);
   registerDustPodFsCommand(pi, runtime);
   registerDustPodsCommand(pi, runtime);
+  registerDustSkillsCommand(pi, runtime);
   registerDustStatusCommand(pi, runtime);
 }

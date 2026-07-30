@@ -9,7 +9,9 @@ import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, St
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
 import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
+import { composeAgentsMd, ensureAgentsMd, POD_AGENTS_MD_MAX_CHARS } from "./dust-pod-agents-md.js";
 import { podApiFor } from "./dust-pod-runtime.js";
+import { buildPodSkillsListing, discoverLocalSkills, stripSkillsListing } from "./dust-pod-skills.js";
 import { isEmptyReport, syncPod } from "./dust-pod-sync.js";
 import { beginPodStatusTurn, podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
 import { getPodBinding } from "./dust-state.js";
@@ -148,6 +150,59 @@ async function syncPodQuietly(
     }
   } catch (err) {
     console.error(`[dust] pod sync ${phase} failed: ${errorMessage(err)}`);
+  }
+}
+
+/**
+ * Moves the session's instructions into the pod's AGENTS.md.
+ *
+ * Dust injects that file as agent instructions and keeps it as a per-pod stable
+ * prompt prefix, so it can be cached across conversations — which a 7 kB
+ * preamble prepended to every new conversation's first user message cannot be.
+ *
+ * pi's own skills block is stripped and replaced with one naming only the
+ * skills `/dust-skills` put in the pod, pointing at the sandbox mount. Two
+ * reasons: the agent can then read a skill with the free `files__*` tools rather
+ * than our billed `read`, and dropping the unselected skills is what keeps the
+ * whole file under Dust's 8 kB cap.
+ *
+ * Returns false when the instructions could not be installed — over the cap, or
+ * the upload failed — leaving the caller to send them in-message as before. A
+ * failure here must not cost the user their turn.
+ */
+async function installPodInstructions(
+  runtime: DustSessionRuntime,
+  cwd: string,
+  basePrompt: string,
+  toolGuidance: string,
+): Promise<boolean> {
+  const binding = getPodBinding(cwd);
+  if (!binding) return false;
+
+  const selected = binding.skills ?? [];
+  // Skill discovery stats a whole tree, so it is skipped when nothing is synced.
+  const skills = selected.length === 0
+    ? []
+    : discoverLocalSkills(cwd).filter((skill) => selected.includes(skill.name));
+
+  const content = composeAgentsMd({
+    basePrompt: stripSkillsListing(basePrompt),
+    toolGuidance,
+    skillsListing: buildPodSkillsListing(skills, binding.podId),
+  });
+
+  try {
+    const installed = await ensureAgentsMd(podApiFor(runtime), cwd, binding, content);
+    if (!installed) {
+      console.error(
+        `[dust] instructions are ${content.length} chars, over Dust's ${POD_AGENTS_MD_MAX_CHARS} ` +
+          "pod limit — sending them in the message instead. Sync fewer skills to fit.",
+      );
+    }
+    return installed;
+  } catch (err) {
+    console.error(`[dust] could not write pod instructions: ${errorMessage(err)}`);
+    return false;
   }
 }
 
@@ -690,10 +745,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         const userText = extractUserText(context);
         const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
         const podBinding = getPodBinding(cwd);
-        const systemPrompt = [
-          extractSystemPrompt(context),
-          podBinding ? buildPodToolGuidance(cwd, podBinding.podId) : buildToolGuidance(cwd),
-        ]
+        const basePrompt = extractSystemPrompt(context);
+        const toolGuidance = podBinding
+          ? buildPodToolGuidance(cwd, podBinding.podId)
+          : buildToolGuidance(cwd);
+        let systemPrompt = [basePrompt, toolGuidance]
           .filter((part) => part.length > 0)
           .join("\n\n");
 
@@ -701,6 +757,11 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         // the user is actually looking at rather than the ingest-time snapshot.
         if (podBinding) {
           await syncPodBeforeTurn(runtime, cwd);
+          // With the instructions in the pod, the user message carries only what
+          // the user actually said.
+          if (await installPodInstructions(runtime, cwd, basePrompt, toolGuidance)) {
+            systemPrompt = "";
+          }
         }
         debugLog("dust:session", "Prepared user message", { userText, systemPrompt, currentConversationId: runtime.conversationId });
 

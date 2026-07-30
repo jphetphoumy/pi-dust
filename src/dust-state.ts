@@ -53,6 +53,16 @@ export interface DustPodBinding {
    * deliberately left out. Absent means the whole directory.
    */
   pathspecs?: string[];
+  /** Skill names synced into the pod by `/dust-skills`. */
+  skills?: string[];
+  /**
+   * Hash of the AGENTS.md last written to the pod.
+   *
+   * Lets a turn skip the upload when the instructions have not changed, which
+   * saves a request and — more importantly — keeps the file byte-identical so
+   * conversations in the pod keep sharing one cached prompt prefix.
+   */
+  agentsMdHash?: string;
 }
 
 const STATE_KEYS = [

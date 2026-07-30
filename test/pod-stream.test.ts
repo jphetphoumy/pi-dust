@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as podRuntime from "../src/dust-pod-runtime.js";
+import * as agentsMd from "../src/dust-pod-agents-md.js";
 import * as podSync from "../src/dust-pod-sync.js";
 import { savePodBinding } from "../src/dust-state.js";
 import * as tools from "../src/dust-tools.js";
@@ -24,12 +25,20 @@ describe("pod mode in the Dust stream", () => {
 
   const root = process.cwd();
   let emptyReport: () => podSync.SyncReport;
+  let agentsMdInstalls: boolean;
+  let agentsMdContent: string | null;
 
   beforeEach(() => {
     emptyReport = () => ({ pushed: [], pulled: [], conflicted: [], skipped: [] });
     vi.spyOn(podRuntime, "podApiFor").mockReturnValue({
       baseUrl: "https://x/api/w/w1",
       getAuthHeaders: () => ({}),
+    });
+    agentsMdInstalls = true;
+    agentsMdContent = null;
+    vi.spyOn(agentsMd, "ensureAgentsMd").mockImplementation(async (_api, _root, _binding, content) => {
+      agentsMdContent = content;
+      return agentsMdInstalls;
     });
   });
 
@@ -118,10 +127,10 @@ describe("pod mode in the Dust stream", () => {
 
     await drain(streamSimple);
 
-    const content = createConversationBody(fetchMock).message.content;
-    expect(content).toContain("/files/pod-vlt_pod");
-    expect(content).toContain("ALWAYS use the `files__*` tools");
-    expect(content).toContain("Do NOT use `pi_dust_extension__read`");
+    // The guidance now travels as pod instructions rather than in the message.
+    expect(agentsMdContent).toContain("/files/pod-vlt_pod");
+    expect(agentsMdContent).toContain("ALWAYS use the `files__*` tools");
+    expect(agentsMdContent).toContain("Do NOT use `pi_dust_extension__read`");
   });
 
   it("keeps the local-tools guidance when no pod is bound", async () => {
@@ -303,5 +312,67 @@ describe("pod mode in the Dust stream", () => {
 
     expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
     expect(errors.mock.calls.flat().join(" ")).toContain("pod listing 500");
+  });
+  it("moves the instructions into the pod and sends only the user's text", async () => {
+    // Dust injects AGENTS.md as instructions and keeps it as a per-pod stable
+    // prefix it can cache, which a 7 kB preamble on every new conversation is
+    // not. The message is then just what the user said.
+    vi.spyOn(podSync, "syncPod").mockResolvedValue(emptyReport());
+    const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
+    bindPod();
+    const fetchMock = makeTurnFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await drain(streamSimple);
+
+    expect(createConversationBody(fetchMock).message.content).toBe("Hi");
+    expect(agentsMdContent).toContain("ALWAYS use the `files__*` tools");
+  });
+
+  it("keeps the prompt in the message when the instructions will not fit", async () => {
+    // Dust truncates past its cap without a word, so a prompt that would lose
+    // its tail has to travel the old way instead.
+    agentsMdInstalls = false;
+    vi.spyOn(podSync, "syncPod").mockResolvedValue(emptyReport());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
+    bindPod();
+    const fetchMock = makeTurnFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await drain(streamSimple);
+
+    const content = createConversationBody(fetchMock).message.content;
+    expect(content).toContain("ALWAYS use the `files__*` tools");
+    expect(content).toContain("Hi");
+    expect(errors.mock.calls.flat().join(" ")).toMatch(/over Dust's \d+ pod limit/);
+  });
+
+  it("still answers the turn when writing the instructions fails", async () => {
+    vi.spyOn(podSync, "syncPod").mockResolvedValue(emptyReport());
+    vi.mocked(agentsMd.ensureAgentsMd).mockRejectedValue(new Error("HTTP 500"));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
+    bindPod();
+    const fetchMock = makeTurnFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = await drain(streamSimple);
+
+    expect(events.some((event) => (event as { type?: string }).type === "done")).toBe(true);
+    // The prompt falls back into the message rather than being lost.
+    expect(createConversationBody(fetchMock).message.content).toContain("Tool usage rules");
+    expect(errors.mock.calls.flat().join(" ")).toContain("could not write pod instructions");
+  });
+
+  it("leaves the prompt in the message when no pod is bound", async () => {
+    const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
+    const fetchMock = makeTurnFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await drain(streamSimple);
+
+    expect(createConversationBody(fetchMock).message.content).toContain("Tool usage rules");
+    expect(agentsMdContent).toBeNull();
   });
 });

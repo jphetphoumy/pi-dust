@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
+import { POD_AGENTS_MD } from "./dust-pod-agents-md.js";
 import { selectIngestableFiles } from "./dust-pod-files.js";
+import { isPodSkillPath } from "./dust-pod-skills.js";
 import {
   downloadPodFile,
   listPodFiles,
@@ -52,6 +54,18 @@ export function describeReport(report: SyncReport): string {
   if (report.conflicted.length > 0) parts.push(`⚠ ${report.conflicted.length} conflicted`);
   if (report.skipped.length > 0) parts.push(`− ${report.skipped.length} skipped`);
   return parts.join(", ");
+}
+
+/**
+ * Files the extension put in the pod for the agent, not the user's content.
+ *
+ * These must never be pulled onto disk: AGENTS.md is a rendering of the system
+ * prompt and .pi-skills/ is a copy of the user's skills directory, so writing
+ * either into the project would litter it with tooling that then looks like
+ * something they wrote.
+ */
+export function isPodOwnedPath(rel: string): boolean {
+  return rel === POD_AGENTS_MD || isPodSkillPath(rel);
 }
 
 function hashOf(content: Buffer | string): string {
@@ -108,6 +122,8 @@ export async function syncPod(
   for (const entry of entries) {
     step();
     const rel = toRelativePath(binding.podId, entry.path);
+    // Ours, not theirs: neither pulled down nor treated as a conflict.
+    if (isPodOwnedPath(rel)) continue;
     const watermark = seen[rel];
     const local = readLocal(root, rel);
     const localHash = local ? hashOf(local) : null;
