@@ -256,16 +256,25 @@ function parseUploadedPath(body: string): string | null {
   }
 }
 
-/** Moves a file inside the pod; both paths are canonical (`pod-{id}/…`). */
+/**
+ * Moves a file inside the pod.
+ *
+ * The two ends are spelled differently, which is easy to get wrong: the source
+ * is a scoped path in the URL and takes the bare `pod/` prefix, like GET and
+ * DELETE, while the destination is a plain path relative to the pod root with
+ * no prefix at all. Sending canonical `pod-{id}/…` for either answers 500 with
+ * a "No such object" from the storage layer rather than a validation error, so
+ * the mistake surfaces as an infrastructure failure.
+ */
 export async function movePodFile(
   api: PodApi,
   podId: string,
   fromRel: string,
   toRel: string,
 ): Promise<void> {
-  const res = await request(api, `/spaces/${podId}/files/pod-${podId}/${fromRel}`, {
+  const res = await request(api, `/spaces/${podId}/files/pod/${fromRel}`, {
     method: "POST",
-    body: JSON.stringify({ destRelativeFilePath: `pod-${podId}/${toRel}` }),
+    body: JSON.stringify({ destRelativeFilePath: toRel }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");

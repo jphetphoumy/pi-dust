@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -75,16 +75,14 @@ describe("/ingest command", () => {
     return notices.map(([message]) => message);
   }
 
-  it("uploads the git-tracked files and binds the pod to the working directory", async () => {
-    git("init", "-q");
+  it("uploads the directory files and binds the pod to the working directory", async () => {
     write("main.py", "print(1)");
     write("src/util.py", "x = 1");
-    git("add", "-A");
 
     const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod")
       .mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: ["main.py", "src/util.py"], pulled: [], conflicted: [] });
+      .mockResolvedValue({ pushed: ["main.py", "src/util.py"], pulled: [], conflicted: [], skipped: [] });
 
     await handler("", ctx());
 
@@ -97,47 +95,167 @@ describe("/ingest command", () => {
   });
 
   it("respects a pathspec so the user can upload part of the tree", async () => {
-    git("init", "-q");
     write("main.py", "print(1)");
     write("src/util.py", "x = 1");
-    git("add", "-A");
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [] });
+      .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [], skipped: [] });
 
     await handler("src", ctx());
 
     expect(ingest.mock.calls[0][3]).toEqual(["src/util.py"]);
   });
 
-  it("includes untracked files that are not gitignored, and excludes ignored ones", async () => {
-    git("init", "-q");
-    write(".gitignore", "secret.env\n");
+  it("works in a directory that is not a git repository", async () => {
+    // Git is an optional refinement, not a precondition: a scratch folder, an
+    // unpacked tarball or any plain directory has to be ingestable.
     write("main.py", "print(1)");
-    write("secret.env", "TOKEN=1");
-    git("add", ".gitignore");
+    write("src/util.py", "x = 1");
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(ingest.mock.calls[0][3]).toEqual(["main.py", "src/util.py"]);
+  });
+
+  it("honours .gitignore when the directory happens to be a repo", async () => {
+    git("init", "-q");
+    write(".gitignore", "generated.py\n");
+    write("main.py", "print(1)");
+    write("generated.py", "# built");
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
 
     await handler("", ctx());
 
     const uploaded = ingest.mock.calls[0][3];
     expect(uploaded).toContain("main.py");
-    expect(uploaded).not.toContain("secret.env");
+    expect(uploaded).not.toContain("generated.py");
   });
 
-  it("skips files too large to be worth putting in an LLM's context", async () => {
+  it("uploads a file that git has never seen, tracked or not", async () => {
     git("init", "-q");
-    write("main.py", "print(1)");
-    write("blob.bin", "x".repeat(300 * 1024));
-    git("add", "-A");
+    write("brand-new.py", "print(1)");
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(ingest.mock.calls[0][3]).toContain("brand-new.py");
+  });
+
+  it("skips hidden files, so an unqualified /ingest cannot upload .env", async () => {
+    write("main.py", "print(1)");
+    write(".env", "TOKEN=hunter2");
+    write(".config/creds.json", "{}");
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(ingest.mock.calls[0][3]).toEqual(["main.py"]);
+  });
+
+  it("skips dependency and build directories", async () => {
+    write("main.py", "print(1)");
+    write("node_modules/left-pad/index.js", "module.exports = 1");
+    write("dist/bundle.js", "//");
+    write("__pycache__/main.pyc", "x");
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(ingest.mock.calls[0][3]).toEqual(["main.py"]);
+  });
+
+  it("does not follow symlinks, which could cycle or escape the tree", async () => {
+    write("main.py", "print(1)");
+    symlinkSync(root, join(root, "loop"));
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(ingest.mock.calls[0][3]).toEqual(["main.py"]);
+  });
+
+  it.each([
+    ["src", ["src/deep/b.py", "src/util.py"]],
+    ["src/util.py", ["src/util.py"]],
+    ["*.py", ["main.py"]],
+    ["src/*.py", ["src/util.py"]],
+    ["**/*.py", ["main.py", "src/deep/b.py", "src/util.py"]],
+  ])("selects with the pathspec %s, without needing git", async (spec, expected) => {
+    // Pathspec matching is ours rather than git's, so it behaves identically
+    // whether or not the directory is a repository.
+    write("main.py", "print(1)");
+    write("src/util.py", "x = 1");
+    write("src/deep/b.py", "y = 2");
+    write("README.md", "# hi");
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler(spec, ctx());
+
+    expect(ingest.mock.calls[0][3]).toEqual(expected);
+  });
+
+  it("skips empty files, which the pod refuses outright", async () => {
+    // Dust answers 400 `file_is_empty`, and `__init__.py` / `.gitkeep` make
+    // that a routine case rather than an edge one.
+    write("main.py", "print(1)");
+    write("src/__init__.py", "");
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(ingest.mock.calls[0][3]).toEqual(["main.py"]);
+  });
+
+  it("names files the pod refused, since the agent will not see them", async () => {
+    write("main.py", "print(1)");
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    vi.spyOn(podSync, "ingestFiles").mockResolvedValue({
+      pushed: ["main.py"],
+      pulled: [],
+      conflicted: [],
+      skipped: [{ rel: "odd.bin", reason: "HTTP 400" }],
+    });
+
+    await handler("", ctx());
+
+    expect(messages()[0]).toContain("Ingested 1 files");
+    expect(notices[1]).toEqual(["Skipped odd.bin: HTTP 400", "warning"]);
+  });
+
+  it("skips files too large to be worth putting in an LLM's context", async () => {
+    write("main.py", "print(1)");
+    write("blob.bin", "x".repeat(300 * 1024));
+
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
 
     await handler("", ctx());
 
@@ -145,9 +263,7 @@ describe("/ingest command", () => {
   });
 
   it("uploads nothing when the user declines the confirmation", async () => {
-    git("init", "-q");
     write("main.py", "print(1)");
-    git("add", "-A");
     confirmAnswer = false;
 
     const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod");
@@ -163,9 +279,7 @@ describe("/ingest command", () => {
   });
 
   it("names the file count and a preview in the confirmation", async () => {
-    git("init", "-q");
     write("main.py", "print(1)");
-    git("add", "-A");
     confirmAnswer = false;
 
     await handler("", ctx());
@@ -174,19 +288,18 @@ describe("/ingest command", () => {
     expect(confirmCalls[0][1]).toContain("main.py");
   });
 
-  it("refuses a directory that is not a git repository rather than walking it", async () => {
-    write("main.py", "print(1)");
+  it("warns rather than creating a pod when the directory holds nothing ingestable", async () => {
+    write(".env", "TOKEN=1");
+    write("node_modules/x/index.js", "1");
 
     await handler("", ctx());
 
-    expect(messages()[0]).toContain("needs a git repository");
+    expect(messages()[0]).toContain("No files to ingest");
     expect(getPodBinding(root)).toBeNull();
   });
 
   it("warns instead of uploading when a pathspec matches nothing", async () => {
-    git("init", "-q");
     write("main.py", "print(1)");
-    git("add", "-A");
 
     await handler("does-not-exist", ctx());
 
@@ -194,9 +307,7 @@ describe("/ingest command", () => {
   });
 
   it("refuses an ingest over the file-count limit", async () => {
-    git("init", "-q");
     for (let i = 0; i < 501; i++) write(`f${i}.txt`, "x");
-    git("add", "-A");
 
     await handler("", ctx());
 
@@ -220,7 +331,7 @@ describe("/ingest command", () => {
   it("reconciles both directions on /ingest sync and surfaces conflicts", async () => {
     savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
     vi.spyOn(podSync, "syncPod")
-      .mockResolvedValue({ pushed: ["a.py"], pulled: ["b.py"], conflicted: ["c.py"] });
+      .mockResolvedValue({ pushed: ["a.py"], pulled: ["b.py"], conflicted: ["c.py"], skipped: [] });
 
     await handler("sync", ctx());
 

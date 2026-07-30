@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import {
   downloadPodFile,
@@ -10,6 +11,7 @@ import {
   uploadPodFile,
 } from "./dust-pod.js";
 import { type DustPodBinding, savePodBinding } from "./dust-state.js";
+import { errorMessage } from "./dust-validation.js";
 
 export interface SyncReport {
   /** Pod files written onto the local tree. */
@@ -18,14 +20,19 @@ export interface SyncReport {
   pushed: string[];
   /** Changed on both sides since the last sync; left untouched. */
   conflicted: string[];
+  /** Files the pod would not accept, with the reason. */
+  skipped: Array<{ rel: string; reason: string }>;
 }
 
 export function emptyReport(): SyncReport {
-  return { pulled: [], pushed: [], conflicted: [] };
+  return { pulled: [], pushed: [], conflicted: [], skipped: [] };
 }
 
 export function isEmptyReport(report: SyncReport): boolean {
-  return report.pulled.length === 0 && report.pushed.length === 0 && report.conflicted.length === 0;
+  return report.pulled.length === 0
+    && report.pushed.length === 0
+    && report.conflicted.length === 0
+    && report.skipped.length === 0;
 }
 
 export function describeReport(report: SyncReport): string {
@@ -33,6 +40,7 @@ export function describeReport(report: SyncReport): string {
   if (report.pushed.length > 0) parts.push(`↑ ${report.pushed.length} pushed`);
   if (report.pulled.length > 0) parts.push(`↓ ${report.pulled.length} pulled`);
   if (report.conflicted.length > 0) parts.push(`⚠ ${report.conflicted.length} conflicted`);
+  if (report.skipped.length > 0) parts.push(`− ${report.skipped.length} skipped`);
   return parts.join(", ");
 }
 
@@ -91,6 +99,17 @@ export async function syncPod(
     const localChanged = watermark ? localHash !== watermark.hash : local !== null;
 
     if (podChanged && localChanged) {
+      // Both sides moved by the watermark's reckoning, but they may well have
+      // moved to the same place — or the watermark may be missing entirely,
+      // which is what a partial ingest leaves behind. Compare the bytes before
+      // calling it a conflict, so identical copies simply re-establish the
+      // watermark instead of jamming the file permanently.
+      const content = await downloadPodFile(api, binding.podId, rel);
+      const contentHash = hashOf(content);
+      if (contentHash === localHash) {
+        seen[rel] = { podMs: entry.lastModifiedMs, hash: contentHash };
+        continue;
+      }
       report.conflicted.push(rel);
       continue;
     }
@@ -151,7 +170,15 @@ export async function syncPod(
   return report;
 }
 
-/** First upload of a chosen file set; establishes the watermark for each. */
+/**
+ * First upload of a chosen file set; establishes the watermark for each.
+ *
+ * A file the pod refuses is recorded and skipped rather than aborting the run.
+ * Letting one rejection throw would strand the whole ingest: the files already
+ * uploaded would have no watermark, and a watermark-less file that exists on
+ * both sides reads as changed-on-both-sides, so the next sync would report the
+ * entire project as conflicted. A partial ingest has to leave consistent state.
+ */
 export async function ingestFiles(
   api: PodApi,
   root: string,
@@ -162,7 +189,15 @@ export async function ingestFiles(
   for (const rel of relPaths) {
     const local = readLocal(root, rel);
     if (!local) continue;
-    await uploadPodFile(api, binding.podId, rel, local);
+    try {
+      await uploadPodFile(api, binding.podId, rel, local);
+    } catch (err) {
+      // A dead session is not a per-file problem and must not be swallowed as
+      // one — every remaining file would "fail" too, for the same reason.
+      if (err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE) throw err;
+      report.skipped.push({ rel, reason: errorMessage(err) });
+      continue;
+    }
     binding.seen[rel] = { podMs: Number.MAX_SAFE_INTEGER, hash: hashOf(local) };
     report.pushed.push(rel);
   }

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
 import type { PodApi } from "../src/dust-pod.js";
 import * as podApi from "../src/dust-pod.js";
 import { describeReport, ingestFiles, isEmptyReport, syncPod } from "../src/dust-pod-sync.js";
@@ -232,6 +233,68 @@ describe("pod sync", () => {
     expect(getPodBinding(root)?.seen["main.py"]).toBeDefined();
   });
 
+  it("adopts the watermark instead of reporting a conflict when both sides hold the same bytes", async () => {
+    // A partial ingest leaves files with no watermark at all, which otherwise
+    // reads as changed-on-both-sides and jams every file in the project. If the
+    // bytes agree there is nothing to reconcile.
+    const pod = makeFakePod({ "main.py": { content: "same", ms: 200 } });
+    writeLocal("main.py", "same");
+    const bound = binding();
+
+    const report = await syncPod(pod.api, root, bound);
+
+    expect(isEmptyReport(report)).toBe(true);
+    expect(bound.seen["main.py"]).toEqual({ podMs: 200, hash: hash("same") });
+  });
+
+  it("still reports a conflict when the two sides genuinely differ", async () => {
+    const pod = makeFakePod({ "main.py": { content: "pod version", ms: 200 } });
+    writeLocal("main.py", "local version");
+
+    const report = await syncPod(pod.api, root, binding());
+
+    expect(report.conflicted).toEqual(["main.py"]);
+    expect(readLocal("main.py")).toBe("local version");
+  });
+
+  it("ingest records a rejected file and keeps going", async () => {
+    // Dust refuses zero-byte uploads with 400 `file_is_empty`. Aborting the run
+    // would leave the files already uploaded without watermarks, and a
+    // watermark-less file reads as conflicted — so one rejected file would
+    // report the whole project as conflicted on the next sync.
+    const pod = makeFakePod({});
+    writeLocal("a.py", "one");
+    writeLocal("bad.py", "two");
+    writeLocal("c.py", "three");
+    vi.mocked(podApi.uploadPodFile).mockImplementation(async (_api, _podId, rel, content) => {
+      if (rel === "bad.py") throw new Error("Pod upload failed for bad.py: HTTP 400 — file_is_empty");
+      pod.files.set(rel, { content: content.toString(), ms: 10 });
+    });
+    const bound = binding();
+
+    const report = await ingestFiles(pod.api, root, bound, ["a.py", "bad.py", "c.py"]);
+
+    expect(report.pushed).toEqual(["a.py", "c.py"]);
+    expect(report.skipped).toEqual([
+      { rel: "bad.py", reason: "Pod upload failed for bad.py: HTTP 400 — file_is_empty" },
+    ]);
+    // The watermarks that did succeed must survive, or the next sync conflicts.
+    expect(Object.keys(bound.seen)).toEqual(["a.py", "c.py"]);
+    expect(getPodBinding(root)?.seen["c.py"]).toBeDefined();
+  });
+
+  it("ingest still aborts on a dead session rather than skipping every file", async () => {
+    // Every remaining file would fail for the same reason, so recording them
+    // one by one as skipped would bury the real cause.
+    const pod = makeFakePod({});
+    writeLocal("a.py", "one");
+    writeLocal("b.py", "two");
+    vi.mocked(podApi.uploadPodFile).mockRejectedValue(new Error(SESSION_EXPIRED_MESSAGE));
+
+    await expect(ingestFiles(pod.api, root, binding(), ["a.py", "b.py"]))
+      .rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+  });
+
   it("ingest skips a path that has disappeared between selection and upload", async () => {
     const pod = makeFakePod({});
     writeLocal("main.py", "a");
@@ -242,8 +305,8 @@ describe("pod sync", () => {
   });
 
   it("summarises a report in both directions", () => {
-    expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"] }))
+    expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"], skipped: [] }))
       .toBe("↑ 1 pushed, ↓ 2 pulled, ⚠ 1 conflicted");
-    expect(describeReport({ pushed: [], pulled: [], conflicted: [] })).toBe("");
+    expect(describeReport({ pushed: [], pulled: [], conflicted: [], skipped: [] })).toBe("");
   });
 });

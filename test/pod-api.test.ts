@@ -203,15 +203,18 @@ describe("dust pod API client", () => {
     expect(calls(fetchMock)[0][0]).toBe(`${BASE}/spaces/vlt_1/files/pod/src/main.py`);
   });
 
-  it("moves through the canonical `pod-{id}/` prefix on both sides", async () => {
+  it("moves with a bare-prefixed source and an unprefixed destination", async () => {
+    // The two ends really are spelled differently. Sending canonical
+    // `pod-{id}/…` for either answers 500 "No such object" from the storage
+    // layer, so getting this wrong looks like an outage rather than a bug.
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
     vi.stubGlobal("fetch", fetchMock);
 
     await movePodFile(makeApi(), "vlt_1", "main.py", "src/main.py");
 
     const [url, init] = calls(fetchMock)[0];
-    expect(url).toBe(`${BASE}/spaces/vlt_1/files/pod-vlt_1/main.py`);
-    expect(JSON.parse(String(init.body))).toEqual({ destRelativeFilePath: "pod-vlt_1/src/main.py" });
+    expect(url).toBe(`${BASE}/spaces/vlt_1/files/pod/main.py`);
+    expect(JSON.parse(String(init.body))).toEqual({ destRelativeFilePath: "src/main.py" });
   });
 
   it("deletes through the bare `pod/` scope prefix", async () => {
@@ -277,9 +280,9 @@ describe("dust pod API client", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(4);
     const [moveUrl, moveInit] = calls(fetchMock)[3];
-    expect(moveUrl).toBe(`${BASE}/spaces/vlt_1/files/pod-vlt_1/main.py`);
+    expect(moveUrl).toBe(`${BASE}/spaces/vlt_1/files/pod/main.py`);
     expect(JSON.parse(String(moveInit.body))).toEqual({
-      destRelativeFilePath: "pod-vlt_1/src/deep/main.py",
+      destRelativeFilePath: "src/deep/main.py",
     });
   });
 
@@ -296,8 +299,8 @@ describe("dust pod API client", () => {
     await uploadPodFile(makeApi(), "vlt_1", "main.py", Buffer.from("x"));
 
     const [moveUrl, moveInit] = calls(fetchMock)[3];
-    expect(moveUrl).toBe(`${BASE}/spaces/vlt_1/files/pod-vlt_1/main_fil_abc.py`);
-    expect(JSON.parse(String(moveInit.body))).toEqual({ destRelativeFilePath: "pod-vlt_1/main.py" });
+    expect(moveUrl).toBe(`${BASE}/spaces/vlt_1/files/pod/main_fil_abc.py`);
+    expect(JSON.parse(String(moveInit.body))).toEqual({ destRelativeFilePath: "main.py" });
   });
 
   it("falls back to the file name when the upload response says nothing useful", async () => {
@@ -313,7 +316,7 @@ describe("dust pod API client", () => {
     await uploadPodFile(makeApi(), "vlt_1", "src/main.py", Buffer.from("x"));
 
     // Assumed to be at the root under its own name, so it still gets moved.
-    expect(calls(fetchMock)[3][0]).toBe(`${BASE}/spaces/vlt_1/files/pod-vlt_1/main.py`);
+    expect(calls(fetchMock)[3][0]).toBe(`${BASE}/spaces/vlt_1/files/pod/main.py`);
   });
 
   it("surfaces a failed upload rather than reporting success", async () => {

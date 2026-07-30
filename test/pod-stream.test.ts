@@ -26,7 +26,7 @@ describe("pod mode in the Dust stream", () => {
   let emptyReport: () => podSync.SyncReport;
 
   beforeEach(() => {
-    emptyReport = () => ({ pushed: [], pulled: [], conflicted: [] });
+    emptyReport = () => ({ pushed: [], pulled: [], conflicted: [], skipped: [] });
     vi.spyOn(podRuntime, "podApiFor").mockReturnValue({
       baseUrl: "https://x/api/w/w1",
       getAuthHeaders: () => ({}),
