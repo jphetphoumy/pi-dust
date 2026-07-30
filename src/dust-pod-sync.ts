@@ -25,6 +25,15 @@ export interface SyncReport {
   skipped: Array<{ rel: string; reason: string }>;
 }
 
+/** Called as each file finishes, for a progress indicator. */
+export type SyncProgress = (done: number, total: number) => void;
+
+export interface SyncOptions {
+  push?: boolean;
+  pull?: boolean;
+  onProgress?: SyncProgress;
+}
+
 export function emptyReport(): SyncReport {
   return { pulled: [], pushed: [], conflicted: [], skipped: [] };
 }
@@ -82,7 +91,7 @@ export async function syncPod(
   api: PodApi,
   root: string,
   binding: DustPodBinding,
-  options: { push?: boolean; pull?: boolean } = {},
+  options: SyncOptions = {},
 ): Promise<SyncReport> {
   const push = options.push ?? true;
   const pull = options.pull ?? true;
@@ -90,7 +99,14 @@ export async function syncPod(
   const seen = { ...binding.seen };
 
   const entries = await listPodFiles(api, binding.podId);
+  // Both loops feed one counter, so the indicator does not restart halfway.
+  const discovered = push ? selectIngestableFiles(root, binding.pathspecs ?? []) : [];
+  const total = entries.length + discovered.length;
+  let done = 0;
+  const step = (): void => options.onProgress?.(++done, total);
+
   for (const entry of entries) {
+    step();
     const rel = toRelativePath(binding.podId, entry.path);
     const watermark = seen[rel];
     const local = readLocal(root, rel);
@@ -145,12 +161,10 @@ export async function syncPod(
     // makes a pod created for an empty directory usable — otherwise the first
     // file the user writes themselves would never reach the agent.
     const podPaths = new Set(entries.map((entry) => toRelativePath(binding.podId, entry.path)));
-    const missing = new Set([
-      ...Object.keys(seen),
-      ...selectIngestableFiles(root, binding.pathspecs ?? []),
-    ]);
+    const missing = new Set([...Object.keys(seen), ...discovered]);
 
     for (const rel of missing) {
+      step();
       if (podPaths.has(rel)) continue;
       const local = readLocal(root, rel);
       if (!local) continue;
@@ -198,9 +212,12 @@ export async function ingestFiles(
   root: string,
   binding: DustPodBinding,
   relPaths: string[],
+  onProgress?: SyncProgress,
 ): Promise<SyncReport> {
   const report = emptyReport();
+  let done = 0;
   for (const rel of relPaths) {
+    onProgress?.(++done, relPaths.length);
     const local = readLocal(root, rel);
     if (!local) continue;
     try {

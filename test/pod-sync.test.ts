@@ -354,6 +354,35 @@ describe("pod sync", () => {
     expect(report.pushed).toEqual(["main.py"]);
   });
 
+  it("reports progress across both of sync's passes as one running count", () => {
+    // The pod-entry loop and the discovery loop share a counter; restarting at
+    // 1/n halfway through would read as the sync having begun again.
+    const pod = makeFakePod({ "a.py": { content: "pod", ms: 200 } });
+    writeLocal("a.py", "pod");
+    writeLocal("b.py", "new");
+    const steps: string[] = [];
+
+    return syncPod(pod.api, root, binding(), {
+      push: true,
+      pull: true,
+      onProgress: (done, total) => steps.push(`${done}/${total}`),
+    }).then(() => {
+      expect(steps).toEqual(["1/3", "2/3", "3/3"]);
+    });
+  });
+
+  it("reports progress through an ingest", async () => {
+    const pod = makeFakePod({});
+    writeLocal("a.py", "one");
+    writeLocal("b.py", "two");
+    const steps: string[] = [];
+
+    await ingestFiles(pod.api, root, binding(), ["a.py", "b.py"], (done, total) =>
+      steps.push(`${done}/${total}`));
+
+    expect(steps).toEqual(["1/2", "2/2"]);
+  });
+
   it("summarises a report in both directions", () => {
     expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"], skipped: [] }))
       .toBe("↑ 1 pushed, ↓ 2 pulled, ⚠ 1 conflicted");

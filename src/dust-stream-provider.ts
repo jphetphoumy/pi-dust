@@ -11,7 +11,7 @@ import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshA
 import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
 import { podApiFor } from "./dust-pod-runtime.js";
 import { isEmptyReport, syncPod } from "./dust-pod-sync.js";
-import { beginPodStatusTurn, refreshPodStatus } from "./dust-pod-status.js";
+import { beginPodStatusTurn, podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
 import { getPodBinding } from "./dust-state.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
@@ -130,7 +130,10 @@ async function syncPodQuietly(
   if (!binding) return;
 
   try {
-    const report = await syncPod(podApiFor(runtime), cwd, binding, options);
+    const report = await syncPod(podApiFor(runtime), cwd, binding, {
+      ...options,
+      onProgress: podProgressReporter(runtime, binding.name),
+    });
     if (!isEmptyReport(report)) {
       debugLog("dust:pod", `Pod sync ${phase}`, report);
     }

@@ -7,25 +7,71 @@ import type { PiRuntimeContext } from "./dust-types.js";
 const STATUS_KEY = "dust-pod";
 
 /**
+ * Colour is written as raw SGR codes rather than through pi's `theme`.
+ *
+ * The theme singleton lives at `modes/interactive/theme/theme.js`, which the
+ * package's export map does not expose — only `.` and `./rpc-entry` — so
+ * importing it would break under Node's ESM resolution. Basic ANSI colours are
+ * the portable alternative: they resolve against the user's own terminal
+ * palette, so they stay legible on light and dark backgrounds alike.
+ *
+ * pi's footer measures width with `visibleWidth`, which strips escape
+ * sequences, so colouring cannot upset its truncation.
+ */
+const SGR = {
+  reset: "\x1b[0m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  cyan: "\x1b[36m",
+  dim: "\x1b[2m",
+} as const;
+
+/** Honours the NO_COLOR convention, and keeps assertions readable in tests. */
+function colorsEnabled(): boolean {
+  return !process.env.NO_COLOR;
+}
+
+function paint(color: keyof typeof SGR, text: string): string {
+  return colorsEnabled() ? `${SGR[color]}${text}${SGR.reset}` : text;
+}
+
+/**
  * Compact form of a sync report for the footer, e.g. `↑1 ↓2 ⚠1`.
  *
  * Deliberately terser than `describeReport`: that one writes prose for a
  * notification line, this one shares a single row with the model, token count
  * and git branch.
+ *
+ * Colour encodes severity, not direction — the arrows already say which way a
+ * file went, so what the colour has left to convey is whether anything needs
+ * the user's attention. Green moved cleanly, yellow needs a decision, red did
+ * not happen at all.
  */
 function compactReport(report: SyncReport): string {
   const parts: string[] = [];
-  if (report.pushed.length > 0) parts.push(`↑${report.pushed.length}`);
-  if (report.pulled.length > 0) parts.push(`↓${report.pulled.length}`);
-  if (report.conflicted.length > 0) parts.push(`⚠${report.conflicted.length}`);
-  if (report.skipped.length > 0) parts.push(`−${report.skipped.length}`);
+  if (report.pushed.length > 0) parts.push(paint("green", `↑${report.pushed.length}`));
+  if (report.pulled.length > 0) parts.push(paint("green", `↓${report.pulled.length}`));
+  if (report.conflicted.length > 0) parts.push(paint("yellow", `⚠${report.conflicted.length}`));
+  if (report.skipped.length > 0) parts.push(paint("red", `−${report.skipped.length}`));
   return parts.join(" ");
 }
 
 export function podStatusText(podName: string, report?: SyncReport): string {
-  return report && !isEmptyReport(report)
-    ? `pod:${podName} ${compactReport(report)}`
-    : `pod:${podName}`;
+  const label = paint("dim", `pod:${podName}`);
+  return report && !isEmptyReport(report) ? `${label} ${compactReport(report)}` : label;
+}
+
+/**
+ * In-progress form, e.g. `pod:proj ⟳ 3/12`.
+ *
+ * Uploads are sequential, one request per file, so ingesting a real project is
+ * visibly slow. Without this the footer sat on its previous value and the
+ * session looked wedged.
+ */
+export function podSyncingText(podName: string, done: number, total: number): string {
+  const label = paint("dim", `pod:${podName}`);
+  return `${label} ${paint("cyan", `⟳ ${done}/${total}`)}`;
 }
 
 /**
@@ -76,6 +122,23 @@ export function refreshPodStatus(
   const binding = getPodBinding(root);
   const totals = report ? accumulate(report) : turnTotals ?? undefined;
   setStatus(STATUS_KEY, binding ? podStatusText(binding.name, totals) : undefined);
+}
+
+/**
+ * A progress reporter for one sync, or a no-op when there is nothing to show it
+ * on. Handed to `syncPod`/`ingestFiles`, which call it as each file lands.
+ */
+export function podProgressReporter(
+  runtime: DustSessionRuntime,
+  podName: string,
+): (done: number, total: number) => void {
+  const setStatus = (runtime.extensionContext as PiRuntimeContext | null)?.ui?.setStatus;
+  if (!setStatus) return () => {};
+  return (done, total) => {
+    // A single-file sync is over before the eye can read it; showing 1/1 just
+    // makes the footer twitch.
+    if (total > 1) setStatus(STATUS_KEY, podSyncingText(podName, done, total));
+  };
 }
 
 /** Drops the footer entry, for `/ingest clear` and for logout. */

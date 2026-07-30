@@ -146,11 +146,16 @@ describe("pod mode in the Dust stream", () => {
 
     await drain(streamSimple);
 
-    const options = syncPod.mock.calls.map((call) => call[3]);
+    const options = syncPod.mock.calls.map((call) => ({
+      push: call[3]?.push,
+      pull: call[3]?.pull,
+    }));
     expect(options).toEqual([
       { push: true, pull: false },
       { push: false, pull: true },
     ]);
+    // Progress is wired through, or a slow sync would leave the footer stale.
+    expect(syncPod.mock.calls.every((call) => typeof call[3]?.onProgress === "function")).toBe(true);
   });
 
   /**

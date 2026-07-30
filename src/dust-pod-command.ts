@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { basename } from "node:path";
 import { archivePod, type PodApi, resolveOrCreatePod } from "./dust-pod.js";
 import { MAX_INGEST_FILES, selectIngestableFiles } from "./dust-pod-files.js";
-import { clearPodStatus, refreshPodStatus } from "./dust-pod-status.js";
+import { clearPodStatus, podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
 import { describeReport, ingestFiles, isEmptyReport, syncPod } from "./dust-pod-sync.js";
 import { podApiFor } from "./dust-pod-runtime.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
@@ -53,7 +53,9 @@ export function registerDustIngestCommand(pi: ExtensionAPI, runtime: DustSession
           return;
         }
         try {
-          const report = await syncPod(api, root, binding);
+          const report = await syncPod(api, root, binding, {
+            onProgress: podProgressReporter(runtime, binding.name),
+          });
           refreshPodStatus(runtime, root, report);
           notify(isEmptyReport(report) ? "Pod already in sync." : describeReport(report), "info");
           for (const rel of report.conflicted) {
@@ -143,7 +145,13 @@ export function registerDustIngestCommand(pi: ExtensionAPI, runtime: DustSession
         binding.pathspecs = pathspecs.length > 0 ? pathspecs : undefined;
         savePodBinding(root, binding);
 
-        const report = await ingestFiles(api, root, binding, candidates);
+        const report = await ingestFiles(
+          api,
+          root,
+          binding,
+          candidates,
+          podProgressReporter(runtime, pod.name),
+        );
         refreshPodStatus(runtime, root, report);
         notify(
           candidates.length === 0
