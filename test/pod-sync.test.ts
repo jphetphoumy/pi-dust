@@ -233,6 +233,56 @@ describe("pod sync", () => {
     expect(getPodBinding(root)?.seen["main.py"]).toBeDefined();
   });
 
+  it("pushes a local file the pod has never seen, so an empty pod fills up", async () => {
+    // Without this a pod created for an empty directory is a dead end: the
+    // first file the user writes themselves would never reach the agent,
+    // because `seen` has no entry for it and the pod has no entry either.
+    const pod = makeFakePod({});
+    writeLocal("brand-new.py", "print(1)");
+    const bound = binding();
+
+    const report = await syncPod(pod.api, root, bound, { push: true, pull: false });
+
+    expect(report.pushed).toEqual(["brand-new.py"]);
+    expect(pod.files.get("brand-new.py")?.content).toBe("print(1)");
+    expect(bound.seen["brand-new.py"]).toBeDefined();
+  });
+
+  it("re-applies the ingest pathspecs, rather than sweeping up the whole tree", async () => {
+    // `/ingest src` is a deliberate narrowing. Discovering new files must not
+    // quietly widen it to everything the user left out.
+    const pod = makeFakePod({});
+    writeLocal("src/new.py", "x = 1");
+    writeLocal("secret-notes.md", "not for upload");
+    const bound: DustPodBinding = { podId: POD_ID, name: "proj", seen: {}, pathspecs: ["src"] };
+
+    const report = await syncPod(pod.api, root, bound, { push: true, pull: false });
+
+    expect(report.pushed).toEqual(["src/new.py"]);
+    expect(pod.files.has("secret-notes.md")).toBe(false);
+  });
+
+  it("does not discover new local files during a pull-only sync", async () => {
+    const pod = makeFakePod({});
+    writeLocal("brand-new.py", "print(1)");
+
+    const report = await syncPod(pod.api, root, binding(), { push: false, pull: true });
+
+    expect(report.pushed).toEqual([]);
+    expect(pod.uploads).toEqual([]);
+  });
+
+  it("records a discovered file the pod rejects instead of failing the sync", async () => {
+    const pod = makeFakePod({});
+    writeLocal("bad.py", "x");
+    vi.mocked(podApi.uploadPodFile).mockRejectedValue(new Error("HTTP 400 — file_is_empty"));
+
+    const report = await syncPod(pod.api, root, binding(), { push: true, pull: false });
+
+    expect(report.pushed).toEqual([]);
+    expect(report.skipped).toEqual([{ rel: "bad.py", reason: "HTTP 400 — file_is_empty" }]);
+  });
+
   it("adopts the watermark instead of reporting a conflict when both sides hold the same bytes", async () => {
     // A partial ingest leaves files with no watermark at all, which otherwise
     // reads as changed-on-both-sides and jams every file in the project. If the

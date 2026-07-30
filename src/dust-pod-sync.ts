@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
+import { selectIngestableFiles } from "./dust-pod-files.js";
 import {
   downloadPodFile,
   listPodFiles,
@@ -138,15 +139,28 @@ export async function syncPod(
   }
 
   if (push) {
-    // Files we know about that have vanished from the pod listing (or were
-    // never uploaded) get re-pushed, so a local addition inside an ingested
-    // tree reaches the agent without a second /ingest.
+    // Anything the pod does not have but the selection says it should: files we
+    // already track that have vanished from the pod, and files the user has
+    // created locally since the ingest. Re-running the same selection is what
+    // makes a pod created for an empty directory usable — otherwise the first
+    // file the user writes themselves would never reach the agent.
     const podPaths = new Set(entries.map((entry) => toRelativePath(binding.podId, entry.path)));
-    for (const rel of Object.keys(seen)) {
+    const missing = new Set([
+      ...Object.keys(seen),
+      ...selectIngestableFiles(root, binding.pathspecs ?? []),
+    ]);
+
+    for (const rel of missing) {
       if (podPaths.has(rel)) continue;
       const local = readLocal(root, rel);
       if (!local) continue;
-      await uploadPodFile(api, binding.podId, rel, local);
+      try {
+        await uploadPodFile(api, binding.podId, rel, local);
+      } catch (err) {
+        if (err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE) throw err;
+        report.skipped.push({ rel, reason: errorMessage(err) });
+        continue;
+      }
       seen[rel] = { podMs: Number.MAX_SAFE_INTEGER, hash: hashOf(local) };
       report.pushed.push(rel);
     }

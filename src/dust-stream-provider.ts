@@ -10,7 +10,8 @@ import { errorMessage, isRecord, parseConversationCreateResponse, parseConversat
 import { HOST_TOKEN_ASSUMED_TTL_MS, invalidateRuntimeCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import type { ActiveDustTurn, DustSessionRuntime } from "./dust-runtime.js";
 import { podApiFor } from "./dust-pod-runtime.js";
-import { describeReport, isEmptyReport, syncPod } from "./dust-pod-sync.js";
+import { isEmptyReport, syncPod } from "./dust-pod-sync.js";
+import { beginPodStatusTurn, refreshPodStatus } from "./dust-pod-status.js";
 import { getPodBinding } from "./dust-state.js";
 
 const STREAM_REFRESH_SKEW_MS = 30_000;
@@ -132,18 +133,26 @@ async function syncPodQuietly(
     const report = await syncPod(podApiFor(runtime), cwd, binding, options);
     if (!isEmptyReport(report)) {
       debugLog("dust:pod", `Pod sync ${phase}`, report);
-      console.error(`[dust] pod sync ${phase}: ${describeReport(report)}`);
     }
+    // Counts go to the footer rather than the transcript; only the things that
+    // name a file and want the user to act stay as printed lines.
+    refreshPodStatus(runtime, cwd, report);
     for (const rel of report.conflicted) {
       console.error(`[dust] pod conflict, left untouched: ${rel}`);
+    }
+    for (const { rel, reason } of report.skipped) {
+      console.error(`[dust] pod skipped ${rel}: ${reason}`);
     }
   } catch (err) {
     console.error(`[dust] pod sync ${phase} failed: ${errorMessage(err)}`);
   }
 }
 
-const syncPodBeforeTurn = (runtime: DustSessionRuntime, cwd: string) =>
-  syncPodQuietly(runtime, cwd, { push: true, pull: false }, "before turn");
+const syncPodBeforeTurn = (runtime: DustSessionRuntime, cwd: string) => {
+  // The footer reports per turn, so the running totals start over here.
+  beginPodStatusTurn();
+  return syncPodQuietly(runtime, cwd, { push: true, pull: false }, "before turn");
+};
 
 const syncPodAfterTurn = (runtime: DustSessionRuntime, cwd: string) =>
   syncPodQuietly(runtime, cwd, { push: false, pull: true }, "after turn");

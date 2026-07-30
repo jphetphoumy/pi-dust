@@ -4,6 +4,7 @@ import { describeConversation, resolveAttachment, verifyConversation } from "./d
 import type { ConversationAttachment } from "./dust-conversation.js";
 import { debugLog } from "./dust-debug.js";
 import { refreshApprovalStatus } from "./dust-approval.js";
+import { refreshPodStatus } from "./dust-pod-status.js";
 import { applyRuntimeContext, HOST_TOKEN_ASSUMED_TTL_MS, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
 import {
   clearInvalidated,
@@ -279,6 +280,10 @@ export function registerDustSessionEvents(
     // pointed at a thread its first message never reached.
     applyRuntimeContext(runtime, ctx);
     refreshApprovalStatus(runtime, ctx);
+    // Show the pod in the footer straight away. Syncs refresh it, but the first
+    // one is a turn away, and a session resumed in an ingested project should
+    // say so before the user types anything.
+    refreshPodStatus(runtime, (ctx as { cwd?: string }).cwd ?? process.cwd());
     const attached = attachConversation(runtime, ctx, event);
 
     if (cred.access && shouldRefreshAccessToken(cred.expires, SESSION_START_REFRESH_SKEW_MS)) {

@@ -46,6 +46,13 @@ export interface DustPodBinding {
   podId: string;
   name: string;
   seen: Record<string, { podMs: number; hash: string }>;
+  /**
+   * The pathspecs `/ingest` was given, replayed by the pre-turn push so files
+   * created since are picked up. Without them the push would either miss new
+   * files or, if it re-selected the whole tree, sweep up everything the user
+   * deliberately left out. Absent means the whole directory.
+   */
+  pathspecs?: string[];
 }
 
 const STATE_KEYS = [

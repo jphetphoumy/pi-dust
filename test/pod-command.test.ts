@@ -288,14 +288,80 @@ describe("/ingest command", () => {
     expect(confirmCalls[0][1]).toContain("main.py");
   });
 
-  it("warns rather than creating a pod when the directory holds nothing ingestable", async () => {
-    write(".env", "TOKEN=1");
-    write("node_modules/x/index.js", "1");
+  it("binds an empty directory to a pod, so a new project uses the free tools", async () => {
+    // Refusing here was the bug: with no binding, pod mode never engages and
+    // every file the agent creates goes through our billed write tool —
+    // precisely the case where the free tools save the most.
+    const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod")
+      .mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    const ingest = vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
 
     await handler("", ctx());
 
-    expect(messages()[0]).toContain("No files to ingest");
+    expect(confirmCalls[0][0]).toContain("Create empty Dust pod");
+    expect(resolveOrCreate).toHaveBeenCalled();
+    expect(ingest.mock.calls[0][3]).toEqual([]);
+    expect(getPodBinding(root)).toMatchObject({ podId: "vlt_1", name: "proj" });
+    expect(messages()[0]).toContain("Created empty pod");
+  });
+
+  it("binds a directory holding only skipped files", async () => {
+    write(".env", "TOKEN=1");
+    write("node_modules/x/index.js", "1");
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(getPodBinding(root)).not.toBeNull();
+  });
+
+  it("creates no pod when the user declines the empty-pod confirmation", async () => {
+    confirmAnswer = false;
+    const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod");
+
+    await handler("", ctx());
+
+    expect(resolveOrCreate).not.toHaveBeenCalled();
     expect(getPodBinding(root)).toBeNull();
+  });
+
+  it("still refuses a pathspec that matches nothing", async () => {
+    // Different from an empty directory: the user named something specific, so
+    // silently binding the whole directory is not what they asked for.
+    write("main.py", "print(1)");
+    const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod");
+
+    await handler("does-not-exist", ctx());
+
+    expect(messages()[0]).toContain("No files matched");
+    expect(resolveOrCreate).not.toHaveBeenCalled();
+    expect(getPodBinding(root)).toBeNull();
+  });
+
+  it("records the pathspecs, so later pushes re-apply the same selection", async () => {
+    write("src/util.py", "x = 1");
+    write("other.py", "y = 2");
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("src", ctx());
+
+    expect(getPodBinding(root)?.pathspecs).toEqual(["src"]);
+  });
+
+  it("records no pathspecs for a whole-directory ingest", async () => {
+    write("main.py", "print(1)");
+    vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
+    vi.spyOn(podSync, "ingestFiles")
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+
+    await handler("", ctx());
+
+    expect(getPodBinding(root)?.pathspecs).toBeUndefined();
   });
 
   it("warns instead of uploading when a pathspec matches nothing", async () => {
