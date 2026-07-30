@@ -6,6 +6,8 @@ import {
   discoverLocalSkills,
   type LocalSkill,
   MAX_SKILL_FILES,
+  podSkillPathsFor,
+  removeSkillsFromPod,
   syncSkillsToPod,
 } from "./dust-pod-skills.js";
 import { openListPanel } from "./dust-pod-ui.js";
@@ -95,7 +97,28 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
         return;
       }
 
+      // `skills/` is a plausible project directory, so a skill whose name
+      // collides with one the user already tracks there would have its files
+      // overwritten by ours — and then excluded from syncing back down.
+      const tracked = Object.keys(binding.seen);
+      const collisions = chosen
+        .map((skill) => skill.name)
+        .filter((name) => tracked.some((rel) => rel.startsWith(podSkillPathsFor(name))));
+      if (collisions.length > 0) {
+        notify(
+          `Your project already has files under skills/${collisions[0]}/. ` +
+            "Syncing that skill would overwrite them — rename one of the two.",
+          "warning",
+        );
+        return;
+      }
+
       try {
+        // De-selected skills are deleted, not merely dropped from the listing,
+        // or their files would sit in the pod for good.
+        const dropped = (binding.skills ?? []).filter((name) => !chosenNames.has(name));
+        const removed = await removeSkillsFromPod(api, binding.podId, dropped);
+
         const result = await syncSkillsToPod(
           api,
           binding.podId,
@@ -110,10 +133,13 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
         savePodBinding(root, binding);
         refreshPodStatus(runtime, root);
 
+        const removedNote = removed.length > 0
+          ? ` Removed ${removed.length} file${removed.length === 1 ? "" : "s"} from ${dropped.length} de-selected.`
+          : "";
         notify(
-          chosen.length === 0
+          (chosen.length === 0
             ? "No skills synced. The pod's agent will be offered none."
-            : `Synced ${chosen.length} skill${chosen.length === 1 ? "" : "s"} (${result.uploaded.length} files) into "${binding.name}".`,
+            : `Synced ${chosen.length} skill${chosen.length === 1 ? "" : "s"} (${result.uploaded.length} files) into "${binding.name}".`) + removedNote,
           "info",
         );
         for (const { rel, reason } of result.skipped) {

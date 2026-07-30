@@ -60,12 +60,15 @@ export function describeReport(report: SyncReport): string {
  * Files the extension put in the pod for the agent, not the user's content.
  *
  * These must never be pulled onto disk: AGENTS.md is a rendering of the system
- * prompt and .pi-skills/ is a copy of the user's skills directory, so writing
- * either into the project would litter it with tooling that then looks like
- * something they wrote.
+ * prompt and `skills/<name>/` holds copies of the user's own skill files, so
+ * writing either into the project would litter it with tooling that then looks
+ * like something they wrote.
+ *
+ * Matched against the synced set rather than the bare `skills/` prefix, so a
+ * project that genuinely has a `skills/` directory still syncs it.
  */
-export function isPodOwnedPath(rel: string): boolean {
-  return rel === POD_AGENTS_MD || isPodSkillPath(rel);
+export function isPodOwnedPath(rel: string, binding: DustPodBinding): boolean {
+  return rel === POD_AGENTS_MD || isPodSkillPath(rel, binding.skills ?? []);
 }
 
 function hashOf(content: Buffer | string): string {
@@ -123,7 +126,7 @@ export async function syncPod(
     step();
     const rel = toRelativePath(binding.podId, entry.path);
     // Ours, not theirs: neither pulled down nor treated as a conflict.
-    if (isPodOwnedPath(rel)) continue;
+    if (isPodOwnedPath(rel, binding)) continue;
     const watermark = seen[rel];
     const local = readLocal(root, rel);
     const localHash = local ? hashOf(local) : null;

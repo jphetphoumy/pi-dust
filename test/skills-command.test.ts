@@ -63,6 +63,7 @@ describe("/dust-skills", () => {
       return panelResult;
     });
     vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({ uploaded: ["a"], skipped: [] });
+    vi.spyOn(podSkills, "removeSkillsFromPod").mockResolvedValue([]);
     // Real discovery, but confined to this suite's throwaway agent dir. The
     // default search includes ~/.agents/skills, so without this the assertions
     // would depend on whichever skills the developer happens to have installed.
@@ -172,6 +173,63 @@ describe("/dust-skills", () => {
 
     expect(messages()[0]).toContain(`over the ${podSkills.MAX_SKILL_FILES} limit`);
     expect(podSkills.syncSkillsToPod).not.toHaveBeenCalled();
+  });
+
+  it("deletes a de-selected skill's files rather than orphaning them in the pod", async () => {
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["old", "keep"] });
+    writeSkill("keep");
+    panelResult = [{ label: "keep", value: "keep", selected: true }];
+    vi.mocked(podSkills.removeSkillsFromPod).mockResolvedValue(["skills/old/SKILL.md"]);
+
+    await handler("", ctx());
+
+    expect(podSkills.removeSkillsFromPod).toHaveBeenCalledWith(expect.anything(), "vlt_1", ["old"]);
+    expect(messages()[0]).toContain("Removed 1 file");
+  });
+
+  it("removes nothing when the selection only grows", async () => {
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["keep"] });
+    writeSkill("keep");
+    writeSkill("extra");
+    panelResult = [
+      { label: "keep", value: "keep", selected: true },
+      { label: "extra", value: "extra", selected: true },
+    ];
+
+    await handler("", ctx());
+
+    expect(podSkills.removeSkillsFromPod).toHaveBeenCalledWith(expect.anything(), "vlt_1", []);
+  });
+
+  it("refuses a skill whose name collides with the project's own skills/ directory", async () => {
+    // `skills/` is no longer ours alone, so syncing over the user's files there
+    // would overwrite them and then exclude them from syncing back down.
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: { "skills/herdr/notes.md": { podMs: 1, hash: "h" } },
+    });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    expect(messages()[0]).toContain("already has files under skills/herdr/");
+    expect(podSkills.syncSkillsToPod).not.toHaveBeenCalled();
+  });
+
+  it("allows a skill when the project's skills/ holds unrelated files", async () => {
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: { "skills/something-else/notes.md": { podMs: 1, hash: "h" } },
+    });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
   });
 
   it("says so when there are no skills to offer", async () => {

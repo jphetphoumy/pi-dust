@@ -10,6 +10,7 @@ import {
   type LocalSkill,
   POD_SKILLS_PREFIX,
   podSkillPath,
+  removeSkillsFromPod,
   skillSearchDirs,
   stripSkillsListing,
   syncSkillsToPod,
@@ -50,8 +51,8 @@ function skill(name: string, files: string[], bytes = 100): LocalSkill {
   return {
     name,
     description: `does ${name}`,
-    baseDir: `/skills/${name}`,
-    filePath: `/skills/${name}/SKILL.md`,
+    baseDir: `/home/u/.agents/skills/${name}`,
+    filePath: `/home/u/.agents/skills/${name}/SKILL.md`,
     files,
     bytes,
   };
@@ -233,7 +234,7 @@ describe("pod skills", () => {
 
       expect(listing).toContain("<name>herdr</name>");
       expect(listing).toContain(`/files/pod-vlt_1/${POD_SKILLS_PREFIX}/herdr/SKILL.md`);
-      expect(listing).not.toContain("/skills/herdr/SKILL.md");
+      expect(listing).not.toContain("/home/u/.agents/skills/herdr/SKILL.md");
     });
 
     it("produces nothing when no skills are synced", () => {
@@ -269,24 +270,75 @@ describe("pod skills", () => {
   });
 
   describe("path ownership", () => {
+    const bound = (skills: string[]) => ({ podId: "vlt_1", name: "proj", seen: {}, skills });
+
     it("builds pod paths under the skills prefix", () => {
-      expect(podSkillPath("herdr", "SKILL.md")).toBe(`${POD_SKILLS_PREFIX}/herdr/SKILL.md`);
+      expect(podSkillPath("herdr", "SKILL.md")).toBe("skills/herdr/SKILL.md");
     });
 
-    it("recognises its own paths, and nothing else", () => {
-      expect(isPodSkillPath(`${POD_SKILLS_PREFIX}/herdr/SKILL.md`)).toBe(true);
-      expect(isPodSkillPath(POD_SKILLS_PREFIX)).toBe(true);
-      expect(isPodSkillPath("src/main.py")).toBe(false);
-      // Guards against a project file that merely starts with the same letters.
-      expect(isPodSkillPath(`${POD_SKILLS_PREFIX}-notes.md`)).toBe(false);
+    it("claims only the skills it actually synced", () => {
+      expect(isPodSkillPath("skills/herdr/SKILL.md", ["herdr"])).toBe(true);
+      expect(isPodSkillPath("skills/herdr/refs/a.md", ["herdr"])).toBe(true);
+      expect(isPodSkillPath("src/main.py", ["herdr"])).toBe(false);
+    });
+
+    it("leaves a project's own skills/ directory alone", () => {
+      // The prefix is no longer ours alone, so a project that genuinely keeps
+      // files under skills/ has to keep syncing them normally.
+      expect(isPodSkillPath("skills/my-own-thing/notes.md", ["herdr"])).toBe(false);
+      expect(isPodSkillPath("skills/README.md", ["herdr"])).toBe(false);
+      expect(isPodSkillPath("skills/herdr-notes.md", ["herdr"])).toBe(false);
+    });
+
+    it("claims nothing when no skills are synced", () => {
+      expect(isPodSkillPath("skills/herdr/SKILL.md", [])).toBe(false);
     });
 
     it("keeps the extension's own pod files out of the pull direction", () => {
-      // Otherwise AGENTS.md and a copy of the user's skills tree would be
+      // Otherwise AGENTS.md and copies of the user's skill files would be
       // written into their project as if they had authored them.
-      expect(isPodOwnedPath("AGENTS.md")).toBe(true);
-      expect(isPodOwnedPath(`${POD_SKILLS_PREFIX}/herdr/SKILL.md`)).toBe(true);
-      expect(isPodOwnedPath("src/main.py")).toBe(false);
+      expect(isPodOwnedPath("AGENTS.md", bound([]))).toBe(true);
+      expect(isPodOwnedPath("skills/herdr/SKILL.md", bound(["herdr"]))).toBe(true);
+      expect(isPodOwnedPath("src/main.py", bound(["herdr"]))).toBe(false);
+      expect(isPodOwnedPath("skills/theirs/x.md", bound(["herdr"]))).toBe(false);
+    });
+  });
+
+  describe("removal", () => {
+    it("deletes every file of a de-selected skill", async () => {
+      // Dropping it from the listing alone would leave the copy in the pod for
+      // good — which went unnoticed while the prefix was hidden from Dust's UI.
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        { path: "pod-vlt_1/skills/gone/SKILL.md", fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+        { path: "pod-vlt_1/skills/gone/refs/a.md", fileName: "a.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+        { path: "pod-vlt_1/skills/kept/SKILL.md", fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+        { path: "pod-vlt_1/src/main.py", fileName: "main.py", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+      ]);
+      const del = vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+
+      const removed = await removeSkillsFromPod(api, "vlt_1", ["gone"]);
+
+      expect(removed).toEqual(["skills/gone/SKILL.md", "skills/gone/refs/a.md"]);
+      expect(del).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not list the pod when nothing was de-selected", async () => {
+      const list = vi.spyOn(podApi, "listPodFiles");
+
+      expect(await removeSkillsFromPod(api, "vlt_1", [])).toEqual([]);
+      expect(list).not.toHaveBeenCalled();
+    });
+
+    it("keeps going when one delete fails", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        { path: "pod-vlt_1/skills/gone/a.md", fileName: "a.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+        { path: "pod-vlt_1/skills/gone/b.md", fileName: "b.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+      ]);
+      vi.spyOn(podApi, "deletePodFile").mockImplementation(async (_a, _p, rel) => {
+        if (rel.endsWith("a.md")) throw new Error("HTTP 500");
+      });
+
+      expect(await removeSkillsFromPod(api, "vlt_1", ["gone"])).toEqual(["skills/gone/b.md"]);
     });
   });
 });

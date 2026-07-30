@@ -4,24 +4,48 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { debugLog } from "./dust-debug.js";
-import { type PodApi, uploadPodFile } from "./dust-pod.js";
+import {
+  deletePodFile,
+  listPodFiles,
+  type PodApi,
+  toRelativePath,
+  uploadPodFile,
+} from "./dust-pod.js";
 import type { SyncProgress } from "./dust-pod-sync.js";
 import { resolveAgentDir } from "./dust-state.js";
 
 /**
  * Where a synced skill lives inside the pod.
  *
- * Dotted so it reads as tooling rather than project content, and so it is
- * skipped by the ingest walk (which ignores hidden entries) if it ever ends up
- * on disk. The pull direction excludes it outright — see `isPodSkillPath`.
+ * Undotted, so it shows up in the Dust UI and in `/podfs` and can be inspected
+ * and cleaned up by hand — Dust hides the contents of any `.`-prefixed
+ * directory from its listings, which made an earlier `.pi-skills` invisible.
+ *
+ * The cost is that `skills` is a plausible project directory too, so ownership
+ * cannot be a prefix match: see `podSkillPathsFor`.
  */
-export const POD_SKILLS_PREFIX = ".pi-skills";
+export const POD_SKILLS_PREFIX = "skills";
 
 /** Guards against a `/dust-skills` selection that would take minutes to upload. */
 export const MAX_SKILL_FILES = 120;
 
-export function isPodSkillPath(rel: string): boolean {
-  return rel === POD_SKILLS_PREFIX || rel.startsWith(`${POD_SKILLS_PREFIX}/`);
+/**
+ * True when `rel` is a copy of one of `syncedSkills`, rather than a project
+ * file that merely lives under `skills/`.
+ *
+ * The distinction matters because the prefix is no longer ours alone. A project
+ * with its own `skills/` directory must keep syncing normally; only the exact
+ * `skills/<name>/…` subtrees we uploaded are excluded from the pull direction.
+ */
+export function isPodSkillPath(rel: string, syncedSkills: string[]): boolean {
+  return syncedSkills.some(
+    (name) => rel.startsWith(`${POD_SKILLS_PREFIX}/${name}/`),
+  );
+}
+
+/** Everything in the pod belonging to a given synced skill. */
+export function podSkillPathsFor(name: string): string {
+  return `${POD_SKILLS_PREFIX}/${name}/`;
 }
 
 export interface LocalSkill {
@@ -170,6 +194,38 @@ export async function syncSkillsToPod(
   }
 
   return { uploaded, skipped };
+}
+
+/**
+ * Removes a skill's files from the pod.
+ *
+ * De-selecting a skill has to delete it, not just stop listing it. The copy
+ * would otherwise sit in the pod indefinitely — this was invisible while the
+ * prefix was dotted, which is exactly how it went unnoticed.
+ */
+export async function removeSkillsFromPod(
+  api: PodApi,
+  podId: string,
+  names: string[],
+): Promise<string[]> {
+  if (names.length === 0) return [];
+
+  const removed: string[] = [];
+  const entries = await listPodFiles(api, podId);
+  for (const entry of entries) {
+    const rel = toRelativePath(podId, entry.path);
+    if (!names.some((name) => rel.startsWith(podSkillPathsFor(name)))) continue;
+    try {
+      await deletePodFile(api, podId, rel);
+      removed.push(rel);
+    } catch (err) {
+      debugLog("dust:pod", "Could not remove a de-selected skill file", {
+        rel,
+        error: String(err),
+      });
+    }
+  }
+  return removed;
 }
 
 /**
