@@ -1,5 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { OAuthCredentials } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessageEvent as PiAiAssistantMessageEvent,
+  OAuthCredentials,
+  TextContent as PiAiTextContent,
+  ThinkingContent as PiAiThinkingContent,
+} from "@earendil-works/pi-ai";
 
 export type Workspace = { sId: string; name: string; role: string };
 export type DustAgent = { sId: string; name: string; description: string };
@@ -178,9 +183,47 @@ export interface McpRequestLike {
   params?: JsonObject;
 }
 
+/** pi's `TextContent`: the answer the user reads. */
+export interface PiTextBlock {
+  type: "text";
+  text: string;
+  /**
+   * pi's `TextContent` carries this for providers that sign their output;
+   * Dust gives us no signature, so it is always absent here. Optional for
+   * the same reason as `PiThinkingBlock.thinkingSignature`.
+   */
+  textSignature?: string;
+}
+
+/**
+ * pi's `ThinkingContent`: the agent's reasoning trace. pi renders these blocks
+ * dimmed and italic (or collapsed behind a label, per the user's setting), and
+ * keeps them out of the answer — which is why the Dust `chain_of_thought`
+ * stream lands here rather than being concatenated into a text block.
+ */
+export interface PiThinkingBlock {
+  type: "thinking";
+  thinking: string;
+  /**
+   * pi's `ThinkingContent` carries this for providers that return signed
+   * reasoning; Dust gives us no signature, so it is always absent here.
+   * Declared optional rather than omitted so a block pi persists and later
+   * replays into a signature-checking provider isn't rejected for a field
+   * that was simply never populated.
+   */
+  thinkingSignature?: string;
+}
+
+export type PiContentBlock = PiTextBlock | PiThinkingBlock;
+
 export interface AssistantMessageLike {
   role: "assistant";
-  content: Array<{ type: "text"; text: string }>;
+  /**
+   * Thinking blocks are never part of the answer — consumers must filter on
+   * `type === "text"` (see `extractMessageText` in dust-stream-provider.ts).
+   * Reading `content` itself as the answer pulls the reasoning trace in.
+   */
+  content: PiContentBlock[];
   api: string;
   provider: string;
   model: string;
@@ -203,10 +246,61 @@ export interface AssistantMessageLike {
   timestamp: number;
 }
 
+/**
+ * Opens the streaming message. pi's agent loop drops every partial update until
+ * it has seen this event (it has no message to apply them to), so a stream that
+ * never emits it only renders once, at `done`.
+ */
+export interface PiStartEvent {
+  type: "start";
+  partial: AssistantMessageLike;
+}
+
+export interface PiTextStartEvent {
+  type: "text_start";
+  contentIndex: number;
+  partial: AssistantMessageLike;
+}
+
 export interface PiTextDeltaEvent {
   type: "text_delta";
   contentIndex: number;
   delta: string;
+  partial: AssistantMessageLike;
+}
+
+/**
+ * Closes a `text` block. Emitting a matching end event for every opened
+ * block is what pi-ai's own `AssistantMessageEvent` streams (`start`, then
+ * partial updates) all do — see the `_PiStreamEventShapeChecks` block below,
+ * which checks this and every other event here against pi-ai's real types
+ * at compile time rather than by hand.
+ */
+export interface PiTextEndEvent {
+  type: "text_end";
+  contentIndex: number;
+  content: string;
+  partial: AssistantMessageLike;
+}
+
+export interface PiThinkingStartEvent {
+  type: "thinking_start";
+  contentIndex: number;
+  partial: AssistantMessageLike;
+}
+
+export interface PiThinkingDeltaEvent {
+  type: "thinking_delta";
+  contentIndex: number;
+  delta: string;
+  partial: AssistantMessageLike;
+}
+
+/** Closes a `thinking` block — the `thinking_end` counterpart of `PiTextEndEvent`; see its doc comment for how the shape was verified. */
+export interface PiThinkingEndEvent {
+  type: "thinking_end";
+  contentIndex: number;
+  content: string;
   partial: AssistantMessageLike;
 }
 
@@ -223,7 +317,50 @@ export interface PiErrorEvent {
   error: AssistantMessageLike;
 }
 
-export type PiStreamEvent = PiTextDeltaEvent | PiDoneEvent | PiErrorEvent;
+export type PiStreamEvent =
+  | PiStartEvent
+  | PiTextStartEvent
+  | PiTextDeltaEvent
+  | PiTextEndEvent
+  | PiThinkingStartEvent
+  | PiThinkingDeltaEvent
+  | PiThinkingEndEvent
+  | PiDoneEvent
+  | PiErrorEvent;
+
+/**
+ * Compile-time check, not hand-verification: `@earendil-works/pi-ai` is a
+ * direct dependency (package.json) whose `dist/index.d.ts` re-exports
+ * `types.ts`, so its real `AssistantMessageEvent`/`TextContent`/
+ * `ThinkingContent` types are importable and checkable here, not just
+ * readable. A pi-ai upgrade that renames a field or drops a variant these
+ * types rely on fails `make typecheck` at the assignment below instead of
+ * drifting unnoticed.
+ *
+ * `AssistantMessageLike` is intentionally looser than pi-ai's real
+ * `AssistantMessage` (`stopReason` etc. are plain `string`, not pi's
+ * `StopReason` union — this file predates depending on pi-ai's message
+ * shape directly), so checking whole `PiStreamEvent` members against whole
+ * `AssistantMessageEvent` members fails on that unrelated looseness. Each
+ * event is checked instead with its message-carrying field (`partial` /
+ * `message` / `error`) omitted, which is the part this file actually
+ * hand-models.
+ */
+type OmitMessageField<T> = Omit<T, "partial" | "message" | "error">;
+type PiAiEventVariant<Type extends PiAiAssistantMessageEvent["type"]> = Extract<PiAiAssistantMessageEvent, { type: Type }>;
+type AssertAssignable<T extends U, U> = T;
+type _PiStreamEventShapeChecks = [
+  AssertAssignable<PiContentBlock, PiAiTextContent | PiAiThinkingContent>,
+  AssertAssignable<OmitMessageField<PiStartEvent>, OmitMessageField<PiAiEventVariant<"start">>>,
+  AssertAssignable<OmitMessageField<PiTextStartEvent>, OmitMessageField<PiAiEventVariant<"text_start">>>,
+  AssertAssignable<OmitMessageField<PiTextDeltaEvent>, OmitMessageField<PiAiEventVariant<"text_delta">>>,
+  AssertAssignable<OmitMessageField<PiTextEndEvent>, OmitMessageField<PiAiEventVariant<"text_end">>>,
+  AssertAssignable<OmitMessageField<PiThinkingStartEvent>, OmitMessageField<PiAiEventVariant<"thinking_start">>>,
+  AssertAssignable<OmitMessageField<PiThinkingDeltaEvent>, OmitMessageField<PiAiEventVariant<"thinking_delta">>>,
+  AssertAssignable<OmitMessageField<PiThinkingEndEvent>, OmitMessageField<PiAiEventVariant<"thinking_end">>>,
+  AssertAssignable<OmitMessageField<PiDoneEvent>, OmitMessageField<PiAiEventVariant<"done">>>,
+  AssertAssignable<OmitMessageField<PiErrorEvent>, OmitMessageField<PiAiEventVariant<"error">>>,
+];
 
 export interface PiEventStream {
   push(event: PiStreamEvent): void;
