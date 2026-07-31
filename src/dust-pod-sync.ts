@@ -5,7 +5,7 @@ import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import { POD_AGENTS_MD } from "./dust-pod-agents-md.js";
 import { selectIngestableFiles } from "./dust-pod-files.js";
-import { isPodSkillPath } from "./dust-pod-skills.js";
+import { fingerprintSkill, isPodSkillPath } from "./dust-pod-skills.js";
 import {
   downloadPodFile,
   listPodFiles,
@@ -25,6 +25,8 @@ export interface SyncReport {
   conflicted: string[];
   /** Files the pod would not accept, with the reason. */
   skipped: Array<{ rel: string; reason: string }>;
+  /** Skills the agent authored in the pod, installed into the project. */
+  adopted: string[];
 }
 
 /** Called as each file finishes, for a progress indicator. */
@@ -37,23 +39,101 @@ export interface SyncOptions {
 }
 
 export function emptyReport(): SyncReport {
-  return { pulled: [], pushed: [], conflicted: [], skipped: [] };
+  return { pulled: [], pushed: [], conflicted: [], skipped: [], adopted: [] };
 }
 
 export function isEmptyReport(report: SyncReport): boolean {
   return report.pulled.length === 0
     && report.pushed.length === 0
     && report.conflicted.length === 0
-    && report.skipped.length === 0;
+    && report.skipped.length === 0
+    && report.adopted.length === 0;
 }
 
 export function describeReport(report: SyncReport): string {
   const parts: string[] = [];
   if (report.pushed.length > 0) parts.push(`↑ ${report.pushed.length} pushed`);
   if (report.pulled.length > 0) parts.push(`↓ ${report.pulled.length} pulled`);
+  if (report.adopted.length > 0) parts.push(`+ ${report.adopted.length} skill adopted`);
   if (report.conflicted.length > 0) parts.push(`⚠ ${report.conflicted.length} conflicted`);
   if (report.skipped.length > 0) parts.push(`− ${report.skipped.length} skipped`);
   return parts.join(", ");
+}
+
+/**
+ * Skills the agent wrote into the pod that this project should take on.
+ *
+ * The pod's `skills/` prefix is where `/dust-skills` puts our copies, so a
+ * subtree there that we did not upload is one the agent authored. Pulled as an
+ * ordinary file it would land at `<root>/skills/<name>/`, which pi does not
+ * scan — the skill would sit on disk inert, and leave a stray `skills/`
+ * directory in the project root.
+ *
+ * The guards matter because `skills/` is a plausible project directory too:
+ *
+ *  - it must carry a `SKILL.md`, or it is just files that happen to live there;
+ *  - nothing in it may be tracked in `seen`, which would make it the user's own
+ *    content that we ingested;
+ *  - nothing in it may already exist locally, for the same reason.
+ *
+ * Getting this wrong would divert a user's source tree into their config
+ * directory, so the bar for claiming a subtree is deliberately high.
+ */
+export function detectAdoptableSkills(
+  rels: readonly string[],
+  binding: DustPodBinding,
+  root: string,
+): Map<string, string[]> {
+  const already = new Set(binding.skills ?? []);
+  const grouped = new Map<string, string[]>();
+
+  for (const rel of rels) {
+    const match = /^skills\/([^/]+)\/(.+)$/.exec(rel);
+    if (!match) continue;
+    const [, name] = match;
+    if (already.has(name as string)) continue;
+    const group = grouped.get(name as string) ?? [];
+    group.push(rel);
+    grouped.set(name as string, group);
+  }
+
+  for (const [name, group] of [...grouped]) {
+    const isSkill = group.includes(`skills/${name}/SKILL.md`);
+    const untouched = group.every((rel) => !binding.seen[rel] && !existsSync(join(root, rel)));
+    if (!isSkill || !untouched) grouped.delete(name);
+  }
+
+  return grouped;
+}
+
+/**
+ * Where an adopted skill's file goes: the *project's* skill directory.
+ *
+ * `.pi/skills/` under the project root, never `~/.pi/agent/skills`. The skill
+ * came out of one pod and belongs to the project bound to it — installing it
+ * globally would leak it into every other project on the machine.
+ */
+export function adoptedSkillPath(rel: string): string {
+  return join(".pi", rel);
+}
+
+/**
+ * Fingerprints an adopted skill from the files just written.
+ *
+ * Recorded like any other synced skill, so the `[DustSkills]` section can say
+ * `synced` for it — and report `stale` once the user edits it locally, which is
+ * the normal next step after the agent hands one over.
+ */
+function fingerprintAdopted(root: string, name: string, rels: readonly string[]): string {
+  const prefix = `skills/${name}/`;
+  return fingerprintSkill({
+    name,
+    description: "",
+    baseDir: join(root, ".pi", "skills", name),
+    filePath: join(root, ".pi", "skills", name, "SKILL.md"),
+    files: rels.map((rel) => rel.slice(prefix.length)).sort(),
+    bytes: 0,
+  });
 }
 
 /**
@@ -254,11 +334,28 @@ export async function syncPod(
   let done = 0;
   const step = (): void => options.onProgress?.(++done, total);
 
+  // Skills the agent wrote for itself. Only on a pull: a push has no business
+  // writing into the project's config directory, and the post-turn pull is
+  // where the agent's own output arrives anyway.
+  const adoptable = pull
+    ? detectAdoptableSkills(entries.map((entry) => toRelativePath(binding.podId, entry.path)), binding, root)
+    : new Map<string, string[]>();
+  const adoptedPaths = new Set([...adoptable.values()].flat());
+
   for (const entry of entries) {
     step();
     const rel = toRelativePath(binding.podId, entry.path);
     // Ours, not theirs: neither pulled down nor treated as a conflict.
     if (isPodOwnedPath(rel, binding)) continue;
+
+    // An adopted skill goes to `.pi/skills/…` rather than its literal pod path,
+    // which is the whole point — `<root>/skills/` is not somewhere pi looks.
+    if (adoptedPaths.has(rel)) {
+      const content = await downloadPodFile(api, binding.podId, rel);
+      writeLocal(root, adoptedSkillPath(rel), content);
+      seen[rel] = { podMs: entry.lastModifiedMs, hash: hashOf(content) };
+      continue;
+    }
     const watermark = seen[rel];
     const local = readLocal(root, rel);
     const localHash = local ? hashOf(local) : null;
@@ -303,6 +400,22 @@ export async function syncPod(
       seen[rel] = { podMs: Number.MAX_SAFE_INTEGER, hash: hashOf(local) };
       report.pushed.push(rel);
     }
+  }
+
+  if (adoptable.size > 0) {
+    // Registering them is what makes the adoption complete. Without it pi would
+    // discover the skill on disk while AGENTS.md kept omitting it — the agent
+    // would have written a skill it cannot see — and the next sync would treat
+    // the pod's copy as an untracked file all over again.
+    const names = [...adoptable.keys()].sort();
+    binding.skills = [...(binding.skills ?? []), ...names].sort();
+    binding.skillFingerprints = {
+      ...binding.skillFingerprints,
+      ...Object.fromEntries(names.map((name) => [name, fingerprintAdopted(root, name, adoptable.get(name) ?? [])])),
+    };
+    // The instructions list the synced skills, so they are now out of date.
+    binding.agentsMdHash = undefined;
+    report.adopted.push(...names);
   }
 
   if (push) {

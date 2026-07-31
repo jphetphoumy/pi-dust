@@ -93,7 +93,7 @@ describe("/ingest command", () => {
     const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod")
       .mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: ["main.py", "src/util.py"], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: ["main.py", "src/util.py"], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -111,7 +111,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("src", ctx());
 
@@ -126,7 +126,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -141,7 +141,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -156,7 +156,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -170,7 +170,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -185,7 +185,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -198,7 +198,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -221,7 +221,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler(spec, ctx());
 
@@ -236,7 +236,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -252,6 +252,7 @@ describe("/ingest command", () => {
       pulled: [],
       conflicted: [],
       skipped: [{ rel: "odd.bin", reason: "HTTP 400" }],
+      adopted: [],
     });
 
     await handler("", ctx());
@@ -266,7 +267,7 @@ describe("/ingest command", () => {
 
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -306,7 +307,7 @@ describe("/ingest command", () => {
     const resolveOrCreate = vi.spyOn(podApi, "resolveOrCreatePod")
       .mockResolvedValue({ sId: "vlt_1", name: "proj" });
     const ingest = vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -322,7 +323,7 @@ describe("/ingest command", () => {
     write("node_modules/x/index.js", "1");
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -357,7 +358,7 @@ describe("/ingest command", () => {
     write("other.py", "y = 2");
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("src", ctx());
 
@@ -368,7 +369,7 @@ describe("/ingest command", () => {
     write("main.py", "print(1)");
     vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
     vi.spyOn(podSync, "ingestFiles")
-      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+      .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
     await handler("", ctx());
 
@@ -408,7 +409,7 @@ describe("/ingest command", () => {
   it("reconciles both directions on /ingest sync and surfaces conflicts", async () => {
     savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
     vi.spyOn(podSync, "syncPod")
-      .mockResolvedValue({ pushed: ["a.py"], pulled: ["b.py"], conflicted: ["c.py"], skipped: [] });
+      .mockResolvedValue({ pushed: ["a.py"], pulled: ["b.py"], conflicted: ["c.py"], skipped: [], adopted: [] });
 
     await handler("sync", ctx());
 
@@ -478,7 +479,7 @@ describe("/ingest command", () => {
       pickerResult = [{ label: "main.py", value: "main.py", selected: true }];
       vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
       vi.spyOn(podSync, "ingestFiles")
-        .mockResolvedValue({ pushed: ["main.py"], pulled: [], conflicted: [], skipped: [] });
+        .mockResolvedValue({ pushed: ["main.py"], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
       await handler("", ctx());
 
@@ -493,7 +494,7 @@ describe("/ingest command", () => {
       pickerResult = [{ label: "src/util.py", value: "src/util.py", selected: true }];
       vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
       const ingest = vi.spyOn(podSync, "ingestFiles")
-        .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [], skipped: [] });
+        .mockResolvedValue({ pushed: ["src/util.py"], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
       await handler("", ctx());
 
@@ -519,7 +520,7 @@ describe("/ingest command", () => {
       pickerResult = [];
       vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
       vi.spyOn(podSync, "ingestFiles")
-        .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+        .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
       await handler("", ctx());
 
@@ -530,7 +531,7 @@ describe("/ingest command", () => {
       // There is nothing to choose between, so a list would be an empty box.
       vi.spyOn(podApi, "resolveOrCreatePod").mockResolvedValue({ sId: "vlt_1", name: "proj" });
       vi.spyOn(podSync, "ingestFiles")
-        .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+        .mockResolvedValue({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
 
       await handler("", ctx());
 

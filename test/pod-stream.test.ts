@@ -29,7 +29,7 @@ describe("pod mode in the Dust stream", () => {
   let agentsMdContent: string | null;
 
   beforeEach(() => {
-    emptyReport = () => ({ pushed: [], pulled: [], conflicted: [], skipped: [] });
+    emptyReport = () => ({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] });
     vi.spyOn(podRuntime, "podApiFor").mockReturnValue({
       baseUrl: "https://x/api/w/w1",
       getAuthHeaders: () => ({}),

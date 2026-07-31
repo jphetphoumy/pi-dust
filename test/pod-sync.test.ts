@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -584,9 +584,108 @@ describe("pod sync", () => {
    * the skill lands on disk completely inert, and drops a stray `skills/`
    * directory in the project root on the way.
    */
+  describe("adopting a skill the agent created", () => {
+    it("lands it where pi looks for skills, not in the project root", async () => {
+      const pod = makeFakePod({
+        "skills/deploy-helper/SKILL.md": { content: "---\nname: deploy-helper\n---\nbody", ms: 500 },
+        "skills/deploy-helper/ref.md": { content: "reference", ms: 500 },
+      });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(readLocal(".pi/skills/deploy-helper/SKILL.md")).toContain("name: deploy-helper");
+      expect(readLocal(".pi/skills/deploy-helper/ref.md")).toBe("reference");
+      // Nothing in the project root.
+      expect(existsSync(join(root, "skills"))).toBe(false);
+      expect(report.adopted).toEqual(["deploy-helper"]);
+    });
+
+    it("registers it, so the agent is offered it and the banner lists it", async () => {
+      // Adopting without recording would leave it discoverable by pi but absent
+      // from AGENTS.md — the agent would have written a skill it cannot see.
+      const pod = makeFakePod({
+        "skills/deploy-helper/SKILL.md": { content: "---\nname: deploy-helper\n---\nbody", ms: 500 },
+      });
+      const bound = binding();
+
+      await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(bound.skills).toEqual(["deploy-helper"]);
+      expect(bound.skillFingerprints?.["deploy-helper"]).toEqual(expect.any(String));
+      // The instructions list the synced skills, so they have to be rewritten.
+      expect(bound.agentsMdHash).toBeUndefined();
+    });
+
+    it("adopts it once, then leaves it alone", async () => {
+      // Once registered it is pod-owned like any other synced skill, so a later
+      // sync must not pull it down a second time or report it again.
+      const pod = makeFakePod({
+        "skills/deploy-helper/SKILL.md": { content: "---\nname: deploy-helper\n---\nbody", ms: 500 },
+      });
+      const bound = binding();
+
+      await syncPod(pod.api, root, bound, { push: false, pull: true });
+      const second = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(second.adopted).toEqual([]);
+      expect(second.pulled).toEqual([]);
+    });
+
+    it("leaves the project's own skills/ directory alone", async () => {
+      // `skills/` is a plausible project directory. A file the user already
+      // tracks there is theirs, and diverting it into .pi/ would move their
+      // source tree out from under them.
+      const pod = makeFakePod({ "skills/mine/SKILL.md": { content: "updated by agent", ms: 500 } });
+      writeLocal("skills/mine/SKILL.md", "mine");
+      const bound = binding({ "skills/mine/SKILL.md": { podMs: 100, hash: hash("mine") } });
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(report.adopted).toEqual([]);
+      expect(readLocal("skills/mine/SKILL.md")).toBe("updated by agent");
+      expect(existsSync(join(root, ".pi/skills/mine"))).toBe(false);
+      expect(bound.skills ?? []).toEqual([]);
+    });
+
+    it("does not adopt an untracked file that merely sits under skills/", async () => {
+      // Without a SKILL.md it is not a skill, and diverting it into .pi/ would
+      // hide an ordinary project file from the user.
+      const pod = makeFakePod({ "skills/notes/todo.md": { content: "just a note", ms: 500 } });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(report.adopted).toEqual([]);
+      expect(readLocal("skills/notes/todo.md")).toBe("just a note");
+    });
+
+    it("does not re-adopt a skill the user already selected", async () => {
+      const pod = makeFakePod({ "skills/chosen/SKILL.md": { content: "ours", ms: 500 } });
+      const bound = binding();
+      bound.skills = ["chosen"];
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(report.adopted).toEqual([]);
+      expect(existsSync(join(root, ".pi/skills/chosen"))).toBe(false);
+    });
+
+    it("does not adopt during a push-only sync", async () => {
+      // The pre-turn push must not write to the user's config directory.
+      const pod = makeFakePod({ "skills/deploy-helper/SKILL.md": { content: "x", ms: 500 } });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, { push: true, pull: false });
+
+      expect(report.adopted).toEqual([]);
+      expect(existsSync(join(root, ".pi/skills/deploy-helper"))).toBe(false);
+    });
+  });
+
   it("summarises a report in both directions", () => {
-    expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"], skipped: [] }))
+    expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"], skipped: [], adopted: [] }))
       .toBe("↑ 1 pushed, ↓ 2 pulled, ⚠ 1 conflicted");
-    expect(describeReport({ pushed: [], pulled: [], conflicted: [], skipped: [] })).toBe("");
+    expect(describeReport({ pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [] })).toBe("");
   });
 });

@@ -13,7 +13,7 @@ import { savePodBinding } from "../src/dust-state.js";
 import { useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 function report(overrides: Partial<SyncReport> = {}): SyncReport {
-  return { pushed: [], pulled: [], conflicted: [], skipped: [], ...overrides };
+  return { pushed: [], pulled: [], conflicted: [], skipped: [], adopted: [], ...overrides };
 }
 
 function runtimeWithUi(setStatus?: (key: string, text: string | undefined) => void) {
@@ -58,7 +58,7 @@ describe("pod status bar", () => {
     // the model, token count and git branch.
     expect(podStatusText("proj", report({ pushed: ["a"], pulled: ["b", "c"] })))
       .toBe("pod:proj ↑1 ↓2");
-    expect(podStatusText("proj", report({ conflicted: ["a"], skipped: [{ rel: "b", reason: "x" }] })))
+    expect(podStatusText("proj", report({ conflicted: ["a"], skipped: [{ rel: "b", reason: "x" }], adopted: [] })))
       .toBe("pod:proj ⚠1 −1");
   });
 
@@ -202,6 +202,7 @@ describe("pod status colours", () => {
       pulled: ["b"],
       conflicted: ["c"],
       skipped: [{ rel: "d", reason: "x" }],
+      adopted: [],
     });
 
     expect(text).toContain(`${ESC}[32m↑1${ESC}[0m`);
@@ -223,7 +224,7 @@ describe("pod status colours", () => {
     // terminal without colour support.
     process.env.NO_COLOR = "1";
     try {
-      expect(podStatusText("proj", { pushed: ["a"], pulled: [], conflicted: [], skipped: [] }))
+      expect(podStatusText("proj", { pushed: ["a"], pulled: [], conflicted: [], skipped: [], adopted: [] }))
         .not.toContain(ESC);
       expect(podSyncingText("proj", 1, 4)).not.toContain(ESC);
     } finally {

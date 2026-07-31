@@ -150,6 +150,14 @@ async function syncPodQuietly(
     // Counts go to the footer rather than the transcript; only the things that
     // name a file and want the user to act stay as printed lines.
     refreshPodStatus(runtime, cwd, report);
+    // A skill the agent wrote for itself now loads into this project next
+    // session, which is a change to the user's setup rather than to their
+    // files — it is named, with its location, rather than left to a counter.
+    for (const name of report.adopted) {
+      console.error(
+        `[dust] adopted agent skill "${name}" → .pi/skills/${name}/ (loads next session)`,
+      );
+    }
     for (const rel of report.conflicted) {
       console.error(`[dust] pod conflict, left untouched: ${rel}`);
     }

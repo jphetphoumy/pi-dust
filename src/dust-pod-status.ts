@@ -95,6 +95,7 @@ function accumulate(report: SyncReport): SyncReport {
     pulled: [...turnTotals.pulled, ...report.pulled],
     conflicted: [...turnTotals.conflicted, ...report.conflicted],
     skipped: [...turnTotals.skipped, ...report.skipped],
+    adopted: [...turnTotals.adopted, ...report.adopted],
   };
   return turnTotals;
 }
