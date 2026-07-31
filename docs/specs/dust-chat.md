@@ -129,16 +129,21 @@ Accept: text/event-stream
 
 The stream opens with `{ type: "start", partial }`: pi's agent loop drops every
 partial update until that event has established the streaming message, so
-without it the whole turn only renders once, at `done`.
+without it the whole turn only renders once, at `done`. `start` is emitted
+exactly once per turn, before the reconnect loop below — not once per SSE
+connection. `streamEvents` reconnects on every tool call and again whenever
+Dust closes the window at its 60s server-side cap, and a `start` repeated on
+one of those reconnects would look like a second turn beginning and reset
+whatever pi had already rendered.
 
 | Dust SSE event | Pi action |
 |---|---|
-| `generation_tokens` where `classification === "tokens"` | Append to the open `text` block; yield `text_start` (first token of the block) then `text_delta` |
-| `generation_tokens` where `classification === "chain_of_thought"` | Append to the open `thinking` block; yield `thinking_start` then `thinking_delta`, so the reasoning streams live and stays out of the answer text |
-| `generation_tokens` where `classification` is `opening_delimiter` / `closing_delimiter` | Close the open block (the delimiter markup itself is not content) |
-| `agent_message_success` | Yield `{ type: "done", reason: "stop" }` and return |
+| `generation_tokens` where `classification === "tokens"` | Append to the open `text` block; yields `text_start` when the block opens, then a `text_delta` per batch, then `text_end` when the block closes. A batch with empty text yields nothing at all |
+| `generation_tokens` where `classification === "chain_of_thought"` | Append to the open `thinking` block; yields `thinking_start`/`thinking_delta`/`thinking_end` the same way, so the reasoning streams live and stays out of the answer text. A batch with empty text yields nothing at all |
+| `generation_tokens` where `classification` is `opening_delimiter` / `closing_delimiter` | Close the open block, emitting its `text_end`/`thinking_end` (the delimiter markup itself is not content) |
+| `agent_message_success` | Close any open block, then yield `{ type: "done", reason: "stop" }` and return |
 | `agent_error` | Throw `event.error.message` (terminal) |
-| `agent_generation_cancelled` | Yield `{ type: "done", reason: "stop" }` and return |
+| `agent_generation_cancelled` | End the turn via `finishAborted`: yield `{ type: "error", reason: "aborted" }` carrying `stopReason: "aborted"`, the reasoning and answer accumulated so far, and the cancellation message — not a clean `done` |
 | `user_message_error` | Throw `event.error.message` (terminal) |
 | `tool_params` | Ignore for now |
 | `agent_action_success` | Ignore for now |

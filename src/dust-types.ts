@@ -193,12 +193,25 @@ export interface PiTextBlock {
 export interface PiThinkingBlock {
   type: "thinking";
   thinking: string;
+  /**
+   * pi's `ThinkingContent` carries this for providers that return signed
+   * reasoning; Dust gives us no signature, so it is always absent here.
+   * Declared optional rather than omitted so a block pi persists and later
+   * replays into a signature-checking provider isn't rejected for a field
+   * that was simply never populated.
+   */
+  thinkingSignature?: string;
 }
 
 export type PiContentBlock = PiTextBlock | PiThinkingBlock;
 
 export interface AssistantMessageLike {
   role: "assistant";
+  /**
+   * Thinking blocks are never part of the answer — consumers must filter on
+   * `type === "text"` (see `extractMessageText` in dust-stream-provider.ts).
+   * Reading `content` itself as the answer pulls the reasoning trace in.
+   */
   content: PiContentBlock[];
   api: string;
   provider: string;
@@ -245,6 +258,14 @@ export interface PiTextDeltaEvent {
   partial: AssistantMessageLike;
 }
 
+/** Closes a `text` block. pi's agent loop tracks open blocks by this event, not by `done`. */
+export interface PiTextEndEvent {
+  type: "text_end";
+  contentIndex: number;
+  content: string;
+  partial: AssistantMessageLike;
+}
+
 export interface PiThinkingStartEvent {
   type: "thinking_start";
   contentIndex: number;
@@ -255,6 +276,14 @@ export interface PiThinkingDeltaEvent {
   type: "thinking_delta";
   contentIndex: number;
   delta: string;
+  partial: AssistantMessageLike;
+}
+
+/** Closes a `thinking` block. pi's agent loop tracks open blocks by this event, not by `done`. */
+export interface PiThinkingEndEvent {
+  type: "thinking_end";
+  contentIndex: number;
+  content: string;
   partial: AssistantMessageLike;
 }
 
@@ -275,8 +304,10 @@ export type PiStreamEvent =
   | PiStartEvent
   | PiTextStartEvent
   | PiTextDeltaEvent
+  | PiTextEndEvent
   | PiThinkingStartEvent
   | PiThinkingDeltaEvent
+  | PiThinkingEndEvent
   | PiDoneEvent
   | PiErrorEvent;
 

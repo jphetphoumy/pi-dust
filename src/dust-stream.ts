@@ -6,6 +6,8 @@ import type {
   PiContentBlock,
   PiEventStream,
   PiStreamEvent,
+  PiTextBlock,
+  PiThinkingBlock,
   ToolApproveExecutionEvent,
 } from "./dust-types.js";
 import {
@@ -50,8 +52,24 @@ export function makeEmptyMessage(model: DustModel): AssistantMessageLike {
   };
 }
 
-/** What a `generation_tokens` event contributes to, per its `classification`. */
+/** Which kind of pi content block a token batch grows. */
 type BlockKind = PiContentBlock["type"];
+
+/** Event names and an empty-block constructor for each `BlockKind`, so the three places that branch on it (open, delta, close) share one table instead of repeating the ternary. */
+const BLOCK_SHAPES = {
+  text: {
+    start: "text_start" as const,
+    delta: "text_delta" as const,
+    end: "text_end" as const,
+    make: (): PiTextBlock => ({ type: "text", text: "" }),
+  },
+  thinking: {
+    start: "thinking_start" as const,
+    delta: "thinking_delta" as const,
+    end: "thinking_end" as const,
+    make: (): PiThinkingBlock => ({ type: "thinking", thinking: "" }),
+  },
+};
 
 /**
  * The assistant message as it is being written, block by block.
@@ -63,6 +81,13 @@ type BlockKind = PiContentBlock["type"];
  * turns quote back to Dust (see `extractMessageText` in dust-stream-provider).
  */
 interface StreamingMessage {
+  /**
+   * Opens the turn: pushes `start` with this message's own (empty) partial.
+   * Must be called exactly once, before the reconnect loop — pi's agent loop
+   * drops every partial update until it sees this, so calling it again mid-turn
+   * would look like a second turn starting over the first.
+   */
+  start(): void;
   /** Appends to the open block of `kind`, opening one if it is not open yet. */
   append(kind: BlockKind, delta: string): void;
   /** Ends whichever block is open, so the next token starts a fresh one. */
@@ -76,6 +101,8 @@ interface StreamingMessage {
 function createStreamingMessage(stream: PiEventStream, model: DustModel): StreamingMessage {
   const partial = makeEmptyMessage(model);
   let openKind: BlockKind | null = null;
+  let openIndex = -1;
+  let openBlock: PiTextBlock | PiThinkingBlock | null = null;
 
   // pi keeps a reference to whatever `partial` it was last handed, so every
   // event gets its own copy of the blocks; sharing them would rewrite the
@@ -85,35 +112,56 @@ function createStreamingMessage(stream: PiEventStream, model: DustModel): Stream
     content: partial.content.map((block) => ({ ...block })),
   });
 
+  // pi's agent loop tracks open blocks by `text_end`/`thinking_end`, not by
+  // `done` — a block left open at `done` may render as still in progress.
+  function endOpenBlock(): void {
+    if (openKind === null || !openBlock) return;
+    const shape = BLOCK_SHAPES[openKind];
+    const content = openKind === "text" ? (openBlock as PiTextBlock).text : (openBlock as PiThinkingBlock).thinking;
+    stream.push({ type: shape.end, contentIndex: openIndex, content, partial: detach() });
+    openKind = null;
+    openIndex = -1;
+    openBlock = null;
+  }
+
   return {
+    start() {
+      stream.push({ type: "start", partial: detach() });
+    },
     append(kind, delta) {
+      // An empty batch (e.g. `text: ""`, or a non-string field) must not open
+      // a block or push a delta — Dust does send these, and an empty block
+      // would render as a stray, content-less bubble in the transcript.
       if (!delta) return;
       if (openKind !== kind) {
-        partial.content.push(kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
+        endOpenBlock();
+        const shape = BLOCK_SHAPES[kind];
+        const block = shape.make();
+        partial.content.push(block);
         openKind = kind;
-        stream.push(kind === "text"
-          ? { type: "text_start", contentIndex: partial.content.length - 1, partial: detach() }
-          : { type: "thinking_start", contentIndex: partial.content.length - 1, partial: detach() });
+        openIndex = partial.content.length - 1;
+        openBlock = block;
+        stream.push({ type: shape.start, contentIndex: openIndex, partial: detach() });
       }
-      const contentIndex = partial.content.length - 1;
-      const block = partial.content[contentIndex];
-      if (block.type === "text") {
-        block.text += delta;
+      // `openBlock` was just pushed (or already matched `kind`), so it is
+      // always the block this delta belongs to — holding the reference here
+      // avoids re-discriminating `partial.content[openIndex]` by `.type`.
+      if (openBlock!.type === "text") {
+        openBlock!.text += delta;
       } else {
-        block.thinking += delta;
+        openBlock!.thinking += delta;
       }
-      stream.push(kind === "text"
-        ? { type: "text_delta", contentIndex, delta, partial: detach() }
-        : { type: "thinking_delta", contentIndex, delta, partial: detach() });
+      const shape = BLOCK_SHAPES[kind];
+      stream.push({ type: shape.delta, contentIndex: openIndex, delta, partial: detach() });
     },
     closeBlock() {
-      openKind = null;
+      endOpenBlock();
     },
     answerText() {
       return partial.content.filter((block) => block.type === "text").map((block) => block.text).join("");
     },
     snapshot() {
-      return partial.content.map((block) => ({ ...block }));
+      return detach().content;
     },
   };
 }
@@ -128,17 +176,18 @@ function createStreamingMessage(stream: PiEventStream, model: DustModel): Stream
 function finishAborted(
   stream: PiEventStream,
   model: DustModel,
-  content: StreamingMessage,
+  message: StreamingMessage,
   resolveApprovalGate: () => void,
 ): void {
   resolveApprovalGate();
+  message.closeBlock();
   const finalMessage = makeEmptyMessage(model);
-  finalMessage.content = content.snapshot();
+  finalMessage.content = message.snapshot();
   finalMessage.stopReason = "aborted";
   finalMessage.errorMessage = CANCELLED_MESSAGE;
   stream.push({ type: "error", reason: "aborted", error: finalMessage });
   stream.end();
-  debugLog("dust:stream", "Stream aborted by user", { fullText: content.answerText() });
+  debugLog("dust:stream", "Stream aborted by user", { answerText: message.answerText() });
 }
 
 export function createEventStream(): PiEventStream {
@@ -248,11 +297,13 @@ export async function streamEvents({
   onCancelled,
 }: StreamEventsOptions): Promise<void> {
   const baseSseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
-  const content = createStreamingMessage(stream, model);
+  const message = createStreamingMessage(stream, model);
   // pi's agent loop ignores every partial update until a `start` event has
   // opened the streaming message, so without this nothing renders before the
-  // turn ends — the whole answer lands at once.
-  stream.push({ type: "start", partial: makeEmptyMessage(model) });
+  // turn ends — the whole answer lands at once. Emitted exactly once, before
+  // the reconnect loop below: every reconnect (each tool call, and Dust's 60s
+  // window cap) resumes the same turn and must not repeat it.
+  message.start();
   debugLog("dust:stream", "Opening SSE stream", { conversationSId, agentMsgSId, sseUrl: baseSseUrl });
   let reconnectAttempt = 0;
 
@@ -272,7 +323,7 @@ export async function streamEvents({
 
   reconnect: for (;;) {
     if (signal?.aborted) {
-      finishAborted(stream, model, content, resolveApprovalGate);
+      finishAborted(stream, model, message, resolveApprovalGate);
       return;
     }
 
@@ -291,7 +342,7 @@ export async function streamEvents({
       });
     } catch (error) {
       if (signal?.aborted) {
-        finishAborted(stream, model, content, resolveApprovalGate);
+        finishAborted(stream, model, message, resolveApprovalGate);
         return;
       }
       const delayMs = streamRetryDelay(reconnectAttempt);
@@ -389,13 +440,22 @@ export async function streamEvents({
                 const classification = isRecord(event) ? event.classification : undefined;
                 const delta = isRecord(event) && typeof event.text === "string" ? event.text : "";
                 if (classification === "tokens") {
-                  content.append("text", delta);
-                  debugLog("dust:stream", "Forwarded text delta", { delta });
+                  message.append("text", delta);
+                  // Only true when a delta was actually pushed — `append` silently
+                  // drops an empty batch, and a log line claiming forwarding that
+                  // didn't happen sends anyone debugging a missing token the wrong way.
+                  if (delta) debugLog("dust:stream", "Forwarded text delta", { delta });
                 } else if (classification === "chain_of_thought") {
-                  content.append("thinking", delta);
-                  debugLog("dust:stream", "Forwarded thinking delta", { delta });
+                  message.append("thinking", delta);
+                  if (delta) debugLog("dust:stream", "Forwarded thinking delta", { delta });
                 } else if (classification === "opening_delimiter" || classification === "closing_delimiter") {
-                  content.closeBlock();
+                  message.closeBlock();
+                } else {
+                  // Covers a malformed frame (`classification` missing) and any new
+                  // value Dust adds later. This is the single dispatch point for all
+                  // agent output, so silently ignoring it would drop text from the
+                  // transcript with nothing in the logs to show it happened.
+                  debugLog("dust:stream", "Ignored generation_tokens classification", { classification });
                 }
               } else if (eventType === "tool_params") {
                 // Client-side tool calls render as their own transcript entry
@@ -424,23 +484,25 @@ export async function streamEvents({
                 break outer;
               } else if (eventType === "agent_message_success") {
                 resolveApprovalGate();
+                message.closeBlock();
                 const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = content.snapshot();
+                finalMessage.content = message.snapshot();
                 finalMessage.stopReason = "stop";
                 stream.push({ type: "done", reason: "stop", message: finalMessage });
                 stream.end();
-                debugLog("dust:stream", "Stream completed successfully", { fullText: content.answerText() });
+                debugLog("dust:stream", "Stream completed successfully", { answerText: message.answerText() });
                 return;
               } else if (eventType === "agent_message_gracefully_stopped") {
                 // Terminal per the Dust SDK's terminalEventTypes; without this
                 // the stream never completes and the turn hangs.
                 resolveApprovalGate();
+                message.closeBlock();
                 const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = content.snapshot();
+                finalMessage.content = message.snapshot();
                 finalMessage.stopReason = "stop";
                 stream.push({ type: "done", reason: "stop", message: finalMessage });
                 stream.end();
-                debugLog("dust:stream", "Stream gracefully stopped", { fullText: content.answerText() });
+                debugLog("dust:stream", "Stream gracefully stopped", { answerText: message.answerText() });
                 return;
               } else if (eventType === "agent_generation_cancelled") {
                 // Dust says the generation was cancelled — by our own cancel
@@ -449,7 +511,7 @@ export async function streamEvents({
                 // clean finish, and the runtime has to hear about it: the local
                 // abort signal never fired on this path.
                 onCancelled();
-                finishAborted(stream, model, content, resolveApprovalGate);
+                finishAborted(stream, model, message, resolveApprovalGate);
                 return;
               } else if (eventType === "agent_error") {
                 debugLog("dust:stream", "Received agent error event", event);
@@ -467,7 +529,7 @@ export async function streamEvents({
       // Cancelling the turn aborts the in-flight read; end as cancelled rather
       // than letting the AbortError surface as a stream failure.
       if (signal?.aborted) {
-        finishAborted(stream, model, content, resolveApprovalGate);
+        finishAborted(stream, model, message, resolveApprovalGate);
         return;
       }
       throw error;
@@ -504,10 +566,11 @@ export async function streamEvents({
   }
 
   resolveApprovalGate();
+  message.closeBlock();
   const finalMessage = makeEmptyMessage(model);
-  finalMessage.content = content.snapshot();
+  finalMessage.content = message.snapshot();
   finalMessage.stopReason = "stop";
   stream.push({ type: "done", reason: "stop", message: finalMessage });
   stream.end();
-  debugLog("dust:stream", "Stream ended after reconnect loop", { fullText: content.answerText() });
+  debugLog("dust:stream", "Stream ended after reconnect loop", { answerText: message.answerText() });
 }

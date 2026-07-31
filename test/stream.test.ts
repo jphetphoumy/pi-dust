@@ -314,8 +314,10 @@ describe("dust extension", () => {
         "start",
         "thinking_start",
         "thinking_delta",
+        "thinking_end",
         "text_start",
         "text_delta",
+        "text_end",
         "done",
       ]);
       // The answer keeps its own content block, after the reasoning one.
@@ -342,6 +344,10 @@ describe("dust extension", () => {
       expect(deltas[0].delta).toBe("Answer");
 
       const done = events.find((e) => e.type === "done");
+      // A regressed fix would drop this event silently rather than change its
+      // shape; failing here first gives a readable diff instead of a
+      // "Cannot read properties of undefined" a few lines down.
+      expect(done).toBeDefined();
       // Reasoning stays in its own `thinking` block; the answer text is clean.
       expect(done.message.content).toEqual([
         { type: "thinking", thinking: "thinking..." },
@@ -364,6 +370,7 @@ describe("dust extension", () => {
       for await (const e of stream) events.push(e);
 
       const lastTextDelta = events.filter((e) => e.type === "text_delta").at(-1);
+      expect(lastTextDelta).toBeDefined();
       expect(lastTextDelta.partial.content).toEqual([
         { type: "thinking", thinking: "thinking..." },
         { type: "text", text: "Answer" },
@@ -387,7 +394,7 @@ describe("dust extension", () => {
       expect(error.error.content).toEqual([{ type: "thinking", thinking: "half a thought" }]);
     });
 
-    it("renders the delimiters Dust wraps the reasoning in as separate blocks, not as answer text", async () => {
+    it("splits the reasoning at the delimiters and drops the delimiter markup", async () => {
       const model = makeModel();
       const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
         { type: "generation_tokens", classification: "opening_delimiter", text: "<thinking>" },
@@ -403,14 +410,116 @@ describe("dust extension", () => {
       const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const e of stream) events.push(e);
 
-      // Delimiter text is markup around the trace, never content of its own.
-      expect(events.some((e) => typeof e.delta === "string" && e.delta.includes("thinking>"))).toBe(false);
+      // Delimiter events push no stream event of their own — not text with
+      // different markup, not a delta some other way. A delimiter only ever
+      // closes the block that was open.
+      expect(events.every((e) => e.delta !== "<thinking>" && e.delta !== "</thinking>")).toBe(true);
+      expect(events.map((e) => e.type)).toEqual([
+        "start",
+        "thinking_start",
+        "thinking_delta",
+        "thinking_end",
+        "thinking_start",
+        "thinking_delta",
+        "thinking_end",
+        "text_start",
+        "text_delta",
+        "text_end",
+        "done",
+      ]);
       const done = events.find((e) => e.type === "done");
       expect(done.message.content).toEqual([
         { type: "thinking", thinking: "step one" },
         { type: "thinking", thinking: "step two" },
         { type: "text", text: "Answer" },
       ]);
+    });
+
+    it("does not open a block or push a delta for an empty-text token batch", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "tokens", text: "" },
+        { type: "generation_tokens", classification: "tokens", text: "Hi" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      // The empty batch must not be the one that opens the block.
+      expect(events.filter((e) => e.type === "text_start")).toHaveLength(1);
+      const deltas = events.filter((e) => e.type === "text_delta");
+      expect(deltas.map((e) => e.delta)).toEqual(["Hi"]);
+    });
+
+    it("ignores generation_tokens with an unrecognized classification, without disturbing the open block", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "tokens", text: "Hel" },
+        { type: "generation_tokens", classification: "some_future_kind", text: "???" },
+        { type: "generation_tokens", classification: "tokens", text: "lo" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      // An unrecognized classification is dropped, not treated as a boundary —
+      // the block stays open and the two known batches land in it together.
+      expect(events.filter((e) => e.type === "text_start")).toHaveLength(1);
+      const done = events.find((e) => e.type === "done");
+      expect(done).toBeDefined();
+      expect(done.message.content).toEqual([{ type: "text", text: "Hello" }]);
+    });
+
+    // pi's agent loop drops every partial update until `start` has established
+    // the streaming message; a second `start` mid-turn would look like a new
+    // turn beginning and reset whatever pi already rendered. streamEvents
+    // reconnects on every tool call and on Dust's 60s window cap, so this has
+    // to hold across a reconnect, not just for a single SSE window.
+    it("emits start only once, even when the SSE window reconnects mid-turn", async () => {
+      const model = makeModel();
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+        })
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
+        })
+        // First window: some text, then the connection closes without a
+        // terminal event — Dust's 60s cap, not the end of the turn.
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "generation_tokens", classification: "tokens", text: "Hel" }]),
+        })
+        // Reconnect window: finishes the turn.
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([
+            { type: "generation_tokens", classification: "tokens", text: "lo" },
+            { type: "agent_message_success" },
+          ]),
+        });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      expect(events.filter((e) => e.type === "start")).toHaveLength(1);
+      // The block opened before the reconnect keeps accumulating across it,
+      // rather than a second one opening when the window resumes.
+      expect(events.filter((e) => e.type === "text_start")).toHaveLength(1);
+      const done = events.find((e) => e.type === "done");
+      expect(done).toBeDefined();
+      expect(done.message.content).toEqual([{ type: "text", text: "Hello" }]);
     });
 
     it("ignores malformed SSE JSON frames and still processes later valid events", async () => {
