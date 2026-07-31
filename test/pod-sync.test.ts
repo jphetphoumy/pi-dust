@@ -6,7 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
 import type { PodApi } from "../src/dust-pod.js";
 import * as podApi from "../src/dust-pod.js";
-import { describeReport, ingestFiles, isEmptyReport, syncPod } from "../src/dust-pod-sync.js";
+import {
+  describeReport,
+  ingestFiles,
+  isEmptyReport,
+  POD_UPLOAD_CONCURRENCY,
+  syncPod,
+} from "../src/dust-pod-sync.js";
 import type { DustPodBinding } from "../src/dust-state.js";
 import { getPodBinding } from "../src/dust-state.js";
 import { useTempAgentDir } from "./helpers/dust-fixtures.js";
@@ -420,6 +426,164 @@ describe("pod sync", () => {
     expect(steps).toEqual(["1/2", "2/2"]);
   });
 
+  /**
+   * Makes each upload block until released, so a test can observe how many are
+   * in flight at once rather than inferring concurrency from timing.
+   */
+  function gatedUploads() {
+    const inFlight = { now: 0, peak: 0 };
+    const release: Array<() => void> = [];
+    vi.mocked(podApi.uploadPodFile).mockImplementation(async () => {
+      inFlight.now++;
+      inFlight.peak = Math.max(inFlight.peak, inFlight.now);
+      await new Promise<void>((resolve) => release.push(resolve));
+      inFlight.now--;
+    });
+    // Drain on a timer: every queued upload is freed as soon as it parks, so
+    // the pool keeps refilling and the run completes.
+    const timer = setInterval(() => release.splice(0).forEach((fn) => fn()), 0);
+    return { inFlight, stop: () => clearInterval(timer) };
+  }
+
+  it("uploads several files at once instead of one at a time", async () => {
+    // Each upload is up to four round trips (delete, reserve, PUT, move), so a
+    // sequential ingest of a scaffolded tree spends nearly all its time idle on
+    // the network.
+    const pod = makeFakePod({});
+    for (let i = 0; i < 12; i++) writeLocal(`f${i}.py`, `x${i}`);
+    const gate = gatedUploads();
+
+    try {
+      await ingestFiles(pod.api, root, binding(), Array.from({ length: 12 }, (_, i) => `f${i}.py`));
+    } finally {
+      gate.stop();
+    }
+
+    expect(gate.inFlight.peak).toBeGreaterThan(1);
+  });
+
+  it("bounds how many uploads are in flight, so a big ingest cannot flood Dust", async () => {
+    // Dust rate-limits the reserve step to 40/min per workspace. Unbounded
+    // fan-out over a 500-file ingest would open 500 sockets and spend the whole
+    // window instantly.
+    const pod = makeFakePod({});
+    for (let i = 0; i < 40; i++) writeLocal(`f${i}.py`, `x${i}`);
+    const gate = gatedUploads();
+
+    try {
+      await ingestFiles(pod.api, root, binding(), Array.from({ length: 40 }, (_, i) => `f${i}.py`));
+    } finally {
+      gate.stop();
+    }
+
+    expect(gate.inFlight.peak).toBeLessThanOrEqual(POD_UPLOAD_CONCURRENCY);
+  });
+
+  it("counts progress on completion, not on dispatch", async () => {
+    // Under concurrency a counter incremented at the top of the loop would mean
+    // "this many started" — the footer would race to 12/12 while uploads were
+    // still in flight, and the user would think a sync had finished when it had
+    // not. Every reported `done` must be a file that is actually up.
+    const pod = makeFakePod({});
+    for (let i = 0; i < 6; i++) writeLocal(`f${i}.py`, `x${i}`);
+    let landed = 0;
+    const original = vi.mocked(podApi.uploadPodFile).getMockImplementation();
+    vi.mocked(podApi.uploadPodFile).mockImplementation(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      await original?.(...args);
+      landed++;
+    });
+    const seen: Array<{ done: number; landed: number }> = [];
+
+    await ingestFiles(
+      pod.api,
+      root,
+      binding(),
+      Array.from({ length: 6 }, (_, i) => `f${i}.py`),
+      (done) => seen.push({ done, landed }),
+    );
+
+    expect(seen).toHaveLength(6);
+    // `done` may never exceed the number of uploads that have actually landed.
+    expect(seen.every((s) => s.done <= s.landed)).toBe(true);
+    expect(seen.at(-1)?.done).toBe(6);
+  });
+
+  it("reports pushed files in a stable order however the uploads interleave", async () => {
+    // Completion order under concurrency is arbitrary. Reporting in that order
+    // would make the transcript and the tests non-deterministic for no gain.
+    const pod = makeFakePod({});
+    for (const rel of ["a.py", "b.py", "c.py", "d.py"]) writeLocal(rel, rel);
+    // Reverse the completion order relative to the input order.
+    const delays: Record<string, number> = { "a.py": 8, "b.py": 6, "c.py": 4, "d.py": 2 };
+    const original = vi.mocked(podApi.uploadPodFile).getMockImplementation();
+    vi.mocked(podApi.uploadPodFile).mockImplementation(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, delays[args[2]] ?? 0));
+      return original?.(...args);
+    });
+
+    const report = await ingestFiles(pod.api, root, binding(), ["a.py", "b.py", "c.py", "d.py"]);
+
+    expect(report.pushed).toEqual(["a.py", "b.py", "c.py", "d.py"]);
+  });
+
+  it("keeps watermarks consistent when a concurrent ingest hits an expired session", async () => {
+    // The invariant a partial ingest has to preserve: a file with no watermark
+    // that exists on both sides reads as changed-on-both-sides, so a bad abort
+    // would make the next sync report the whole project as conflicted.
+    // Whatever did upload must be recorded; whatever did not must not be.
+    const pod = makeFakePod({});
+    for (const rel of ["a.py", "b.py", "c.py", "d.py"]) writeLocal(rel, rel);
+    const original = vi.mocked(podApi.uploadPodFile).getMockImplementation();
+    vi.mocked(podApi.uploadPodFile).mockImplementation(async (...args) => {
+      if (args[2] === "c.py") throw new Error(SESSION_EXPIRED_MESSAGE);
+      return original?.(...args);
+    });
+    const bound = binding();
+
+    await expect(ingestFiles(pod.api, root, bound, ["a.py", "b.py", "c.py", "d.py"]))
+      .rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+
+    // Every watermark recorded corresponds to a file that really is in the pod.
+    for (const rel of Object.keys(bound.seen)) {
+      expect(pod.files.has(rel)).toBe(true);
+    }
+    expect(bound.seen["c.py"]).toBeUndefined();
+  });
+
+  it("keeps the watermarks a sync's push had already earned when the session dies", async () => {
+    // Same invariant as the ingest case, on the other upload path: the discovery
+    // push aborts, but a file that reached the pod must keep its watermark —
+    // and it has to be persisted, since the throw means no later pass will.
+    const pod = makeFakePod({});
+    for (const rel of ["a.py", "b.py", "c.py", "d.py"]) writeLocal(rel, rel);
+    const original = vi.mocked(podApi.uploadPodFile).getMockImplementation();
+    vi.mocked(podApi.uploadPodFile).mockImplementation(async (...args) => {
+      if (args[2] === "d.py") throw new Error(SESSION_EXPIRED_MESSAGE);
+      return original?.(...args);
+    });
+    const bound = binding();
+
+    await expect(syncPod(pod.api, root, bound, { push: true, pull: false }))
+      .rejects.toThrow(SESSION_EXPIRED_MESSAGE);
+
+    for (const rel of Object.keys(bound.seen)) {
+      expect(pod.files.has(rel)).toBe(true);
+    }
+    expect(bound.seen["d.py"]).toBeUndefined();
+    // Persisted, not just held in memory — the throw ends this sync.
+    expect(Object.keys(getPodBinding(root)?.seen ?? {})).toEqual(Object.keys(bound.seen));
+  });
+
+  /**
+   * A skill the agent wrote into the pod itself.
+   *
+   * The pod's `skills/` prefix is where `/dust-skills` puts our copies, so an
+   * agent that creates a skill there produces a subtree we never uploaded. Left
+   * alone it pulls down to `<root>/skills/<name>/`, which pi does not scan —
+   * the skill lands on disk completely inert, and drops a stray `skills/`
+   * directory in the project root on the way.
+   */
   it("summarises a report in both directions", () => {
     expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"], skipped: [] }))
       .toBe("↑ 1 pushed, ↓ 2 pulled, ⚠ 1 conflicted");

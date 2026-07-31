@@ -92,6 +92,138 @@ function writeLocal(root: string, rel: string, content: Buffer): void {
 }
 
 /**
+ * How many uploads may be in flight at once.
+ *
+ * One upload is up to four round trips (delete, reserve, PUT, move), so a
+ * sequential ingest of a scaffolded tree spends nearly all its wall clock
+ * waiting on the network. The ceiling is deliberately low: Dust rate-limits the
+ * reserve step to 40 per 60 seconds per workspace, so the gain from a wider
+ * pool is small and the cost — burning the whole window in a burst, then
+ * stalling on 429 backoff — is not.
+ */
+export const POD_UPLOAD_CONCURRENCY = 4;
+
+/**
+ * Runs `worker` over `items` with at most `limit` in flight.
+ *
+ * A worker is expected to record its own per-item failures and resolve; only a
+ * genuinely fatal condition (a dead session) should throw. When one does, no
+ * further items are started and the first error is re-thrown once the already
+ * running workers have settled — cancelling them mid-flight would leave uploads
+ * that may or may not have landed, which is exactly the ambiguity the watermark
+ * bookkeeping cannot tolerate.
+ */
+async function forEachConcurrently<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failure: unknown = null;
+
+  const drain = async (): Promise<void> => {
+    while (failure === null) {
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        await worker(items[index] as T, index);
+      } catch (err) {
+        failure ??= err;
+        return;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, drain));
+  if (failure !== null) throw failure;
+}
+
+/** What one upload attempt concluded; `null` while it has not been attempted. */
+type UploadOutcome =
+  | { ok: true; rel: string; hash: string }
+  | { ok: false; rel: string; reason: string }
+  | null;
+
+/**
+ * Uploads `relPaths` concurrently, reporting outcomes in *input* order.
+ *
+ * Completion order under concurrency is arbitrary, so results are collected by
+ * index and folded in afterwards. Reporting them as they land would make the
+ * transcript and the tests non-deterministic for no benefit.
+ *
+ * Progress is counted when an upload settles, never when it is dispatched: a
+ * counter incremented on dispatch would mean "this many started", racing the
+ * footer to n/n while files were still in flight.
+ */
+async function uploadAll(
+  api: PodApi,
+  root: string,
+  podId: string,
+  relPaths: readonly string[],
+  onProgress?: SyncProgress,
+  progressBase = 0,
+  progressTotal = relPaths.length,
+): Promise<{ outcomes: UploadOutcome[]; fatal: unknown }> {
+  const outcomes: UploadOutcome[] = new Array(relPaths.length).fill(null);
+  let done = progressBase;
+  const step = (): void => onProgress?.(++done, progressTotal);
+
+  let fatal: unknown = null;
+  try {
+    await forEachConcurrently(relPaths, POD_UPLOAD_CONCURRENCY, async (rel, index) => {
+      const local = readLocal(root, rel);
+      if (!local) {
+        step();
+        return;
+      }
+      try {
+        await uploadPodFile(api, podId, rel, local);
+        outcomes[index] = { ok: true, rel, hash: hashOf(local) };
+      } catch (err) {
+        // A dead session is not a per-file problem and must not be swallowed as
+        // one — every remaining file would "fail" too, for the same reason.
+        if (err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE) throw err;
+        outcomes[index] = { ok: false, rel, reason: errorMessage(err) };
+      }
+      step();
+    });
+  } catch (err) {
+    fatal = err;
+  }
+
+  return { outcomes, fatal };
+}
+
+/**
+ * Folds upload outcomes into the report and the watermarks, in input order.
+ *
+ * Watermarks go in at `MAX_SAFE_INTEGER` and are settled from a fresh listing
+ * by the caller. Only files that genuinely landed get one — a watermark for a
+ * file that is not in the pod would make the next sync read it as
+ * changed-on-both-sides and report a conflict that does not exist.
+ */
+function applyOutcomes(outcomes: readonly UploadOutcome[], binding: DustPodBinding, report: SyncReport): void {
+  for (const outcome of outcomes) {
+    if (outcome === null) continue;
+    if (outcome.ok) {
+      binding.seen[outcome.rel] = { podMs: Number.MAX_SAFE_INTEGER, hash: outcome.hash };
+      report.pushed.push(outcome.rel);
+    } else {
+      report.skipped.push({ rel: outcome.rel, reason: outcome.reason });
+    }
+  }
+}
+
+/** Replaces the provisional MAX_SAFE_INTEGER watermarks with the pod's real mtimes. */
+async function settleWatermarks(api: PodApi, binding: DustPodBinding): Promise<void> {
+  for (const entry of await listPodFiles(api, binding.podId)) {
+    const rel = toRelativePath(binding.podId, entry.path);
+    const seen = binding.seen[rel];
+    if (seen) binding.seen[rel] = { ...seen, podMs: entry.lastModifiedMs };
+  }
+}
+
+/**
  * Reconciles the pod against the local tree in both directions.
  *
  * Change detection is watermark-based rather than timestamp-based: a file
@@ -182,25 +314,43 @@ export async function syncPod(
     const podPaths = new Set(entries.map((entry) => toRelativePath(binding.podId, entry.path)));
     const missing = new Set([...Object.keys(seen), ...discovered]);
 
+    // Paths the pod already holds do no work, so they are counted off straight
+    // away; the rest are counted as their uploads land, inside `uploadAll`.
+    const toUpload: string[] = [];
     for (const rel of missing) {
-      step();
-      if (podPaths.has(rel)) continue;
-      const local = readLocal(root, rel);
-      if (!local) continue;
-      try {
-        await uploadPodFile(api, binding.podId, rel, local);
-      } catch (err) {
-        if (err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE) throw err;
-        report.skipped.push({ rel, reason: errorMessage(err) });
-        continue;
-      }
-      seen[rel] = { podMs: Number.MAX_SAFE_INTEGER, hash: hashOf(local) };
-      report.pushed.push(rel);
+      if (podPaths.has(rel)) step();
+      else toUpload.push(rel);
+    }
+
+    const { outcomes, fatal } = await uploadAll(
+      api,
+      root,
+      binding.podId,
+      toUpload,
+      options.onProgress,
+      done,
+      total,
+    );
+
+    // The pushed set has to reach `seen` before any throw: those files are in
+    // the pod, and a watermark-less file that exists on both sides reads as
+    // changed-on-both-sides — so dropping them would report the whole tree as
+    // conflicted on the next sync.
+    const pushReport = emptyReport();
+    const pushBinding = { ...binding, seen };
+    applyOutcomes(outcomes, pushBinding, pushReport);
+    report.pushed.push(...pushReport.pushed);
+    report.skipped.push(...pushReport.skipped);
+
+    if (fatal !== null) {
+      binding.seen = seen;
+      savePodBinding(root, binding);
+      throw fatal;
     }
   }
 
   if (report.pushed.length > 0) {
-    // Settle the watermarks we set to MAX_SAFE_INTEGER above.
+    // Settle the watermarks set to MAX_SAFE_INTEGER above.
     for (const entry of await listPodFiles(api, binding.podId)) {
       const rel = toRelativePath(binding.podId, entry.path);
       if (seen[rel]) seen[rel] = { ...seen[rel], podMs: entry.lastModifiedMs };
@@ -234,29 +384,21 @@ export async function ingestFiles(
   onProgress?: SyncProgress,
 ): Promise<SyncReport> {
   const report = emptyReport();
-  let done = 0;
-  for (const rel of relPaths) {
-    onProgress?.(++done, relPaths.length);
-    const local = readLocal(root, rel);
-    if (!local) continue;
-    try {
-      await uploadPodFile(api, binding.podId, rel, local);
-    } catch (err) {
-      // A dead session is not a per-file problem and must not be swallowed as
-      // one — every remaining file would "fail" too, for the same reason.
-      if (err instanceof Error && err.message === SESSION_EXPIRED_MESSAGE) throw err;
-      report.skipped.push({ rel, reason: errorMessage(err) });
-      continue;
-    }
-    binding.seen[rel] = { podMs: Number.MAX_SAFE_INTEGER, hash: hashOf(local) };
-    report.pushed.push(rel);
+  const { outcomes, fatal } = await uploadAll(api, root, binding.podId, relPaths, onProgress);
+
+  // Whatever landed is recorded either way. On a dead session the run still
+  // has to abort — but the files already in the pod are in it, and dropping
+  // their watermarks would leave exactly the inconsistent state this function
+  // exists to avoid.
+  applyOutcomes(outcomes, binding, report);
+
+  if (fatal !== null) {
+    // No settling listing: the same dead session would fail that too.
+    savePodBinding(root, binding);
+    throw fatal;
   }
 
-  for (const entry of await listPodFiles(api, binding.podId)) {
-    const rel = toRelativePath(binding.podId, entry.path);
-    if (binding.seen[rel]) binding.seen[rel] = { ...binding.seen[rel], podMs: entry.lastModifiedMs };
-  }
-
+  await settleWatermarks(api, binding);
   savePodBinding(root, binding);
   return report;
 }
