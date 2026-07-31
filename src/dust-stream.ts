@@ -99,9 +99,15 @@ interface StreamingMessage {
   append(kind: BlockKind, delta: string): void;
   /**
    * Ends whichever block is open, so the next token starts a fresh one. Every
-   * exit from a turn must call this before its terminal event — pi tracks an
-   * open block by `text_end`/`thinking_end`, not by `done`/`error`, so a block
-   * still open when the terminal event lands renders as stuck in progress.
+   * exit from a turn must call this before its terminal event: pi-ai's own
+   * `AssistantMessageEvent` doc says a stream should emit `start` then
+   * partial updates before terminating, and every provider adapter closes
+   * what it opens, so an unclosed block is a stream that doesn't hold up its
+   * end of that contract — not, as an earlier version of this comment
+   * claimed, something pi's renderer visibly gets stuck on. Checked against
+   * `pi-agent-core`'s `agent-loop.js`: it handles every `*_start`/`*_delta`/
+   * `*_end` case identically (replace `partialMessage`, re-emit) and keeps no
+   * per-block open/closed state of its own.
    */
   endBlock(): void;
   /** The answer only, with the reasoning left out. */
@@ -537,8 +543,8 @@ export async function streamEvents({
                 debugLog("dust:stream", "Received agent error event", event);
                 // Every other terminal exit closes whatever block is open
                 // before it stops pushing to the stream (see `endBlock` on
-                // `StreamingMessage`); an error arriving mid-answer is exactly
-                // when a half-written block is on screen, so this must too.
+                // `StreamingMessage` for why); this must too, for the same
+                // reason.
                 message.endBlock();
                 throw new Error(getDustEventErrorMessage(event, "Agent error"));
               } else if (eventType === "user_message_error") {
