@@ -35,12 +35,17 @@ function buildAuthHeaders(accessToken: string): Record<string, string> {
   };
 }
 
+/**
+ * The answer text of a message, with `thinking` blocks left out — this is what
+ * later turns quote back to Dust.
+ *
+ * Multiple text blocks (dust-stream.ts splits one whenever the classification
+ * switches between `tokens`, `chain_of_thought` and the delimiters) join with
+ * no separator: if a break ever lands on that boundary it isn't reinstated.
+ * Left as-is rather than guessing at one.
+ */
 function extractMessageText(message: ChatMessageLike): string {
   const rawContent = message.content ?? "";
-  // Multiple text blocks (dust-stream.ts splits one whenever the
-  // classification switches between `tokens`, `chain_of_thought` and the
-  // delimiters) join with no separator: if a break ever lands on that
-  // boundary it isn't reinstated. Left as-is rather than guessing at one.
   return Array.isArray(rawContent)
     ? rawContent.filter((block) => block.type === "text").map((block) => block.text ?? "").join("")
     : String(rawContent);
