@@ -191,9 +191,10 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
         return;
       }
 
-      // Directories start open, so the panel opens on the same everything-listed
-      // view it used to show and collapsing is the deliberate act.
-      let expanded = new Set(directoryPathsUnder(tree));
+      // Directories start closed. A pod mirrors a whole project, so opening
+      // everything is a wall of files to scroll before the top-level shape is
+      // even visible — and the top-level shape is what the user is picking from.
+      let expanded = new Set<string>();
       const selected = new Set<string>();
 
       let panel: DustPodListPanel | null = null;
@@ -202,15 +203,10 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
       const render = (): void => panel?.setRows(toRows());
 
       const reload = async (): Promise<void> => {
-        const knownDirs = new Set(directoryPathsUnder(tree));
         tree = await loadTree();
-        // Directories the user closed stay closed; ones that appeared since open
-        // like they would have on a fresh panel. Anything gone drops out of both
-        // sets rather than lingering as a claim about a path the pod no longer
-        // has.
-        expanded = new Set(
-          directoryPathsUnder(tree).filter((path) => expanded.has(path) || !knownDirs.has(path)),
-        );
+        // Directories the user opened stay open; a directory the pod no longer
+        // has drops out rather than lingering as a claim about a missing path.
+        expanded = new Set(directoryPathsUnder(tree).filter((path) => expanded.has(path)));
         const live = new Set(allFiles());
         for (const path of [...selected]) {
           if (!live.has(path)) selected.delete(path);

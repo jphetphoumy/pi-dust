@@ -119,7 +119,9 @@ describe("/podfs and /pods", () => {
       expect(opened?.options.rows[1].detail).toBe("2.0 kB");
     });
 
-    it("shows folders as rows, open, with their file count and total size", async () => {
+    it("opens on the top level only, with folders closed", async () => {
+      // A pod mirrors a whole project; expanding it all would be a wall of
+      // files to scroll before the shape the user is picking from is visible.
       vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
         podFile("src/a.py", 100),
         podFile("src/lib/b.py", 20),
@@ -128,37 +130,34 @@ describe("/podfs and /pods", () => {
 
       await register(registerDustPodFsCommand)("", ctx());
 
-      // Directories first, opened by default, so the panel still shows every
-      // file the flat list used to.
-      expect(opened?.options.rows.map((row) => row.label)).toEqual([
-        "src/",
-        "lib/",
-        "b.py",
-        "a.py",
-        "README.md",
-      ]);
-      // Sizes and counts roll up from every descendant, so a collapsed folder
+      expect(opened?.options.rows.map((row) => row.label)).toEqual(["src/", "README.md"]);
+      // Counts and sizes roll up from every descendant, so a closed folder
       // still says how much pulling it would cost.
       expect(opened?.options.rows[0].detail).toBe("2 files, 120 B");
       expect(opened?.options.rows[0].expandable).toBe(true);
-      expect(opened?.options.rows[0].expanded).toBe(true);
-      expect(opened?.options.rows[1].detail).toBe("1 file, 20 B");
-      expect(opened?.options.rows[2].depth).toBe(2);
-      expect(opened?.options.rows[4].expandable).toBe(false);
+      expect(opened?.options.rows[0].expanded).toBe(false);
+      expect(opened?.options.rows[1].expandable).toBe(false);
     });
 
-    it("hides a folder's contents once it is collapsed", async () => {
-      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py"), podFile("z.py")]);
+    it("reveals a folder's contents when it is opened", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        podFile("src/lib/b.py", 20),
+        podFile("z.py"),
+      ]);
       let after: ListRow[] = [];
       interact = (options) => {
-        options.tree!.setExpanded(options.rows[0], false);
+        options.tree!.setExpanded(options.rows[0], true);
         after = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
       };
 
       await register(registerDustPodFsCommand)("", ctx());
 
-      expect(after.map((row) => row.label)).toEqual(["src/", "z.py"]);
-      expect(after[0].expanded).toBe(false);
+      // Only one level: the nested folder appears, still closed.
+      expect(after.map((row) => row.label)).toEqual(["src/", "lib/", "z.py"]);
+      expect(after[0].expanded).toBe(true);
+      expect(after[1].expanded).toBe(false);
+      expect(after[1].depth).toBe(1);
+      expect(after[1].detail).toBe("1 file, 20 B");
     });
 
     it("pulls a whole folder from one keypress", async () => {
@@ -188,11 +187,13 @@ describe("/podfs and /pods", () => {
       vi.spyOn(podApi, "downloadPodFile").mockResolvedValue(Buffer.from("x = 1"));
       panelResult = [];
       interact = (options) => {
-        // Tick `src/`, then untick the one file inside it that is not wanted.
-        // Rows are src/, lib/, lib/b.py, src/a.py, z.py.
+        // Tick `src/` while it is closed, then open it and untick the one file
+        // inside that is not wanted — the tick has to survive the rebuild.
         options.tree!.toggleSelect(options.rows[0]);
+        options.tree!.setExpanded(options.rows[0], true);
+        // Rows are now src/, lib/, src/a.py, z.py.
         const rows = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
-        options.tree!.toggleSelect(rows[3]);
+        options.tree!.toggleSelect(rows[2]);
       };
 
       await register(registerDustPodFsCommand)("", ctx());
@@ -208,6 +209,7 @@ describe("/podfs and /pods", () => {
       let rows: ListRow[] = [];
       interact = (options) => {
         options.tree!.toggleSelect(options.rows[0]);
+        options.tree!.setExpanded(options.rows[0], true);
         rows = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
         expect(rows[0].selected).toBe(true);
         options.tree!.toggleSelect(rows[1]);

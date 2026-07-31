@@ -413,9 +413,13 @@ The tree exists because the flat list made the common case impossible: pulling
 | `p` | pull the focused row, folder or file |
 | `d` | delete the focused row — a folder asks first, since it is many deletions behind one keypress |
 
-Folders open by default, so the panel still shows what the flat list did.
-Nothing starts ticked: a pull overwrites whatever sits at that path locally, so
-the user says which files rather than un-saying it.
+Folders start **closed**, and nothing starts ticked. A pod mirrors a whole
+project, so opening every folder is a wall of files to scroll before the
+top-level shape — the thing the user is actually picking from — is even visible;
+a closed folder still carries its rolled-up file count and total size, which is
+what makes it pickable without opening it. Ticking nothing by default is the
+matching caution: a pull overwrites whatever sits at that path locally, so the
+user says which files rather than un-saying it.
 
 Selection lives in the command, not the panel
 (`ListPanelOptions.tree` in `src/dust-pod-list-panel.ts`). It has to: ticking a
