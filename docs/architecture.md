@@ -392,6 +392,44 @@ the agent to create files at the path it wants; the directory follows.
 Two paths are pod-owned and never pulled onto disk: `AGENTS.md` (a rendering of
 the system prompt) and `skills/<name>/` (copies of the user's own skills).
 
+### Browsing the pod: `/podfs`
+
+`/podfs` shows the pod as a **tree**, even though the pod has none. Dust stores
+flat canonical paths and no directory objects, so `src/dust-pod-tree.ts` folds
+the listing into one — which means every folder-level action (tick it, pull it,
+delete it) is really the file paths underneath it, resolved at the moment the key
+is pressed.
+
+The tree exists because the flat list made the common case impossible: pulling
+`src/` back meant pressing `p` once per file, and there was no row that meant
+"the folder".
+
+| Key | Acts on |
+|---|---|
+| `space` | tick this row and everything under it |
+| `a` | tick everything, or clear it when everything is ticked |
+| `→` / `←` | open a folder; close it, or step out to the parent |
+| `enter` | pull every ticked file |
+| `p` | pull the focused row, folder or file |
+| `d` | delete the focused row — a folder asks first, since it is many deletions behind one keypress |
+
+Folders open by default, so the panel still shows what the flat list did.
+Nothing starts ticked: a pull overwrites whatever sits at that path locally, so
+the user says which files rather than un-saying it.
+
+Selection lives in the command, not the panel
+(`ListPanelOptions.tree` in `src/dust-pod-list-panel.ts`). It has to: ticking a
+folder ticks files a collapsed row is not showing, and those ticks must survive
+the row list being rebuilt on every expand. So the panel reports intent — toggle,
+expand — and the caller, which owns the tree and the selected-path set, decides
+what it means and hands back new rows. It also follows that Enter cannot resolve
+with "the ticked rows"; the panel's resolution only distinguishes Enter from Esc.
+
+Pulls are sequential rather than concurrent. A folder pull can be hundreds of
+files against a rate-limited API, and the slower loop is the one that finishes.
+Every path is checked with `isPodPathSafe` before it is written — the listing is
+untrusted input, since the agent writes it.
+
 ### The `[DustSkills]` startup section
 
 `src/dust-pod-skills-banner.ts` adds a `[DustSkills]` section under pi's startup

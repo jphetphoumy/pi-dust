@@ -225,4 +225,137 @@ describe("pod list panel", () => {
 
     expect(done).toHaveBeenCalledWith(undefined);
   });
+
+  describe("tree mode", () => {
+    /** `src/` open with one child, then a top-level file. */
+    function treeRows(): ListRow[] {
+      return [
+        { label: "src/", depth: 0, expandable: true, expanded: true, value: "src" },
+        { label: "a.py", depth: 1, value: "src/a.py" },
+        { label: "z.py", depth: 0, value: "z.py" },
+      ];
+    }
+
+    function makeTree(rows: ListRow[] = treeRows()) {
+      const hooks = {
+        toggleSelect: vi.fn(),
+        toggleAll: vi.fn(),
+        setExpanded: vi.fn(),
+      };
+      const done = vi.fn();
+      const panel = new DustPodListPanel(
+        theme,
+        { title: "Files", rows, height: 12, tree: hooks, confirmHint: () => "enter pull 3" },
+        vi.fn(),
+        done,
+      );
+      return { panel, hooks, done };
+    }
+
+    it("indents by depth and shows a twisty only on directories", () => {
+      const { panel } = makeTree();
+      const rendered = rowsOf(panel);
+
+      expect(rendered[0]).toContain("▾ src/");
+      // The child sits one level in, and its twisty column stays blank so names
+      // still line up under the directory.
+      expect(rendered[1]).toMatch(/\[ ] {5}a\.py/);
+      // A top-level file keeps the twisty column but no indent, so it sits two
+      // columns left of the child.
+      expect(rendered[2]).toMatch(/\[ ] {3}z\.py/);
+      expect(rendered[2]).not.toContain("▾");
+      expect(rendered[2]).not.toContain("▸");
+    });
+
+    it("shows a closed twisty for a collapsed directory", () => {
+      const { panel } = makeTree([{ label: "src/", depth: 0, expandable: true, expanded: false }]);
+
+      expect(rowsOf(panel)[0]).toContain("▸ src/");
+    });
+
+    it("marks a partly selected directory apart from a fully selected one", () => {
+      const { panel } = makeTree([
+        { label: "a/", expandable: true, partial: true },
+        { label: "b/", expandable: true, selected: true },
+        { label: "c/", expandable: true },
+      ]);
+      const rendered = rowsOf(panel);
+
+      expect(rendered[0]).toContain("[~]");
+      expect(rendered[1]).toContain("[x]");
+      expect(rendered[2]).toContain("[ ]");
+    });
+
+    it("asks the caller to expand and collapse, rather than deciding itself", () => {
+      // The caller owns the tree — the rows it hands back are the answer.
+      const { panel, hooks } = makeTree();
+
+      panel.handleInput("\x1b[D");
+      expect(hooks.setExpanded).toHaveBeenCalledWith(expect.objectContaining({ label: "src/" }), false);
+
+      // → on an already-open directory has nothing to ask for; it is the
+      // closed one that opens.
+      panel.handleInput("\x1b[C");
+      expect(hooks.setExpanded).toHaveBeenCalledTimes(1);
+
+      const closed = makeTree([{ label: "src/", depth: 0, expandable: true, expanded: false }]);
+      closed.panel.handleInput("\x1b[C");
+      expect(closed.hooks.setExpanded).toHaveBeenCalledWith(expect.objectContaining({ label: "src/" }), true);
+    });
+
+    it("ignores expand keys on a file row", () => {
+      const { panel, hooks } = makeTree();
+      panel.handleInput("\x1b[B");
+      panel.handleInput("\x1b[B");
+
+      panel.handleInput("\x1b[C");
+
+      expect(hooks.setExpanded).not.toHaveBeenCalled();
+    });
+
+    it("steps out to the parent when there is nothing left to collapse", () => {
+      const { panel } = makeTree();
+      panel.handleInput("\x1b[B");
+
+      panel.handleInput("\x1b[D");
+
+      expect(rowsOf(panel)[0]).toContain("› ");
+    });
+
+    it("routes space and `a` to the caller, since collapsed files are not rows", () => {
+      const { panel, hooks } = makeTree();
+
+      panel.handleInput(" ");
+      expect(hooks.toggleSelect).toHaveBeenCalledWith(expect.objectContaining({ label: "src/" }));
+
+      panel.handleInput("a");
+      expect(hooks.toggleAll).toHaveBeenCalled();
+    });
+
+    it("does not tick the row itself, so a stale mark cannot outlive the model", () => {
+      const { panel, hooks } = makeTree();
+      hooks.toggleSelect.mockImplementation(() => {});
+
+      panel.handleInput(" ");
+
+      expect(rowsOf(panel)[0]).toContain("[ ]");
+    });
+
+    it("takes the enter hint from the caller, which knows the real count", () => {
+      const { panel } = makeTree();
+
+      expect(panel.render(120).join("\n")).toContain("enter pull 3");
+    });
+
+    it("resolves on enter and on escape differently, so the caller can tell them apart", () => {
+      const { panel, done } = makeTree();
+
+      panel.handleInput("\r");
+      expect(done).toHaveBeenCalledWith([]);
+
+      const second = makeTree();
+      second.panel.handleInput("\x1b");
+      expect(second.done).toHaveBeenCalledWith(undefined);
+    });
+  });
 });

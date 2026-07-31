@@ -20,8 +20,34 @@ export interface ListRow {
   detail?: string;
   /** Ticked in select mode. Ignored otherwise. */
   selected?: boolean;
+  /** Some but not all of this row's contents are ticked. Tree mode only. */
+  partial?: boolean;
+  /** Indent level. Tree mode only. */
+  depth?: number;
+  /** This row has contents to open, i.e. it is a directory. Tree mode only. */
+  expandable?: boolean;
+  /** Whether those contents are currently listed below it. Tree mode only. */
+  expanded?: boolean;
   /** Free-form payload for the caller's action handlers. */
   value?: unknown;
+}
+
+/**
+ * Hooks for a list whose rows come from a tree the caller owns.
+ *
+ * The panel cannot maintain the selection itself once rows nest: ticking a
+ * directory has to tick files that a collapsed row is not even showing, and
+ * those files must survive the row list being rebuilt on every expand. So in
+ * tree mode the panel reports intent and the caller — which holds the tree and
+ * the selected-path set — decides what it means and calls `setRows`.
+ */
+export interface ListTreeHooks {
+  /** Space on a row: tick or untick it and everything under it. */
+  toggleSelect: (row: ListRow) => void;
+  /** `a`: tick everything, or clear it all when everything is already ticked. */
+  toggleAll: () => void;
+  /** →/← on a directory row. */
+  setExpanded: (row: ListRow, expanded: boolean) => void;
 }
 
 /** A key the panel offers on the focused row, shown in the hint line. */
@@ -40,6 +66,16 @@ export interface ListPanelOptions {
   height: number;
   /** Space toggles rows and Enter resolves with the ticked ones. */
   selectable?: boolean;
+  /**
+   * Turns the list into a tree. Implies `selectable`, and hands selection and
+   * expansion back to the caller — so Enter resolves with the *visible* ticked
+   * rows only, and a tree caller should read its own selection set instead,
+   * using the resolved value solely to tell Enter (an array) from Esc
+   * (`undefined`).
+   */
+  tree?: ListTreeHooks;
+  /** Tree mode's Enter hint, e.g. `enter pull 12`. Re-read on every render. */
+  confirmHint?: () => string;
   actions?: ListAction[];
   /** Shown in place of the list when there is nothing to show. */
   emptyMessage?: string;
@@ -115,14 +151,38 @@ export class DustPodListPanel implements Component {
       return;
     }
 
-    if (this.options.selectable) {
+    const tree = this.options.tree;
+    if (tree) {
+      const row = this.rows[this.focus];
+      if (matchesKey(data, "right")) {
+        if (row?.expandable && !row.expanded) tree.setExpanded(row, true);
+        return;
+      }
+      if (matchesKey(data, "left")) {
+        // Collapse where there is something to collapse, otherwise step out to
+        // the parent — the same two meanings ← has in every other file tree.
+        if (row?.expandable && row.expanded) tree.setExpanded(row, false);
+        else this.focusParentOf(this.focus);
+        return;
+      }
+    }
+
+    if (this.options.selectable || tree) {
       if (data === " ") {
         const row = this.rows[this.focus];
-        if (row) row.selected = !row.selected;
-        this.requestRender();
+        if (!row) return;
+        if (tree) tree.toggleSelect(row);
+        else {
+          row.selected = !row.selected;
+          this.requestRender();
+        }
         return;
       }
       if (data === "a") {
+        if (tree) {
+          tree.toggleAll();
+          return;
+        }
         // Toggle against "everything already ticked", so `a` reads as
         // select-all first and clear-all once nothing is left to add.
         const target = !this.rows.every((row) => row.selected);
@@ -143,14 +203,36 @@ export class DustPodListPanel implements Component {
     }
   }
 
+  /** Moves the cursor to the nearest row above that is one level shallower. */
+  private focusParentOf(index: number): void {
+    const depth = this.rows[index]?.depth ?? 0;
+    if (depth === 0) return;
+    for (let i = index - 1; i >= 0; i--) {
+      if ((this.rows[i]?.depth ?? 0) < depth) {
+        this.focus = i;
+        break;
+      }
+    }
+    this.requestRender();
+  }
+
   private renderRow(row: ListRow, index: number, width: number): string {
     const th = this.theme;
     const focused = index === this.focus;
-    const marker = this.options.selectable ? (row.selected ? "[x] " : "[ ] ") : "";
+    const ticked = this.options.selectable || this.options.tree
+      ? row.partial
+        ? "[~] "
+        : row.selected
+          ? "[x] "
+          : "[ ] "
+      : "";
+    // A fixed-width twisty, so file names still line up under their directory.
+    const twisty = this.options.tree ? (row.expandable ? (row.expanded ? "▾ " : "▸ ") : "  ") : "";
+    const indent = "  ".repeat(row.depth ?? 0);
     const pointer = focused ? "› " : "  ";
     const detail = row.detail ? ` ${th.fg("dim", row.detail)}` : "";
     const label = focused ? th.fg("accent", row.label) : row.label;
-    return truncate(`  ${pointer}${marker}${label}${detail}`, width);
+    return truncate(`  ${pointer}${ticked}${indent}${twisty}${label}${detail}`, width);
   }
 
   render(width: number): string[] {
@@ -189,7 +271,11 @@ export class DustPodListPanel implements Component {
   private renderHint(): string {
     const th = this.theme;
     const parts: string[] = ["↑/↓ move"];
-    if (this.options.selectable) {
+    if (this.options.tree) {
+      // The ticked count cannot be read off the rows here — a collapsed
+      // directory hides ticked files — so the caller states it.
+      parts.push("→/← open/close", "space toggle", "a all/none", this.options.confirmHint?.() ?? "enter confirm");
+    } else if (this.options.selectable) {
       const ticked = this.rows.filter((row) => row.selected).length;
       parts.push("space toggle", "a all/none", `enter upload ${ticked}`);
     }

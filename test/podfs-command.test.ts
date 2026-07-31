@@ -31,6 +31,8 @@ describe("/podfs and /pods", () => {
   let opened: OpenedPanel | null;
   /** What openListPanel resolves with: rows, undefined (esc) or null (no panel). */
   let panelResult: ListRow[] | undefined | null;
+  /** Runs against the live panel options before it resolves. */
+  let interact: ((options: Omit<ListPanelOptions, "height">) => void | Promise<void>) | null;
 
   function ctx() {
     return {
@@ -54,6 +56,7 @@ describe("/podfs and /pods", () => {
     confirmAnswer = true;
     opened = null;
     panelResult = undefined;
+    interact = null;
 
     runtime = new DustSessionRuntime();
     runtime.extensionContext = { cwd: root } as never;
@@ -72,6 +75,9 @@ describe("/podfs and /pods", () => {
       } satisfies OpenedPanel;
       opened = panel;
       onPanel?.(panel as never);
+      // Stands in for the user driving the panel before it closes — the tree's
+      // selection only exists while it is open.
+      await interact?.(options);
       return panelResult;
     });
   });
@@ -111,6 +117,164 @@ describe("/podfs and /pods", () => {
       expect(opened?.options.rows.map((row) => row.label)).toEqual(["a.py", "z.py"]);
       expect(opened?.options.rows[0].detail).toBe("512 B");
       expect(opened?.options.rows[1].detail).toBe("2.0 kB");
+    });
+
+    it("shows folders as rows, open, with their file count and total size", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        podFile("src/a.py", 100),
+        podFile("src/lib/b.py", 20),
+        podFile("README.md", 5),
+      ]);
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      // Directories first, opened by default, so the panel still shows every
+      // file the flat list used to.
+      expect(opened?.options.rows.map((row) => row.label)).toEqual([
+        "src/",
+        "lib/",
+        "b.py",
+        "a.py",
+        "README.md",
+      ]);
+      // Sizes and counts roll up from every descendant, so a collapsed folder
+      // still says how much pulling it would cost.
+      expect(opened?.options.rows[0].detail).toBe("2 files, 120 B");
+      expect(opened?.options.rows[0].expandable).toBe(true);
+      expect(opened?.options.rows[0].expanded).toBe(true);
+      expect(opened?.options.rows[1].detail).toBe("1 file, 20 B");
+      expect(opened?.options.rows[2].depth).toBe(2);
+      expect(opened?.options.rows[4].expandable).toBe(false);
+    });
+
+    it("hides a folder's contents once it is collapsed", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py"), podFile("z.py")]);
+      let after: ListRow[] = [];
+      interact = (options) => {
+        options.tree!.setExpanded(options.rows[0], false);
+        after = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
+      };
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(after.map((row) => row.label)).toEqual(["src/", "z.py"]);
+      expect(after[0].expanded).toBe(false);
+    });
+
+    it("pulls a whole folder from one keypress", async () => {
+      // The point of the tree: `p` on `src/` used to be impossible — a folder
+      // was not a row, so each file had to be pulled on its own.
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        podFile("src/a.py"),
+        podFile("src/lib/b.py"),
+        podFile("other.py"),
+      ]);
+      vi.spyOn(podApi, "downloadPodFile").mockResolvedValue(Buffer.from("x = 1"));
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("p").run(opened!.options.rows[0], 0);
+
+      expect(readFileSync(join(root, "src/a.py"), "utf8")).toBe("x = 1");
+      expect(readFileSync(join(root, "src/lib/b.py"), "utf8")).toBe("x = 1");
+      expect(existsSync(join(root, "other.py"))).toBe(false);
+    });
+
+    it("pulls everything ticked when the panel is confirmed", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        podFile("src/a.py"),
+        podFile("src/lib/b.py"),
+        podFile("z.py"),
+      ]);
+      vi.spyOn(podApi, "downloadPodFile").mockResolvedValue(Buffer.from("x = 1"));
+      panelResult = [];
+      interact = (options) => {
+        // Tick `src/`, then untick the one file inside it that is not wanted.
+        // Rows are src/, lib/, lib/b.py, src/a.py, z.py.
+        options.tree!.toggleSelect(options.rows[0]);
+        const rows = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
+        options.tree!.toggleSelect(rows[3]);
+      };
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(readFileSync(join(root, "src/lib/b.py"), "utf8")).toBe("x = 1");
+      expect(existsSync(join(root, "src/a.py"))).toBe(false);
+      expect(existsSync(join(root, "z.py"))).toBe(false);
+      expect(messages().join(" ")).toContain("Pulled 1 file");
+    });
+
+    it("marks a folder as partly selected once a file under it is unticked", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py"), podFile("src/b.py")]);
+      let rows: ListRow[] = [];
+      interact = (options) => {
+        options.tree!.toggleSelect(options.rows[0]);
+        rows = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
+        expect(rows[0].selected).toBe(true);
+        options.tree!.toggleSelect(rows[1]);
+        rows = opened!.setRows.mock.calls.at(-1)![0] as ListRow[];
+      };
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(rows[0].selected).toBe(false);
+      expect(rows[0].partial).toBe(true);
+    });
+
+    it("pulls nothing when the panel was escaped, however much was ticked", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("a.py")]);
+      const download = vi.spyOn(podApi, "downloadPodFile");
+      panelResult = undefined;
+      interact = (options) => options.tree!.toggleAll();
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(download).not.toHaveBeenCalled();
+    });
+
+    it("refuses to pull a ticked pod path that would escape the project root", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("../evil.txt")]);
+      const download = vi.spyOn(podApi, "downloadPodFile");
+      panelResult = [];
+      interact = (options) => options.tree!.toggleAll();
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(download).not.toHaveBeenCalled();
+      expect(existsSync(join(root, "..", "evil.txt"))).toBe(false);
+      expect(messages().join(" ")).toContain("escapes the project root");
+    });
+
+    it("deletes a folder's files behind a confirmation", async () => {
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        seen: { "src/a.py": { podMs: 1, hash: "h" }, "z.py": { podMs: 1, hash: "h" } },
+      });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        podFile("src/a.py"),
+        podFile("src/lib/b.py"),
+        podFile("z.py"),
+      ]);
+      const del = vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("d").run(opened!.options.rows[0], 0);
+
+      expect(del.mock.calls.map((call) => call[2]).sort()).toEqual(["src/a.py", "src/lib/b.py"]);
+      // The watermarks go too, or the next push would restore what was deleted.
+      expect(Object.keys(getPodBinding(root)?.seen ?? {})).toEqual(["z.py"]);
+    });
+
+    it("keeps a folder when the confirmation is declined", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py")]);
+      const del = vi.spyOn(podApi, "deletePodFile");
+      confirmAnswer = false;
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("d").run(opened!.options.rows[0], 0);
+
+      expect(del).not.toHaveBeenCalled();
+      expect(messages().join(" ")).toContain("Kept src/");
     });
 
     it("tells the user to ingest first when nothing is bound", async () => {
@@ -156,7 +320,9 @@ describe("/podfs and /pods", () => {
       await register(registerDustPodFsCommand)("", ctx());
       await action("p").run(opened!.options.rows[0], 0);
 
-      expect(opened?.setBusy.mock.calls.map((call) => call[0]).join(" ")).toContain("Pull failed: HTTP 500");
+      const busy = opened?.setBusy.mock.calls.map((call) => call[0]).join(" ");
+      expect(busy).toContain("Pulled 0 files");
+      expect(busy).toContain("a.py: HTTP 500");
     });
 
     it("deletes a file and forgets its watermark, so the next push cannot restore it", async () => {
