@@ -141,6 +141,67 @@ const CLASSIFICATION_ACTIONS: Partial<Record<string, (message: StreamingMessage,
   closing_delimiter: (message) => message.endBlock(),
 };
 
+/** Routes one `generation_tokens` batch to the block its classification names. */
+function applyGenerationTokens(message: StreamingMessage, event: unknown): void {
+  const classification = isRecord(event) && typeof event.classification === "string" ? event.classification : "";
+  const delta = isRecord(event) && typeof event.text === "string" ? event.text : "";
+  const applyClassification = CLASSIFICATION_ACTIONS[classification];
+  if (!applyClassification) {
+    // Covers a malformed frame (`classification` missing) and any new value
+    // Dust adds later. This is the single dispatch point for all agent output,
+    // so silently ignoring it would drop text from the transcript with nothing
+    // in the logs to show it.
+    debugLog("dust:stream", "Ignored generation_tokens classification", { classification });
+    return;
+  }
+  applyClassification(message, delta);
+}
+
+/**
+ * Records a tool call in the debug log and nowhere else.
+ *
+ * Client-side tool calls render as their own transcript entry (see
+ * dust-tool-render.ts), using pi's native renderers. Adding a "[Tool: x]" line
+ * here as well would duplicate that, and it would also land inside the
+ * assistant message text.
+ */
+function logToolParams(event: unknown): void {
+  const action = isRecord(event) && isRecord(event.action) ? event.action : undefined;
+  const toolName = getOptionalStringField(action ?? {}, "toolName")
+    ?? getOptionalStringField(action ?? {}, "functionCallName")
+    ?? "tool";
+  debugLog("dust:stream", "Tool params received", { toolName });
+}
+
+/** What `resolveToolApproval` needs from the turn to settle one approval. */
+interface ToolApprovalDeps {
+  handleToolApproveExecution: (event: ToolApproveExecutionEvent) => Promise<boolean>;
+  postValidateAction: (conversationId: string, messageId: string, actionId: string, approved: boolean) => Promise<void>;
+  recordPreApproval: (actionId: string, approved: boolean) => void;
+  resolveApprovalGate: () => void;
+}
+
+/**
+ * Puts one tool call to the user and reports the verdict back to Dust.
+ *
+ * Deliberately does not touch the read loop: the caller reconnects afterwards,
+ * because Dust only resumes the stream once the verdict is posted.
+ */
+async function resolveToolApproval(event: unknown, deps: ToolApprovalDeps): Promise<void> {
+  const approveEvent = parseToolApproveExecutionEvent(event);
+  debugLog("dust:stream", "Handling tool approval request", approveEvent);
+  const approved = await deps.handleToolApproveExecution(approveEvent);
+  await deps.postValidateAction(
+    approveEvent.conversationId,
+    approveEvent.messageId,
+    approveEvent.actionId,
+    approved,
+  );
+  deps.recordPreApproval(approveEvent.actionId, approved);
+  deps.resolveApprovalGate();
+  debugLog("dust:stream", "Tool approval resolved", { approved, actionId: approveEvent.actionId });
+}
+
 function createStreamingMessage(stream: PiEventStream, model: DustModel): StreamingMessage {
   const partial = makeEmptyMessage(model);
   let started = false;
@@ -503,49 +564,20 @@ export async function streamEvents({
               // event type we don't handle fell off the end of the chain and was
               // dropped without a trace.
               switch (eventType) {
-                case "generation_tokens": {
-                  const classification = isRecord(event) && typeof event.classification === "string"
-                    ? event.classification
-                    : "";
-                  const delta = isRecord(event) && typeof event.text === "string" ? event.text : "";
-                  const applyClassification = CLASSIFICATION_ACTIONS[classification];
-                  if (applyClassification) {
-                    applyClassification(message, delta);
-                  } else {
-                    // Covers a malformed frame (`classification` missing) and any
-                    // new value Dust adds later. This is the single dispatch point
-                    // for all agent output, so silently ignoring it would drop text
-                    // from the transcript with nothing in the logs to show it.
-                    debugLog("dust:stream", "Ignored generation_tokens classification", { classification });
-                  }
+                case "generation_tokens":
+                  applyGenerationTokens(message, event);
                   break;
-                }
-                case "tool_params": {
-                  // Client-side tool calls render as their own transcript entry
-                  // (see dust-tool-render.ts), using pi's native renderers. Adding
-                  // a "[Tool: x]" line here as well would duplicate that, and it
-                  // would also land inside the assistant message text.
-                  const action = isRecord(event) && isRecord(event.action) ? event.action : undefined;
-                  const toolName = getOptionalStringField(action ?? {}, "toolName")
-                    ?? getOptionalStringField(action ?? {}, "functionCallName")
-                    ?? "tool";
-                  debugLog("dust:stream", "Tool params received", { toolName });
+                case "tool_params":
+                  logToolParams(event);
                   break;
-                }
                 case "tool_approve_execution": {
-                  const approveEvent = parseToolApproveExecutionEvent(event);
-                  debugLog("dust:stream", "Handling tool approval request", approveEvent);
-                  const approved = await handleToolApproveExecution(approveEvent);
-                  await postValidateAction(
-                    approveEvent.conversationId,
-                    approveEvent.messageId,
-                    approveEvent.actionId,
-                    approved,
-                  );
-                  recordPreApproval(approveEvent.actionId, approved);
-                  resolveApprovalGate();
+                  await resolveToolApproval(event, {
+                    handleToolApproveExecution,
+                    postValidateAction,
+                    recordPreApproval,
+                    resolveApprovalGate,
+                  });
                   shouldReconnect = true;
-                  debugLog("dust:stream", "Tool approval resolved", { approved, actionId: approveEvent.actionId });
                   // Labelled, so it leaves the read loop and not just this switch.
                   break outer;
                 }
