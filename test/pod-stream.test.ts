@@ -133,6 +133,22 @@ describe("pod mode in the Dust stream", () => {
     expect(agentsMdContent).toContain("Do NOT use `pi_dust_extension__read`");
   });
 
+  it("tells the agent that bash-created files arrive in the pod, and how directories appear", async () => {
+    // Two things the agent cannot infer from the tool list. Without the first
+    // it treats a scaffolder's output as lost and redoes the work with billed
+    // writes; without the second it looks for an empty `myrole/templates/` the
+    // pod cannot represent, since the pod stores files and not a tree.
+    vi.spyOn(podSync, "syncPod").mockResolvedValue(emptyReport());
+    const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
+    bindPod();
+    vi.stubGlobal("fetch", makeTurnFetchMock());
+
+    await drain(streamSimple);
+
+    expect(agentsMdContent).toContain("Files a command creates appear in the pod");
+    expect(agentsMdContent).toContain("Directories exist only through their files");
+  });
+
   it("keeps the local-tools guidance when no pod is bound", async () => {
     const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
     const fetchMock = makeTurnFetchMock();
@@ -182,6 +198,8 @@ describe("pod mode in the Dust stream", () => {
    */
   async function runTurnWithBash(
     onSync: (root: string, bound: { seen: Record<string, { podMs: number; hash: string }> }) => void,
+    toolResult?: { content: Array<{ type: "text"; text: string }>; isError: boolean },
+    toolName = "bash",
   ): Promise<string[]> {
     const trace: string[] = [];
     vi.spyOn(podSync, "syncPod").mockImplementation(async (_api, root, bound, options) => {
@@ -191,7 +209,7 @@ describe("pod mode in the Dust stream", () => {
     });
     vi.spyOn(tools, "executeMcpTool").mockImplementation(async (name) => {
       trace.push(`exec:${name}`);
-      return { content: [{ type: "text" as const, text: "ok" }], isError: false };
+      return toolResult ?? { content: [{ type: "text" as const, text: "ok" }], isError: false };
     });
 
     const streamSimple = await makeStreamSimpleFn(makeCredentials({ agents: [] }));
@@ -202,7 +220,7 @@ describe("pod mode in the Dust stream", () => {
       jsonrpc: "2.0",
       id: "tc-pod-1",
       method: "tools/call",
-      params: { name: "bash", arguments: { command: "echo hi" } },
+      params: { name: toolName, arguments: { command: "echo hi" } },
     };
 
     let finishTurn: (() => void) | null = null;
@@ -220,7 +238,7 @@ describe("pod mode in the Dust stream", () => {
             messageId: "amsg-1",
             stake: "never_ask",
             inputs: { command: "echo hi" },
-            metadata: { toolName: "bash" },
+            metadata: { toolName },
           },
         })}\n\n`));
         finishTurn = () => {
@@ -275,7 +293,41 @@ describe("pod mode in the Dust stream", () => {
     // against the pre-edit file, and is told its own fix failed.
     const trace = await runTurnWithBash(() => {});
 
-    expect(trace).toEqual(["push", "pull", "exec:bash", "pull"]);
+    expect(trace).toEqual(["push", "pull", "exec:bash", "push", "pull"]);
+  });
+
+  it("pushes what bash created back up, before the agent is told the command finished", async () => {
+    // The mirror of the pre-bash pull. A scaffolder — `ansible-galaxy role
+    // init myrole`, `npm init`, a codegen step — leaves files the pod has
+    // never seen. Without this push they stay invisible until the *next*
+    // turn's pre-turn push, so the agent's very next `files__list` comes back
+    // empty and it concludes the command did nothing.
+    //
+    // The ordering is the assertion: the push has to land before the tool
+    // result, or the agent can act on a pod that is missing the new files.
+    const trace = await runTurnWithBash(() => {});
+
+    expect(trace.slice(trace.indexOf("exec:bash"))).toEqual(["exec:bash", "push", "pull"]);
+  });
+
+  it("pushes after a bash that failed, since a half-finished command still wrote files", async () => {
+    // `ansible-galaxy init` that dies partway, a build that fails after
+    // emitting sources: the exit code says nothing about whether the tree
+    // changed, so the sync cannot be conditional on success.
+    const trace = await runTurnWithBash(() => {}, {
+      content: [{ type: "text" as const, text: "boom" }],
+      isError: true,
+    });
+
+    expect(trace).toEqual(["push", "pull", "exec:bash", "push", "pull"]);
+  });
+
+  it("leaves non-bash tool calls unsynced, since they do not touch the tree", async () => {
+    // `read`/`edit` go through the pod already; syncing around them would walk
+    // the whole tree for nothing on every call.
+    const trace = await runTurnWithBash(() => {}, undefined, "read");
+
+    expect(trace).toEqual(["push", "exec:read", "pull"]);
   });
 
   it("re-reads the binding at each sync point, so a mid-turn pull's watermark is not lost", async () => {
@@ -292,11 +344,12 @@ describe("pod mode in the Dust stream", () => {
       savePodBinding(root, bound as never);
     });
 
-    expect(seenByCall).toHaveLength(3);
+    expect(seenByCall).toHaveLength(4);
     expect(seenByCall[0]).toEqual([]);
     expect(seenByCall[1]).toEqual(["f1.py"]);
     // Each pass must see every watermark its predecessors persisted.
     expect(seenByCall[2]).toEqual(["f1.py", "f2.py"]);
+    expect(seenByCall[3]).toEqual(["f1.py", "f2.py", "f3.py"]);
   });
 
   it("still answers the turn when a pod sync fails", async () => {

@@ -91,7 +91,11 @@ function buildToolGuidance(cwd: string): string {
  *
  * `bash` stays local — it is the one thing the pod sandbox cannot do, since the
  * user's toolchain, dependencies and environment live on their machine. We sync
- * the tree down before each bash call so it sees the agent's edits.
+ * the tree down before each bash call so it sees the agent's edits, and back up
+ * afterwards so anything the command wrote is in the pod before the agent reads
+ * it. Both halves are stated here because the agent cannot infer them: told
+ * nothing, it treats a scaffolder's output as lost and redoes the work with the
+ * billed write tool.
  */
 function buildPodToolGuidance(cwd: string, podId: string): string {
   return [
@@ -103,6 +107,10 @@ function buildPodToolGuidance(cwd: string, podId: string): string {
     "  Edits there are synced back to the user's machine automatically.",
     `- Use \`${MCP_TOOL_PREFIX}__bash\` ONLY to run commands (tests, builds, git). It executes on the`,
     "  user's real machine and already sees your `files__*` edits.",
+    "- Files a command creates appear in the pod as soon as it finishes — a scaffolder like",
+    "  `ansible-galaxy role init` is yours to read and edit with `files__*` straight away.",
+    "- Directories exist only through their files: create a file at the path you want and the",
+    "  directory follows. An empty one cannot be represented and will not show up.",
     `- Do NOT use \`${MCP_TOOL_PREFIX}__read\`, \`${MCP_TOOL_PREFIX}__write\` or \`${MCP_TOOL_PREFIX}__edit\`:`,
     "  they cost the user credits that the `files__*` tools do not.",
   ].join("\n");
@@ -292,9 +300,16 @@ async function ensureMcpServer(
       // stale until the post-turn pull. A command run mid-turn — `pytest`, a
       // build — would then execute against the old code and report a failure
       // the agent has already fixed. Pull first so bash sees current files.
-      if (name === "bash") {
-        const cwd = (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd();
-        await syncPodQuietly(runtime, cwd, { push: false, pull: true }, "before bash");
+      //
+      // Only bash gets bracketed this way: it is the one tool that runs on the
+      // real machine and can move the tree behind the pod's back. `read`/`edit`
+      // already go through the pod, and syncing around them would walk the
+      // whole tree for nothing on every call.
+      const bashCwd = name === "bash"
+        ? (runtime.extensionContext as { cwd?: string } | null)?.cwd ?? process.cwd()
+        : null;
+      if (bashCwd) {
+        await syncPodQuietly(runtime, bashCwd, { push: false, pull: true }, "before bash");
       }
       const startedAt = Date.now();
       const result = await executeMcpTool(
@@ -303,6 +318,21 @@ async function ensureMcpServer(
         runtime.extensionContext as never,
         runtime.activeTurn?.toolAbortController.signal,
       );
+      // The other half of the same problem. A command that *writes* — a
+      // scaffolder like `ansible-galaxy role init myrole`, a codegen step,
+      // `npm init` — leaves files the pod has never seen. Without a push here
+      // they stay invisible until the next turn's pre-turn push, so the agent's
+      // very next `files__list` comes back empty and it concludes the command
+      // did nothing.
+      //
+      // Pushing before the result is returned is what makes the ordering hold:
+      // the agent only learns the command finished once the pod already holds
+      // everything the command produced. It runs regardless of exit status —
+      // a build that fails after emitting sources still changed the tree, so
+      // the exit code says nothing about whether there is anything to sync.
+      if (bashCwd) {
+        await syncPodQuietly(runtime, bashCwd, { push: true, pull: false }, "after bash");
+      }
       // Dust tool calls bypass pi's tool pipeline, so nothing would appear in
       // the transcript. Record the call so it renders like a native one.
       if (runtime.pi) {

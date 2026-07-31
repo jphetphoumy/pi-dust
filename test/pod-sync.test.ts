@@ -248,6 +248,43 @@ describe("pod sync", () => {
     expect(bound.seen["brand-new.py"]).toBeDefined();
   });
 
+  it("picks up a whole tree a scaffolder dropped in, not just loose files", async () => {
+    // The workflow this exists for: the agent runs `ansible-galaxy role init
+    // myrole` through bash, which writes eight files across six directories
+    // none of which the pod has ever heard of. The post-bash push has to carry
+    // the lot, or the agent's next `files__list` shows an empty pod and it
+    // concludes the scaffolder failed.
+    const pod = makeFakePod({ "playbook.yml": { content: "- hosts: all", ms: 100 } });
+    const bound = binding({ "playbook.yml": { podMs: 100, hash: hash("- hosts: all") } });
+    for (const rel of [
+      "myrole/README.md",
+      "myrole/defaults/main.yml",
+      "myrole/handlers/main.yml",
+      "myrole/meta/main.yml",
+      "myrole/tasks/main.yml",
+      "myrole/tests/inventory",
+      "myrole/tests/test.yml",
+      "myrole/vars/main.yml",
+    ]) writeLocal(rel, `# ${rel}\n`);
+
+    const report = await syncPod(pod.api, root, bound, { push: true, pull: false });
+
+    expect(report.pushed).toEqual([
+      "myrole/README.md",
+      "myrole/defaults/main.yml",
+      "myrole/handlers/main.yml",
+      "myrole/meta/main.yml",
+      "myrole/tasks/main.yml",
+      "myrole/tests/inventory",
+      "myrole/tests/test.yml",
+      "myrole/vars/main.yml",
+    ]);
+    expect(pod.files.get("myrole/tasks/main.yml")?.content).toBe("# myrole/tasks/main.yml\n");
+    // The file that was already in step is left alone — a scaffolder run must
+    // not turn into a re-upload of the whole project.
+    expect(pod.uploads).not.toContain("playbook.yml");
+  });
+
   it("re-applies the ingest pathspecs, rather than sweeping up the whole tree", async () => {
     // `/ingest src` is a deliberate narrowing. Discovering new files must not
     // quietly widen it to everything the user left out.
