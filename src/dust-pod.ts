@@ -45,6 +45,38 @@ export interface PodApi {
   getAuthHeaders: () => Record<string, string>;
   /** Single-flight refresh shared with the rest of the session; see `DustSessionRuntime`. */
   refreshAuth?: () => Promise<boolean>;
+  /** Injectable delay, so the 429 backoff does not make tests wait in real time. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * How often a rate-limited request is retried before giving up.
+ *
+ * Dust limits the upload-reserve step to 40 per 60 seconds per workspace, as a
+ * sliding window. Four retries at the backoff below spans well over a minute,
+ * which is the whole window — so anything still refused after that is not a
+ * burst we can wait out, and reporting it beats hanging the sync.
+ */
+const RATE_LIMIT_RETRIES = 4;
+const RATE_LIMIT_BACKOFF_MS = [1_000, 4_000, 15_000, 30_000];
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * How long to wait before retrying a 429.
+ *
+ * `Retry-After` is preferred wherever the server sends one: it knows when its
+ * window frees up and we are guessing. The header is defined as either seconds
+ * or an HTTP date; only the seconds form is handled, since that is what Dust
+ * sends, and an unparseable value falls back to the schedule.
+ */
+function retryDelayMs(res: { headers?: { get?: (name: string) => string | null } }, attempt: number): number {
+  const header = res.headers?.get?.("retry-after");
+  const seconds = header == null ? Number.NaN : Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  return RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
 }
 
 /** Strips the canonical `pod-{id}/` prefix a listing reports down to a plain relative path. */
@@ -54,10 +86,17 @@ export function toRelativePath(podId: string, canonicalPath: string): string {
 }
 
 /**
- * Issues a private-API request, refreshing once on 401.
+ * Issues a private-API request, refreshing once on 401 and waiting out a 429.
  *
- * Ingesting a large tree is many sequential requests and can outlive the
- * ~15 minute access token, so the retry is not theoretical.
+ * Ingesting a large tree is many requests and can outlive the ~15 minute access
+ * token, so the 401 retry is not theoretical.
+ *
+ * The 429 retry matters because Dust rate-limits the upload-reserve step to 40
+ * per 60 seconds per workspace. Uploading concurrently makes meeting that limit
+ * the norm rather than the exception, and without this the error would surface
+ * as a per-file `skipped` — which reads as a permanent rejection by the pod,
+ * when waiting a second would have worked. Retrying here rather than in the
+ * sync loop covers every limited endpoint at once.
  */
 async function request(
   api: PodApi,
@@ -75,7 +114,14 @@ async function request(
       },
     });
 
-  const res = await send();
+  const sleep = api.sleep ?? defaultSleep;
+  let res = await send();
+  for (let attempt = 0; res.status === 429 && attempt < RATE_LIMIT_RETRIES; attempt++) {
+    const delay = retryDelayMs(res, attempt);
+    debugLog("dust:pod", "Rate limited, backing off", { path, attempt: attempt + 1, delay });
+    await sleep(delay);
+    res = await send();
+  }
   if (res.status !== 401) return res;
 
   if (!(await api.refreshAuth?.())) {

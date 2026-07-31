@@ -381,6 +381,47 @@ describe("dust pod API client", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("waits out a 429 and retries, rather than losing the file", async () => {
+    // Dust rate-limits the upload-reserve step to 40/min per workspace
+    // ("Aggressively rate limit file uploads" — front-api routes/w/[wId]/files).
+    // A concurrent ingest of any size will meet it. Without a retry the error
+    // surfaces as a per-file `skipped`, which reads as "the pod rejected this
+    // file" — permanent, when in fact waiting a moment would have worked.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ error: { type: "rate_limit_error" } }, 429))
+      .mockResolvedValueOnce(jsonResponse({ spaces: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pods = await listPods(makeApi());
+
+    expect(pods).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("honours Retry-After on a 429 instead of guessing", async () => {
+    // The server knows when its sliding window frees up; we do not.
+    const sleeps: number[] = [];
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ...jsonResponse({}, 429), headers: new Headers({ "retry-after": "2" }) })
+      .mockResolvedValueOnce(jsonResponse({ spaces: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listPods(makeApi({ sleep: async (ms: number) => void sleeps.push(ms) } as never));
+
+    expect(sleeps).toEqual([2000]);
+  });
+
+  it("gives up on a 429 that never clears, so a sync cannot hang forever", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}, 429));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listPods(makeApi({ sleep: async () => {} } as never)))
+      .rejects.toThrow(/429/);
+    // Bounded: the initial attempt plus a fixed number of retries.
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+  });
+
   it("reports the session as expired when the refresh cannot recover a 401", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}, 401));
     vi.stubGlobal("fetch", fetchMock);
