@@ -3,6 +3,7 @@ import { debugLog } from "./dust-debug.js";
 import type {
   AssistantMessageLike,
   DustModel,
+  PiContentBlock,
   PiEventStream,
   PiStreamEvent,
   ToolApproveExecutionEvent,
@@ -49,6 +50,74 @@ export function makeEmptyMessage(model: DustModel): AssistantMessageLike {
   };
 }
 
+/** What a `generation_tokens` event contributes to, per its `classification`. */
+type BlockKind = PiContentBlock["type"];
+
+/**
+ * The assistant message as it is being written, block by block.
+ *
+ * Dust streams the reasoning trace and the answer over the same
+ * `generation_tokens` event, told apart by `classification`. The two must not
+ * be concatenated: pi renders `thinking` blocks dimmed and separate from the
+ * reply, and only the `text` blocks make up the answer — which is what later
+ * turns quote back to Dust (see `extractMessageText` in dust-stream-provider).
+ */
+interface StreamingMessage {
+  /** Appends to the open block of `kind`, opening one if it is not open yet. */
+  append(kind: BlockKind, delta: string): void;
+  /** Ends whichever block is open, so the next token starts a fresh one. */
+  closeBlock(): void;
+  /** The answer only, with the reasoning left out. */
+  answerText(): string;
+  /** Detached copy of the blocks written so far, for a terminal message. */
+  snapshot(): PiContentBlock[];
+}
+
+function createStreamingMessage(stream: PiEventStream, model: DustModel): StreamingMessage {
+  const partial = makeEmptyMessage(model);
+  let openKind: BlockKind | null = null;
+
+  // pi keeps a reference to whatever `partial` it was last handed, so every
+  // event gets its own copy of the blocks; sharing them would rewrite the
+  // history of the turn in place as later tokens arrive.
+  const detach = (): AssistantMessageLike => ({
+    ...partial,
+    content: partial.content.map((block) => ({ ...block })),
+  });
+
+  return {
+    append(kind, delta) {
+      if (!delta) return;
+      if (openKind !== kind) {
+        partial.content.push(kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
+        openKind = kind;
+        stream.push(kind === "text"
+          ? { type: "text_start", contentIndex: partial.content.length - 1, partial: detach() }
+          : { type: "thinking_start", contentIndex: partial.content.length - 1, partial: detach() });
+      }
+      const contentIndex = partial.content.length - 1;
+      const block = partial.content[contentIndex];
+      if (block.type === "text") {
+        block.text += delta;
+      } else {
+        block.thinking += delta;
+      }
+      stream.push(kind === "text"
+        ? { type: "text_delta", contentIndex, delta, partial: detach() }
+        : { type: "thinking_delta", contentIndex, delta, partial: detach() });
+    },
+    closeBlock() {
+      openKind = null;
+    },
+    answerText() {
+      return partial.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+    },
+    snapshot() {
+      return partial.content.map((block) => ({ ...block }));
+    },
+  };
+}
+
 /**
  * Ends the turn as cancelled, keeping whatever the agent had already written.
  *
@@ -59,17 +128,17 @@ export function makeEmptyMessage(model: DustModel): AssistantMessageLike {
 function finishAborted(
   stream: PiEventStream,
   model: DustModel,
-  fullText: string,
+  content: StreamingMessage,
   resolveApprovalGate: () => void,
 ): void {
   resolveApprovalGate();
   const finalMessage = makeEmptyMessage(model);
-  finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+  finalMessage.content = content.snapshot();
   finalMessage.stopReason = "aborted";
   finalMessage.errorMessage = CANCELLED_MESSAGE;
   stream.push({ type: "error", reason: "aborted", error: finalMessage });
   stream.end();
-  debugLog("dust:stream", "Stream aborted by user", { fullText });
+  debugLog("dust:stream", "Stream aborted by user", { fullText: content.answerText() });
 }
 
 export function createEventStream(): PiEventStream {
@@ -179,8 +248,11 @@ export async function streamEvents({
   onCancelled,
 }: StreamEventsOptions): Promise<void> {
   const baseSseUrl = `${baseUrl}/assistant/conversations/${conversationSId}/messages/${agentMsgSId}/events`;
-  let fullText = "";
-  const partial = makeEmptyMessage(model);
+  const content = createStreamingMessage(stream, model);
+  // pi's agent loop ignores every partial update until a `start` event has
+  // opened the streaming message, so without this nothing renders before the
+  // turn ends — the whole answer lands at once.
+  stream.push({ type: "start", partial: makeEmptyMessage(model) });
   debugLog("dust:stream", "Opening SSE stream", { conversationSId, agentMsgSId, sseUrl: baseSseUrl });
   let reconnectAttempt = 0;
 
@@ -200,7 +272,7 @@ export async function streamEvents({
 
   reconnect: for (;;) {
     if (signal?.aborted) {
-      finishAborted(stream, model, fullText, resolveApprovalGate);
+      finishAborted(stream, model, content, resolveApprovalGate);
       return;
     }
 
@@ -219,7 +291,7 @@ export async function streamEvents({
       });
     } catch (error) {
       if (signal?.aborted) {
-        finishAborted(stream, model, fullText, resolveApprovalGate);
+        finishAborted(stream, model, content, resolveApprovalGate);
         return;
       }
       const delayMs = streamRetryDelay(reconnectAttempt);
@@ -309,16 +381,21 @@ export async function streamEvents({
               debugLog("dust:stream", "Received SSE event", { eventType, event });
 
               if (eventType === "generation_tokens") {
-                if (isRecord(event) && event.classification === "tokens") {
-                  const delta = typeof event.text === "string" ? event.text : "";
-                  fullText += delta;
-                  if (partial.content.length === 0) {
-                    partial.content.push({ type: "text", text: fullText });
-                  } else {
-                    partial.content[0].text = fullText;
-                  }
-                  stream.push({ type: "text_delta", contentIndex: 0, delta, partial: { ...partial } });
+                // Dust classifies each token batch: `tokens` is the answer,
+                // `chain_of_thought` the reasoning behind it, and the two
+                // delimiters are the markup Dust wraps the trace in — those
+                // carry no content of their own, they just end the current
+                // block so the next batch starts a new one.
+                const classification = isRecord(event) ? event.classification : undefined;
+                const delta = isRecord(event) && typeof event.text === "string" ? event.text : "";
+                if (classification === "tokens") {
+                  content.append("text", delta);
                   debugLog("dust:stream", "Forwarded text delta", { delta });
+                } else if (classification === "chain_of_thought") {
+                  content.append("thinking", delta);
+                  debugLog("dust:stream", "Forwarded thinking delta", { delta });
+                } else if (classification === "opening_delimiter" || classification === "closing_delimiter") {
+                  content.closeBlock();
                 }
               } else if (eventType === "tool_params") {
                 // Client-side tool calls render as their own transcript entry
@@ -348,22 +425,22 @@ export async function streamEvents({
               } else if (eventType === "agent_message_success") {
                 resolveApprovalGate();
                 const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                finalMessage.content = content.snapshot();
                 finalMessage.stopReason = "stop";
                 stream.push({ type: "done", reason: "stop", message: finalMessage });
                 stream.end();
-                debugLog("dust:stream", "Stream completed successfully", { fullText });
+                debugLog("dust:stream", "Stream completed successfully", { fullText: content.answerText() });
                 return;
               } else if (eventType === "agent_message_gracefully_stopped") {
                 // Terminal per the Dust SDK's terminalEventTypes; without this
                 // the stream never completes and the turn hangs.
                 resolveApprovalGate();
                 const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+                finalMessage.content = content.snapshot();
                 finalMessage.stopReason = "stop";
                 stream.push({ type: "done", reason: "stop", message: finalMessage });
                 stream.end();
-                debugLog("dust:stream", "Stream gracefully stopped", { fullText });
+                debugLog("dust:stream", "Stream gracefully stopped", { fullText: content.answerText() });
                 return;
               } else if (eventType === "agent_generation_cancelled") {
                 // Dust says the generation was cancelled — by our own cancel
@@ -372,7 +449,7 @@ export async function streamEvents({
                 // clean finish, and the runtime has to hear about it: the local
                 // abort signal never fired on this path.
                 onCancelled();
-                finishAborted(stream, model, fullText, resolveApprovalGate);
+                finishAborted(stream, model, content, resolveApprovalGate);
                 return;
               } else if (eventType === "agent_error") {
                 debugLog("dust:stream", "Received agent error event", event);
@@ -390,7 +467,7 @@ export async function streamEvents({
       // Cancelling the turn aborts the in-flight read; end as cancelled rather
       // than letting the AbortError surface as a stream failure.
       if (signal?.aborted) {
-        finishAborted(stream, model, fullText, resolveApprovalGate);
+        finishAborted(stream, model, content, resolveApprovalGate);
         return;
       }
       throw error;
@@ -428,9 +505,9 @@ export async function streamEvents({
 
   resolveApprovalGate();
   const finalMessage = makeEmptyMessage(model);
-  finalMessage.content = fullText ? [{ type: "text", text: fullText }] : [];
+  finalMessage.content = content.snapshot();
   finalMessage.stopReason = "stop";
   stream.push({ type: "done", reason: "stop", message: finalMessage });
   stream.end();
-  debugLog("dust:stream", "Stream ended after reconnect loop", { fullText });
+  debugLog("dust:stream", "Stream ended after reconnect loop", { fullText: content.answerText() });
 }

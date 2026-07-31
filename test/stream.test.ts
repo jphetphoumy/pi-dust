@@ -249,7 +249,82 @@ describe("dust extension", () => {
       expect(deltas[1].delta).toBe(" world");
     });
 
-    it("discards generation_tokens with classification 'chain_of_thought'", async () => {
+    // pi's agent loop only forwards partial updates once a `start` event has
+    // established the streaming message (see pi-agent-core's agent-loop: every
+    // *_delta is dropped while `partialMessage` is undefined). Without it the
+    // whole turn renders in one go at `done`.
+    it("emits a start event carrying an empty partial before any delta", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "tokens", text: "Hello" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      expect(events[0]).toMatchObject({ type: "start" });
+      expect(events[0].partial.role).toBe("assistant");
+      expect(events[0].partial.content).toEqual([]);
+    });
+
+    it("streams generation_tokens with classification 'chain_of_thought' as thinking deltas", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "chain_of_thought", text: "Let me " },
+        { type: "generation_tokens", classification: "chain_of_thought", text: "check." },
+        { type: "generation_tokens", classification: "tokens", text: "Answer" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      const thinkingDeltas = events.filter((e) => e.type === "thinking_delta");
+      expect(thinkingDeltas.map((e) => e.delta)).toEqual(["Let me ", "check."]);
+      // Each delta carries the reasoning accumulated so far, so the transcript
+      // grows while the agent reasons instead of appearing at the end.
+      expect(thinkingDeltas[0].partial.content[0]).toEqual({ type: "thinking", thinking: "Let me " });
+      expect(thinkingDeltas[1].partial.content[0]).toEqual({ type: "thinking", thinking: "Let me check." });
+
+      const starts = events.filter((e) => e.type === "thinking_start");
+      expect(starts).toHaveLength(1);
+      expect(starts[0].contentIndex).toBe(0);
+      expect(thinkingDeltas.every((e) => e.contentIndex === 0)).toBe(true);
+    });
+
+    it("emits thinking deltas before the answer's text deltas, as they arrive", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "chain_of_thought", text: "reasoning" },
+        { type: "generation_tokens", classification: "tokens", text: "Answer" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      expect(events.map((e) => e.type)).toEqual([
+        "start",
+        "thinking_start",
+        "thinking_delta",
+        "text_start",
+        "text_delta",
+        "done",
+      ]);
+      // The answer keeps its own content block, after the reasoning one.
+      const textDelta = events.find((e) => e.type === "text_delta");
+      expect(textDelta.contentIndex).toBe(1);
+      expect(textDelta.delta).toBe("Answer");
+    });
+
+    it("keeps chain_of_thought out of the final answer text", async () => {
       const model = makeModel();
       const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
         { type: "generation_tokens", classification: "chain_of_thought", text: "thinking..." },
@@ -265,6 +340,77 @@ describe("dust extension", () => {
       const deltas = events.filter((e) => e.type === "text_delta");
       expect(deltas).toHaveLength(1);
       expect(deltas[0].delta).toBe("Answer");
+
+      const done = events.find((e) => e.type === "done");
+      // Reasoning stays in its own `thinking` block; the answer text is clean.
+      expect(done.message.content).toEqual([
+        { type: "thinking", thinking: "thinking..." },
+        { type: "text", text: "Answer" },
+      ]);
+    });
+
+    it("keeps chain_of_thought out of the partial answer text once the answer starts", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "chain_of_thought", text: "thinking..." },
+        { type: "generation_tokens", classification: "tokens", text: "Ans" },
+        { type: "generation_tokens", classification: "tokens", text: "wer" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      const lastTextDelta = events.filter((e) => e.type === "text_delta").at(-1);
+      expect(lastTextDelta.partial.content).toEqual([
+        { type: "thinking", thinking: "thinking..." },
+        { type: "text", text: "Answer" },
+      ]);
+    });
+
+    it("keeps the reasoning trace on a turn the user cancels", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "chain_of_thought", text: "half a thought" },
+        { type: "agent_generation_cancelled" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      const error = events.at(-1);
+      expect(error).toMatchObject({ type: "error", reason: "aborted" });
+      expect(error.error.content).toEqual([{ type: "thinking", thinking: "half a thought" }]);
+    });
+
+    it("renders the delimiters Dust wraps the reasoning in as separate blocks, not as answer text", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "opening_delimiter", text: "<thinking>" },
+        { type: "generation_tokens", classification: "chain_of_thought", text: "step one" },
+        { type: "generation_tokens", classification: "closing_delimiter", text: "</thinking>" },
+        { type: "generation_tokens", classification: "chain_of_thought", text: "step two" },
+        { type: "generation_tokens", classification: "tokens", text: "Answer" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      // Delimiter text is markup around the trace, never content of its own.
+      expect(events.some((e) => typeof e.delta === "string" && e.delta.includes("thinking>"))).toBe(false);
+      const done = events.find((e) => e.type === "done");
+      expect(done.message.content).toEqual([
+        { type: "thinking", thinking: "step one" },
+        { type: "thinking", thinking: "step two" },
+        { type: "text", text: "Answer" },
+      ]);
     });
 
     it("ignores malformed SSE JSON frames and still processes later valid events", async () => {

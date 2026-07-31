@@ -127,10 +127,15 @@ Accept: text/event-stream
 
 ### SSE Event → Pi Stream Mapping
 
+The stream opens with `{ type: "start", partial }`: pi's agent loop drops every
+partial update until that event has established the streaming message, so
+without it the whole turn only renders once, at `done`.
+
 | Dust SSE event | Pi action |
 |---|---|
-| `generation_tokens` where `classification === "tokens"` | Yield `{ type: "text_delta", delta: event.text }` |
-| `generation_tokens` where `classification === "chain_of_thought"` | Discard (not shown) |
+| `generation_tokens` where `classification === "tokens"` | Append to the open `text` block; yield `text_start` (first token of the block) then `text_delta` |
+| `generation_tokens` where `classification === "chain_of_thought"` | Append to the open `thinking` block; yield `thinking_start` then `thinking_delta`, so the reasoning streams live and stays out of the answer text |
+| `generation_tokens` where `classification` is `opening_delimiter` / `closing_delimiter` | Close the open block (the delimiter markup itself is not content) |
 | `agent_message_success` | Yield `{ type: "done", reason: "stop" }` and return |
 | `agent_error` | Throw `event.error.message` (terminal) |
 | `agent_generation_cancelled` | Yield `{ type: "done", reason: "stop" }` and return |

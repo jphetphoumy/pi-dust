@@ -178,9 +178,28 @@ export interface McpRequestLike {
   params?: JsonObject;
 }
 
+/** pi's `TextContent`: the answer the user reads. */
+export interface PiTextBlock {
+  type: "text";
+  text: string;
+}
+
+/**
+ * pi's `ThinkingContent`: the agent's reasoning trace. pi renders these blocks
+ * dimmed and italic (or collapsed behind a label, per the user's setting), and
+ * keeps them out of the answer — which is why the Dust `chain_of_thought`
+ * stream lands here rather than being concatenated into a text block.
+ */
+export interface PiThinkingBlock {
+  type: "thinking";
+  thinking: string;
+}
+
+export type PiContentBlock = PiTextBlock | PiThinkingBlock;
+
 export interface AssistantMessageLike {
   role: "assistant";
-  content: Array<{ type: "text"; text: string }>;
+  content: PiContentBlock[];
   api: string;
   provider: string;
   model: string;
@@ -203,8 +222,37 @@ export interface AssistantMessageLike {
   timestamp: number;
 }
 
+/**
+ * Opens the streaming message. pi's agent loop drops every partial update until
+ * it has seen this event (it has no message to apply them to), so a stream that
+ * never emits it only renders once, at `done`.
+ */
+export interface PiStartEvent {
+  type: "start";
+  partial: AssistantMessageLike;
+}
+
+export interface PiTextStartEvent {
+  type: "text_start";
+  contentIndex: number;
+  partial: AssistantMessageLike;
+}
+
 export interface PiTextDeltaEvent {
   type: "text_delta";
+  contentIndex: number;
+  delta: string;
+  partial: AssistantMessageLike;
+}
+
+export interface PiThinkingStartEvent {
+  type: "thinking_start";
+  contentIndex: number;
+  partial: AssistantMessageLike;
+}
+
+export interface PiThinkingDeltaEvent {
+  type: "thinking_delta";
   contentIndex: number;
   delta: string;
   partial: AssistantMessageLike;
@@ -223,7 +271,14 @@ export interface PiErrorEvent {
   error: AssistantMessageLike;
 }
 
-export type PiStreamEvent = PiTextDeltaEvent | PiDoneEvent | PiErrorEvent;
+export type PiStreamEvent =
+  | PiStartEvent
+  | PiTextStartEvent
+  | PiTextDeltaEvent
+  | PiThinkingStartEvent
+  | PiThinkingDeltaEvent
+  | PiDoneEvent
+  | PiErrorEvent;
 
 export interface PiEventStream {
   push(event: PiStreamEvent): void;
