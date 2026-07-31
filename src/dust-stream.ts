@@ -116,6 +116,31 @@ interface StreamingMessage {
   snapshot(): PiContentBlock[];
 }
 
+function appendDelta(message: StreamingMessage, kind: BlockKind, delta: string): void {
+  message.append(kind, delta);
+  // Only logged when a delta was actually pushed — `append` silently drops an
+  // empty batch, and a line claiming forwarding that didn't happen sends
+  // anyone debugging a missing token the wrong way.
+  if (delta) debugLog("dust:stream", `Forwarded ${kind} delta`, { delta });
+}
+
+/**
+ * What each Dust `generation_tokens` classification does to the message.
+ *
+ * `tokens` is the answer and `chain_of_thought` the reasoning behind it; the
+ * two delimiters are the markup Dust wraps the trace in, so they carry no
+ * content of their own and only end the current block. A table rather than a
+ * chain of string comparisons: every entry has the same shape, so adding a
+ * classification is one row, and the lookup miss below is the single place
+ * that has to describe "we don't know this one".
+ */
+const CLASSIFICATION_ACTIONS: Partial<Record<string, (message: StreamingMessage, delta: string) => void>> = {
+  tokens: (message, delta) => appendDelta(message, "text", delta),
+  chain_of_thought: (message, delta) => appendDelta(message, "thinking", delta),
+  opening_delimiter: (message) => message.endBlock(),
+  closing_delimiter: (message) => message.endBlock(),
+};
+
 function createStreamingMessage(stream: PiEventStream, model: DustModel): StreamingMessage {
   const partial = makeEmptyMessage(model);
   let started = false;
@@ -471,86 +496,94 @@ export async function streamEvents({
               if (!eventType) continue;
               debugLog("dust:stream", "Received SSE event", { eventType, event });
 
-              if (eventType === "generation_tokens") {
-                // Dust classifies each token batch: `tokens` is the answer,
-                // `chain_of_thought` the reasoning behind it, and the two
-                // delimiters are the markup Dust wraps the trace in — those
-                // carry no content of their own, they just end the current
-                // block so the next batch starts a new one.
-                const classification = isRecord(event) ? event.classification : undefined;
-                const delta = isRecord(event) && typeof event.text === "string" ? event.text : "";
-                if (classification === "tokens") {
-                  message.append("text", delta);
-                  // Only true when a delta was actually pushed — `append` silently
-                  // drops an empty batch, and a log line claiming forwarding that
-                  // didn't happen sends anyone debugging a missing token the wrong way.
-                  if (delta) debugLog("dust:stream", "Forwarded text delta", { delta });
-                } else if (classification === "chain_of_thought") {
-                  message.append("thinking", delta);
-                  if (delta) debugLog("dust:stream", "Forwarded thinking delta", { delta });
-                } else if (classification === "opening_delimiter" || classification === "closing_delimiter") {
-                  message.endBlock();
-                } else {
-                  // Covers a malformed frame (`classification` missing) and any new
-                  // value Dust adds later. This is the single dispatch point for all
-                  // agent output, so silently ignoring it would drop text from the
-                  // transcript with nothing in the logs to show it happened.
-                  debugLog("dust:stream", "Ignored generation_tokens classification", { classification });
+              // A `switch` rather than a chain of `else if`s: these branches are
+              // not variations on one operation but the turn's protocol states,
+              // and each ends the turn a different way (fall through, reconnect,
+              // return, throw). The `default` is the point of it — before, an
+              // event type we don't handle fell off the end of the chain and was
+              // dropped without a trace.
+              switch (eventType) {
+                case "generation_tokens": {
+                  const classification = isRecord(event) && typeof event.classification === "string"
+                    ? event.classification
+                    : "";
+                  const delta = isRecord(event) && typeof event.text === "string" ? event.text : "";
+                  const applyClassification = CLASSIFICATION_ACTIONS[classification];
+                  if (applyClassification) {
+                    applyClassification(message, delta);
+                  } else {
+                    // Covers a malformed frame (`classification` missing) and any
+                    // new value Dust adds later. This is the single dispatch point
+                    // for all agent output, so silently ignoring it would drop text
+                    // from the transcript with nothing in the logs to show it.
+                    debugLog("dust:stream", "Ignored generation_tokens classification", { classification });
+                  }
+                  break;
                 }
-              } else if (eventType === "tool_params") {
-                // Client-side tool calls render as their own transcript entry
-                // (see dust-tool-render.ts), using pi's native renderers. Adding
-                // a "[Tool: x]" line here as well would duplicate that, and it
-                // would also land inside the assistant message text.
-                const action = isRecord(event) && isRecord(event.action) ? event.action : undefined;
-                const toolName = getOptionalStringField(action ?? {}, "toolName")
-                  ?? getOptionalStringField(action ?? {}, "functionCallName")
-                  ?? "tool";
-                debugLog("dust:stream", "Tool params received", { toolName });
-              } else if (eventType === "tool_approve_execution") {
-                const approveEvent = parseToolApproveExecutionEvent(event);
-                debugLog("dust:stream", "Handling tool approval request", approveEvent);
-                const approved = await handleToolApproveExecution(approveEvent);
-                await postValidateAction(
-                  approveEvent.conversationId,
-                  approveEvent.messageId,
-                  approveEvent.actionId,
-                  approved,
-                );
-                recordPreApproval(approveEvent.actionId, approved);
-                resolveApprovalGate();
-                shouldReconnect = true;
-                debugLog("dust:stream", "Tool approval resolved", { approved, actionId: approveEvent.actionId });
-                break outer;
-              } else if (eventType === "agent_message_success") {
-                finishStopped(stream, model, message, resolveApprovalGate, "Stream completed successfully");
-                return;
-              } else if (eventType === "agent_message_gracefully_stopped") {
-                // Terminal per the Dust SDK's terminalEventTypes; without this
-                // the stream never completes and the turn hangs.
-                finishStopped(stream, model, message, resolveApprovalGate, "Stream gracefully stopped");
-                return;
-              } else if (eventType === "agent_generation_cancelled") {
-                // Dust says the generation was cancelled — by our own cancel
-                // request, or from the web UI or another client. Either way the
-                // turn was stopped, not completed, so it must not render as a
-                // clean finish, and the runtime has to hear about it: the local
-                // abort signal never fired on this path.
-                onCancelled();
-                finishAborted(stream, model, message, resolveApprovalGate);
-                return;
-              } else if (eventType === "agent_error") {
-                debugLog("dust:stream", "Received agent error event", event);
-                // Every other terminal exit closes whatever block is open
-                // before it stops pushing to the stream (see `endBlock` on
-                // `StreamingMessage` for why); this must too, for the same
-                // reason.
-                message.endBlock();
-                throw new Error(getDustEventErrorMessage(event, "Agent error"));
-              } else if (eventType === "user_message_error") {
-                debugLog("dust:stream", "Received user message error event", event);
-                message.endBlock();
-                throw new Error(getDustEventErrorMessage(event, "User message error"));
+                case "tool_params": {
+                  // Client-side tool calls render as their own transcript entry
+                  // (see dust-tool-render.ts), using pi's native renderers. Adding
+                  // a "[Tool: x]" line here as well would duplicate that, and it
+                  // would also land inside the assistant message text.
+                  const action = isRecord(event) && isRecord(event.action) ? event.action : undefined;
+                  const toolName = getOptionalStringField(action ?? {}, "toolName")
+                    ?? getOptionalStringField(action ?? {}, "functionCallName")
+                    ?? "tool";
+                  debugLog("dust:stream", "Tool params received", { toolName });
+                  break;
+                }
+                case "tool_approve_execution": {
+                  const approveEvent = parseToolApproveExecutionEvent(event);
+                  debugLog("dust:stream", "Handling tool approval request", approveEvent);
+                  const approved = await handleToolApproveExecution(approveEvent);
+                  await postValidateAction(
+                    approveEvent.conversationId,
+                    approveEvent.messageId,
+                    approveEvent.actionId,
+                    approved,
+                  );
+                  recordPreApproval(approveEvent.actionId, approved);
+                  resolveApprovalGate();
+                  shouldReconnect = true;
+                  debugLog("dust:stream", "Tool approval resolved", { approved, actionId: approveEvent.actionId });
+                  // Labelled, so it leaves the read loop and not just this switch.
+                  break outer;
+                }
+                case "agent_message_success":
+                  finishStopped(stream, model, message, resolveApprovalGate, "Stream completed successfully");
+                  return;
+                case "agent_message_gracefully_stopped":
+                  // Terminal per the Dust SDK's terminalEventTypes; without this
+                  // the stream never completes and the turn hangs.
+                  finishStopped(stream, model, message, resolveApprovalGate, "Stream gracefully stopped");
+                  return;
+                case "agent_generation_cancelled":
+                  // Dust says the generation was cancelled — by our own cancel
+                  // request, or from the web UI or another client. Either way the
+                  // turn was stopped, not completed, so it must not render as a
+                  // clean finish, and the runtime has to hear about it: the local
+                  // abort signal never fired on this path.
+                  onCancelled();
+                  finishAborted(stream, model, message, resolveApprovalGate);
+                  return;
+                case "agent_error":
+                  debugLog("dust:stream", "Received agent error event", event);
+                  // Every other terminal exit closes whatever block is open
+                  // before it stops pushing to the stream (see `endBlock` on
+                  // `StreamingMessage` for why); this must too, for the same
+                  // reason.
+                  message.endBlock();
+                  throw new Error(getDustEventErrorMessage(event, "Agent error"));
+                case "user_message_error":
+                  debugLog("dust:stream", "Received user message error event", event);
+                  message.endBlock();
+                  throw new Error(getDustEventErrorMessage(event, "User message error"));
+                default:
+                  // Dust sends more than this handles (`agent_action_success`,
+                  // `tool_notification`, `tool_error` — see docs/specs/dust-chat.md)
+                  // and can add more. Ignoring them is correct; doing it silently
+                  // is what left the last two gaps invisible.
+                  debugLog("dust:stream", "Ignored event type", { eventType });
               }
             }
           }

@@ -495,6 +495,30 @@ describe("dust extension", () => {
       expect(done.message.content).toEqual([{ type: "text", text: "Hello" }]);
     });
 
+    it("ignores an unhandled event type, without disturbing the open block", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "tokens", text: "Hel" },
+        // Dust sends these today and can add more; the dispatch must fall to its
+        // default and carry on rather than reaching any other branch.
+        { type: "agent_action_success", action: { id: 1 } },
+        { type: "tool_notification", notification: "working" },
+        { type: "generation_tokens", classification: "tokens", text: "lo" },
+        { type: "agent_message_success" },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const events: any[] = [];
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      for await (const e of stream) events.push(e);
+
+      expect(events.filter((e) => e.type === "text_start")).toHaveLength(1);
+      expect(events.filter((e) => e.type === "text_end")).toHaveLength(1);
+      const done = events.find((e) => e.type === "done");
+      expect(done).toBeDefined();
+      expect(done.message.content).toEqual([{ type: "text", text: "Hello" }]);
+    });
+
     // pi's agent loop drops every partial update until `start` has established
     // the streaming message; a second `start` mid-turn would look like a new
     // turn beginning and reset whatever pi already rendered. streamEvents
