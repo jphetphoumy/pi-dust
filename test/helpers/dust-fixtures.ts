@@ -243,6 +243,34 @@ export function makeSseStream(events: object[]): ReadableStream<Uint8Array> {
   });
 }
 
+/**
+ * The first-message fetch chain (MCP register, MCP requests SSE, create
+ * conversation), followed by one SSE window per entry in `windows` — for
+ * pinning behaviour across a reconnect without hand-rolling the setup calls
+ * in every such test, which ties the test to their exact order.
+ */
+export function makeReconnectingFetch(
+  conversationSId = "conv-1",
+  userMessageSId = "msg-1",
+  agentMessageSId = "agent-msg-1",
+  windows: object[][] = [[]],
+) {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
+    })
+    .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(makeConversationResponse(conversationSId, userMessageSId, agentMessageSId)),
+    });
+  for (const events of windows) {
+    fetchMock.mockResolvedValueOnce({ ok: true, body: makeSseStream(events) });
+  }
+  return fetchMock;
+}
+
 export function makeRawSseStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   return new ReadableStream({
