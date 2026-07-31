@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   buildPodTree,
   directoryPathsUnder,
-  fileEntriesUnder,
   filePathsUnder,
   flattenPodTree,
   isDirectory,
@@ -133,17 +132,9 @@ describe("pod file tree", () => {
     });
 
     it("lists directory paths for reload() to prune expanded against", () => {
-      expect(directoryPathsUnder(tree)).toEqual(["src", "src/lib"]);
-    });
-
-    it("lists files under a directory with their sizes, for the flat-listing fallback", () => {
-      const sized = buildPodTree([entry("src/a.ts", 100), entry("src/lib/b.ts", 20), entry("README.md", 5)]);
-
-      expect(fileEntriesUnder(at(sized, "src"))).toEqual([
-        { path: "src/lib/b.ts", bytes: 20 },
-        { path: "src/a.ts", bytes: 100 },
-      ]);
-      expect(fileEntriesUnder(at(sized, "README.md"))).toEqual([{ path: "README.md", bytes: 5 }]);
+      expect(tree.flatMap(directoryPathsUnder)).toEqual(["src", "src/lib"]);
+      expect(directoryPathsUnder(at(tree, "src"))).toEqual(["src", "src/lib"]);
+      expect(directoryPathsUnder(at(tree, "README.md"))).toEqual([]);
     });
 
     it("ticks a whole subtree when a directory is toggled on", () => {

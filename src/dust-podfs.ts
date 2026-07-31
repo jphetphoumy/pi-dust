@@ -18,7 +18,6 @@ import type { DustPodListPanel, ListRow } from "./dust-pod-list-panel.js";
 import {
   buildPodTree,
   directoryPathsUnder,
-  fileEntriesUnder,
   filePathsUnder,
   flattenPodTree,
   isDirectory,
@@ -124,8 +123,17 @@ async function pullPodPaths(
  * are fine.
  */
 function pullReport(summary: PullSummary, root: string, oneLine: boolean): string {
+  // Hoisted so the "Pulled N file(s) to root" wording is written once, not
+  // duplicated (with a trailing period) between the no-failures return below
+  // and the multi-line failure report. Unused in the one-line failure case,
+  // where there is no room for the destination anyway.
   const head = `Pulled ${summary.pulled} file${summary.pulled === 1 ? "" : "s"} to ${root}`;
-  if (summary.failures.length === 0) return `${head}.`;
+  if (summary.failures.length === 0) {
+    return `${head}.`;
+  }
+  // The one-line form skips the destination — it is `setBusy()`'s single row,
+  // and there is no room once the first failure and a count of the rest are in
+  // it.
   if (oneLine) {
     const first = summary.failures[0];
     const rest = summary.failures.length > 1 ? ` (+${summary.failures.length - 1} more)` : "";
@@ -189,15 +197,38 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
         return;
       }
 
-      const loadTree = async (): Promise<PodTreeNode[]> => {
+      const loadEntries = async (): Promise<{ path: string; bytes: number }[]> => {
         const files = await listPodFiles(api, binding.podId);
-        return buildPodTree(
-          files.map((file) => ({
-            path: toRelativePath(binding.podId, file.path),
-            bytes: file.sizeBytes,
-          })),
-        );
+        return files.map((file) => ({
+          path: toRelativePath(binding.podId, file.path),
+          bytes: file.sizeBytes,
+        }));
       };
+      const loadTree = async (): Promise<PodTreeNode[]> => buildPodTree(await loadEntries());
+
+      // The flat listing below is built straight from `listPodFiles`, not from
+      // the tree: `buildPodTree` drops a file shadowed by a same-named
+      // directory (a pod can hold both `a` and `a/b.ts` — nothing server-side
+      // forbids it), because two rows can't share a path in the selection set.
+      // A plain text listing has no such constraint, so going through the tree
+      // here would silently omit a file the pod really holds.
+      if (!supportsPanels(runtimeCtx)) {
+        let entries: { path: string; bytes: number }[];
+        try {
+          entries = await loadEntries();
+        } catch (err) {
+          notify(`Could not list pod files: ${errorMessage(err)}`, "error");
+          return;
+        }
+        entries.sort((a, b) => a.path.localeCompare(b.path));
+        notify(
+          entries.length === 0
+            ? `Pod "${binding.name}" is empty.`
+            : `Pod "${binding.name}":\n${entries.map(({ path, bytes }) => `  ${path}  ${formatBytes(bytes)}`).join("\n")}`,
+          "info",
+        );
+        return;
+      }
 
       let tree: PodTreeNode[];
       try {
@@ -208,17 +239,6 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
       }
 
       const allFiles = (): string[] => tree.flatMap((node) => filePathsUnder(node));
-
-      if (!supportsPanels(runtimeCtx)) {
-        const files = tree.flatMap((node) => fileEntriesUnder(node));
-        notify(
-          files.length === 0
-            ? `Pod "${binding.name}" is empty.`
-            : `Pod "${binding.name}":\n${files.map(({ path, bytes }) => `  ${path}  ${formatBytes(bytes)}`).join("\n")}`,
-          "info",
-        );
-        return;
-      }
 
       // Directories start closed. A pod mirrors a whole project, so opening
       // everything is a wall of files to scroll before the top-level shape is
@@ -235,7 +255,9 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
         tree = await loadTree();
         // Directories the user opened stay open; a directory the pod no longer
         // has drops out rather than lingering as a claim about a missing path.
-        expanded = new Set(directoryPathsUnder(tree).filter((path) => expanded.has(path)));
+        expanded = new Set(
+          tree.flatMap((node) => directoryPathsUnder(node)).filter((path) => expanded.has(path)),
+        );
         const live = new Set(allFiles());
         for (const path of [...selected]) {
           if (!live.has(path)) selected.delete(path);
@@ -315,9 +337,13 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
                 run: async (row) => {
                   const node = row.value as PodTreeNode;
                   const paths = filePathsUnder(node);
-                  setBusy(`Pulling ${node.path}…`);
+                  // A trailing slash on a folder, to match every other folder
+                  // string ("Delete 12 files under src/", "Kept src/.", the row
+                  // label itself) — a file's path is used bare.
+                  const label = isDirectory(node) ? `${node.path}/` : node.path;
+                  setBusy(`Pulling ${label}…`);
                   const summary = await pullPodPaths(api, binding.podId, root, paths, (done, total) => {
-                    if (total > 1) setBusy(`Pulling ${node.path}… ${done + 1}/${total}`);
+                    if (total > 1) setBusy(`Pulling ${label}… ${done + 1}/${total}`);
                   });
                   flash(pullReport(summary, root, true));
                   // The busy line only ever shows the first failure; the rest
@@ -363,10 +389,23 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
                         notify(`Could not confirm deleting ${node.path}/: ${errorMessage(err)}`, "error");
                         return;
                       }
+                      // `ui.confirm` itself is optional — an absent dialog resolves
+                      // to `undefined`, which is not the same as the user declining.
+                      // Folding it into `!confirmed` would tell them "Kept" for a
+                      // choice they were never offered.
+                      if (confirmed === undefined) {
+                        notify(`Cannot delete a folder here: this host has no confirmation dialog.`, "warning");
+                        return;
+                      }
                       if (!confirmed) {
                         notify(`Kept ${node.path}/.`, "info");
                         return;
                       }
+                      // A folder delete can be hundreds of sequential requests behind
+                      // one confirmation — say so upfront, the same way the bulk pull
+                      // does once the panel is closed, or the dialog just vanishes
+                      // into a minute of silence.
+                      if (paths.length > 1) notify(`Deleting ${paths.length} files…`);
                       const deletedPaths: string[] = [];
                       for (const rel of paths) {
                         try {
@@ -416,13 +455,35 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
                   setBusy(`Deleting ${node.path}…`);
                   try {
                     await deletePodFile(api, binding.podId, node.path);
-                    // Drop the watermark too, or the next push restores it.
-                    forgetWatermark(root, node.path);
-                    await reload();
-                    setBusy(null);
                   } catch (err) {
                     flash(`Delete failed: ${errorMessage(err)}`);
+                    return;
                   }
+                  // The file is already gone from the pod below this point, so
+                  // a failure here is not "Delete failed" — the same split the
+                  // folder branch above uses, for the same reason: a save or a
+                  // refresh failing must not read as the delete itself failing.
+                  try {
+                    // Drop the watermark too, or the next push restores it.
+                    forgetWatermark(root, node.path);
+                  } catch (err) {
+                    notify(
+                      `Deleted ${node.path} but could not clear its sync watermark: ${errorMessage(err)}. It may be re-uploaded on the next turn.`,
+                      "error",
+                    );
+                  }
+                  // Stay busy through the refresh too — DustPodListPanel only
+                  // swallows keys while busy is set (that's the point of it: no
+                  // queuing work against a list about to change under the user),
+                  // and reload()'s listPodFiles round trip is another async gap
+                  // right after the one the delete itself just opened.
+                  setBusy("Refreshing…");
+                  try {
+                    await reload();
+                  } catch (err) {
+                    notify(`Could not refresh pod files after deleting ${node.path}: ${errorMessage(err)}`, "error");
+                  }
+                  setBusy(null);
                 },
               },
               {
@@ -452,6 +513,12 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
       // In tree mode the panel resolves only to say how it closed; the ticked
       // paths live here, because a collapsed folder's files are not rows.
       if (picked !== undefined && picked !== null && selected.size > 0) {
+        // The panel is already closed here, unlike the `p` action's per-row
+        // busy line — so this is the only pull with nothing on screen while
+        // it runs. Sequential and rate-limited (see `pullPodPaths`), this can
+        // be a real wait for a big selection; one upfront notice beats silence
+        // without spamming a toast per file.
+        if (selected.size > 1) notify(`Pulling ${selected.size} files…`);
         const summary = await pullPodPaths(api, binding.podId, root, [...selected]);
         notify(pullReport(summary, root, false), summary.failures.length > 0 ? "warning" : "info");
       }
@@ -589,6 +656,12 @@ export function registerDustPodsCommand(pi: ExtensionAPI, runtime: DustSessionRu
                     "It cannot be undone — /pods can only restore *archived* pods.\n\n" +
                     "Local files are untouched.",
                 );
+                // `ui.confirm` is optional; an absent dialog resolves to `undefined`,
+                // not a decline — see /podfs's folder delete for the same check.
+                if (confirmed === undefined) {
+                  notify(`Cannot delete a pod here: this host has no confirmation dialog.`, "warning");
+                  return;
+                }
                 if (!confirmed) {
                   notify(`Kept pod "${pod.name}".`, "info");
                   return;

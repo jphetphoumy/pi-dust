@@ -81,6 +81,14 @@ function finish(drafts: Draft[], depth: number): PodTreeNode[] {
  * forbids it. The directory wins, because a node that is both would have to
  * render as two rows with the same path and the selection set could not tell
  * them apart; the shadowed file is simply not offered.
+ *
+ * `node.path` is rebuilt from `entry.path.split("/")` with empty segments
+ * dropped, so a leading or doubled slash (`/src//a.ts`) does not round-trip:
+ * the node ends up at `src/a.ts`. Callers use `node.path` for the pull/delete
+ * API calls, which assumes real pod paths never carry that kind of stray
+ * slash — Dust's own writers do not produce one. If that assumption ever
+ * breaks, the request goes out for the normalised path rather than the exact
+ * key the pod holds.
  */
 export function buildPodTree(entries: PodTreeEntry[]): PodTreeNode[] {
   const roots = new Map<string, Draft>();
@@ -122,20 +130,13 @@ export function filePathsUnder(node: PodTreeNode): string[] {
   return node.children.flatMap((child) => filePathsUnder(child));
 }
 
-/** Files at or below `node`, with size — for the flat-listing fallback when a host has no panel surface. */
-export function fileEntriesUnder(node: PodTreeNode): PodTreeEntry[] {
-  if (node.children === undefined) return [{ path: node.path, bytes: node.bytes }];
-  return node.children.flatMap((child) => fileEntriesUnder(child));
-}
-
 /**
  * Directory paths at or below `node` — what `reload()` prunes `expanded`
  * against, so a directory the pod no longer has drops out of it.
  */
-export function directoryPathsUnder(nodes: PodTreeNode[]): string[] {
-  return nodes.flatMap((node) =>
-    node.children === undefined ? [] : [node.path, ...directoryPathsUnder(node.children)],
-  );
+export function directoryPathsUnder(node: PodTreeNode): string[] {
+  if (node.children === undefined) return [];
+  return [node.path, ...node.children.flatMap((child) => directoryPathsUnder(child))];
 }
 
 /**
