@@ -258,7 +258,14 @@ export interface PiTextDeltaEvent {
   partial: AssistantMessageLike;
 }
 
-/** Closes a `text` block. pi's agent loop tracks open blocks by this event, not by `done`. */
+/**
+ * Closes a `text` block; pi's agent loop tracks open blocks by this event,
+ * not by `done`. Shape (`contentIndex` + `content` + `partial`) verified
+ * against the `text_end` variant of `AssistantMessageEvent` in
+ * `node_modules/@earendil-works/pi-ai/dist/types.d.ts` (lines 378-395 as of
+ * this check) — this file still isn't a dependency pi-dust type-checks
+ * against, so re-read that source if this event's contents ever look wrong.
+ */
 export interface PiTextEndEvent {
   type: "text_end";
   contentIndex: number;
@@ -279,7 +286,7 @@ export interface PiThinkingDeltaEvent {
   partial: AssistantMessageLike;
 }
 
-/** Closes a `thinking` block. pi's agent loop tracks open blocks by this event, not by `done`. */
+/** Closes a `thinking` block — the `thinking_end` counterpart of `PiTextEndEvent`; see its doc comment for how the shape was verified. */
 export interface PiThinkingEndEvent {
   type: "thinking_end";
   contentIndex: number;

@@ -55,21 +55,27 @@ export function makeEmptyMessage(model: DustModel): AssistantMessageLike {
 /** Which kind of pi content block a token batch grows. */
 type BlockKind = PiContentBlock["type"];
 
-/** Event names and an empty-block constructor for each `BlockKind`, so the three places that branch on it (open, delta, close) share one table instead of repeating the ternary. */
+/**
+ * Event names and an empty-block constructor for each `BlockKind`, so the
+ * three places that branch on it (open, delta, close) share one table
+ * instead of repeating the ternary. `satisfies` keeps this checked against
+ * `BlockKind`: a third block kind would fail here, at the table, rather than
+ * as a missing case at a `BLOCK_SHAPES[kind]` use site.
+ */
 const BLOCK_SHAPES = {
   text: {
-    start: "text_start" as const,
-    delta: "text_delta" as const,
-    end: "text_end" as const,
+    start: "text_start",
+    delta: "text_delta",
+    end: "text_end",
     make: (): PiTextBlock => ({ type: "text", text: "" }),
   },
   thinking: {
-    start: "thinking_start" as const,
-    delta: "thinking_delta" as const,
-    end: "thinking_end" as const,
+    start: "thinking_start",
+    delta: "thinking_delta",
+    end: "thinking_end",
     make: (): PiThinkingBlock => ({ type: "thinking", thinking: "" }),
   },
-};
+} as const satisfies Record<BlockKind, { start: string; delta: string; end: string; make: () => PiContentBlock }>;
 
 /**
  * The assistant message as it is being written, block by block.
@@ -85,13 +91,19 @@ interface StreamingMessage {
    * Opens the turn: pushes `start` with this message's own (empty) partial.
    * Must be called exactly once, before the reconnect loop — pi's agent loop
    * drops every partial update until it sees this, so calling it again mid-turn
-   * would look like a second turn starting over the first.
+   * would look like a second turn starting over the first. Enforced here, not
+   * just by the caller: a second call is a no-op.
    */
   start(): void;
   /** Appends to the open block of `kind`, opening one if it is not open yet. */
   append(kind: BlockKind, delta: string): void;
-  /** Ends whichever block is open, so the next token starts a fresh one. */
-  closeBlock(): void;
+  /**
+   * Ends whichever block is open, so the next token starts a fresh one. Every
+   * exit from a turn must call this before its terminal event — pi tracks an
+   * open block by `text_end`/`thinking_end`, not by `done`/`error`, so a block
+   * still open when the terminal event lands renders as stuck in progress.
+   */
+  endBlock(): void;
   /** The answer only, with the reasoning left out. */
   answerText(): string;
   /** Detached copy of the blocks written so far, for a terminal message. */
@@ -100,9 +112,11 @@ interface StreamingMessage {
 
 function createStreamingMessage(stream: PiEventStream, model: DustModel): StreamingMessage {
   const partial = makeEmptyMessage(model);
-  let openKind: BlockKind | null = null;
-  let openIndex = -1;
-  let openBlock: PiTextBlock | PiThinkingBlock | null = null;
+  let started = false;
+  // `index` and `block` are set and cleared together as one unit, so a
+  // future edit can't update one and forget the other the way three
+  // separate `let`s invited.
+  let open: { index: number; block: PiTextBlock | PiThinkingBlock } | null = null;
 
   // pi keeps a reference to whatever `partial` it was last handed, so every
   // event gets its own copy of the blocks; sharing them would rewrite the
@@ -112,20 +126,22 @@ function createStreamingMessage(stream: PiEventStream, model: DustModel): Stream
     content: partial.content.map((block) => ({ ...block })),
   });
 
-  // pi's agent loop tracks open blocks by `text_end`/`thinking_end`, not by
-  // `done` — a block left open at `done` may render as still in progress.
-  function endOpenBlock(): void {
-    if (openKind === null || !openBlock) return;
-    const shape = BLOCK_SHAPES[openKind];
-    const content = openKind === "text" ? (openBlock as PiTextBlock).text : (openBlock as PiThinkingBlock).thinking;
-    stream.push({ type: shape.end, contentIndex: openIndex, content, partial: detach() });
-    openKind = null;
-    openIndex = -1;
-    openBlock = null;
+  function endBlock(): void {
+    if (!open) return;
+    const { index, block } = open;
+    const shape = BLOCK_SHAPES[block.type];
+    const content = block.type === "text" ? block.text : block.thinking;
+    stream.push({ type: shape.end, contentIndex: index, content, partial: detach() });
+    open = null;
   }
 
   return {
     start() {
+      if (started) {
+        debugLog("dust:stream", "start() called again mid-turn — ignoring the repeat", {});
+        return;
+      }
+      started = true;
       stream.push({ type: "start", partial: detach() });
     },
     append(kind, delta) {
@@ -133,30 +149,22 @@ function createStreamingMessage(stream: PiEventStream, model: DustModel): Stream
       // a block or push a delta — Dust does send these, and an empty block
       // would render as a stray, content-less bubble in the transcript.
       if (!delta) return;
-      if (openKind !== kind) {
-        endOpenBlock();
-        const shape = BLOCK_SHAPES[kind];
+      const shape = BLOCK_SHAPES[kind];
+      if (!open || open.block.type !== kind) {
+        endBlock();
         const block = shape.make();
         partial.content.push(block);
-        openKind = kind;
-        openIndex = partial.content.length - 1;
-        openBlock = block;
-        stream.push({ type: shape.start, contentIndex: openIndex, partial: detach() });
+        open = { index: partial.content.length - 1, block };
+        stream.push({ type: shape.start, contentIndex: open.index, partial: detach() });
       }
-      // `openBlock` was just pushed (or already matched `kind`), so it is
-      // always the block this delta belongs to — holding the reference here
-      // avoids re-discriminating `partial.content[openIndex]` by `.type`.
-      if (openBlock!.type === "text") {
-        openBlock!.text += delta;
+      if (open.block.type === "text") {
+        open.block.text += delta;
       } else {
-        openBlock!.thinking += delta;
+        open.block.thinking += delta;
       }
-      const shape = BLOCK_SHAPES[kind];
-      stream.push({ type: shape.delta, contentIndex: openIndex, delta, partial: detach() });
+      stream.push({ type: shape.delta, contentIndex: open.index, delta, partial: detach() });
     },
-    closeBlock() {
-      endOpenBlock();
-    },
+    endBlock,
     answerText() {
       return partial.content.filter((block) => block.type === "text").map((block) => block.text).join("");
     },
@@ -180,7 +188,7 @@ function finishAborted(
   resolveApprovalGate: () => void,
 ): void {
   resolveApprovalGate();
-  message.closeBlock();
+  message.endBlock();
   const finalMessage = makeEmptyMessage(model);
   finalMessage.content = message.snapshot();
   finalMessage.stopReason = "aborted";
@@ -188,6 +196,32 @@ function finishAborted(
   stream.push({ type: "error", reason: "aborted", error: finalMessage });
   stream.end();
   debugLog("dust:stream", "Stream aborted by user", { answerText: message.answerText() });
+}
+
+/**
+ * Ends the turn as a clean stop: closes whatever block is open, then pushes
+ * `done` with the finished message. `agent_message_success`,
+ * `agent_message_gracefully_stopped` and the reconnect loop falling through
+ * without ever seeing a terminal event all end this way — sharing one
+ * function keeps that five-step sequence from drifting out of sync the way
+ * the throw paths (`agent_error` / `user_message_error`, further down) once
+ * did by skipping the `endBlock()` step.
+ */
+function finishStopped(
+  stream: PiEventStream,
+  model: DustModel,
+  message: StreamingMessage,
+  resolveApprovalGate: () => void,
+  logLabel: string,
+): void {
+  resolveApprovalGate();
+  message.endBlock();
+  const finalMessage = makeEmptyMessage(model);
+  finalMessage.content = message.snapshot();
+  finalMessage.stopReason = "stop";
+  stream.push({ type: "done", reason: "stop", message: finalMessage });
+  stream.end();
+  debugLog("dust:stream", logLabel, { answerText: message.answerText() });
 }
 
 export function createEventStream(): PiEventStream {
@@ -449,7 +483,7 @@ export async function streamEvents({
                   message.append("thinking", delta);
                   if (delta) debugLog("dust:stream", "Forwarded thinking delta", { delta });
                 } else if (classification === "opening_delimiter" || classification === "closing_delimiter") {
-                  message.closeBlock();
+                  message.endBlock();
                 } else {
                   // Covers a malformed frame (`classification` missing) and any new
                   // value Dust adds later. This is the single dispatch point for all
@@ -483,26 +517,12 @@ export async function streamEvents({
                 debugLog("dust:stream", "Tool approval resolved", { approved, actionId: approveEvent.actionId });
                 break outer;
               } else if (eventType === "agent_message_success") {
-                resolveApprovalGate();
-                message.closeBlock();
-                const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = message.snapshot();
-                finalMessage.stopReason = "stop";
-                stream.push({ type: "done", reason: "stop", message: finalMessage });
-                stream.end();
-                debugLog("dust:stream", "Stream completed successfully", { answerText: message.answerText() });
+                finishStopped(stream, model, message, resolveApprovalGate, "Stream completed successfully");
                 return;
               } else if (eventType === "agent_message_gracefully_stopped") {
                 // Terminal per the Dust SDK's terminalEventTypes; without this
                 // the stream never completes and the turn hangs.
-                resolveApprovalGate();
-                message.closeBlock();
-                const finalMessage = makeEmptyMessage(model);
-                finalMessage.content = message.snapshot();
-                finalMessage.stopReason = "stop";
-                stream.push({ type: "done", reason: "stop", message: finalMessage });
-                stream.end();
-                debugLog("dust:stream", "Stream gracefully stopped", { answerText: message.answerText() });
+                finishStopped(stream, model, message, resolveApprovalGate, "Stream gracefully stopped");
                 return;
               } else if (eventType === "agent_generation_cancelled") {
                 // Dust says the generation was cancelled — by our own cancel
@@ -515,9 +535,15 @@ export async function streamEvents({
                 return;
               } else if (eventType === "agent_error") {
                 debugLog("dust:stream", "Received agent error event", event);
+                // Every other terminal exit closes whatever block is open
+                // before it stops pushing to the stream (see `endBlock` on
+                // `StreamingMessage`); an error arriving mid-answer is exactly
+                // when a half-written block is on screen, so this must too.
+                message.endBlock();
                 throw new Error(getDustEventErrorMessage(event, "Agent error"));
               } else if (eventType === "user_message_error") {
                 debugLog("dust:stream", "Received user message error event", event);
+                message.endBlock();
                 throw new Error(getDustEventErrorMessage(event, "User message error"));
               }
             }
@@ -532,6 +558,10 @@ export async function streamEvents({
         finishAborted(stream, model, message, resolveApprovalGate);
         return;
       }
+      // A read failure (network drop, decode error) can leave a block open
+      // exactly like the agent_error/user_message_error throws above — same
+      // reasoning, same fix.
+      message.endBlock();
       throw error;
     } finally {
       reader.releaseLock();
@@ -565,12 +595,5 @@ export async function streamEvents({
     break reconnect;
   }
 
-  resolveApprovalGate();
-  message.closeBlock();
-  const finalMessage = makeEmptyMessage(model);
-  finalMessage.content = message.snapshot();
-  finalMessage.stopReason = "stop";
-  stream.push({ type: "done", reason: "stop", message: finalMessage });
-  stream.end();
-  debugLog("dust:stream", "Stream ended after reconnect loop", { answerText: message.answerText() });
+  finishStopped(stream, model, message, resolveApprovalGate, "Stream ended after reconnect loop");
 }

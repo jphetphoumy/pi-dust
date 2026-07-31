@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeConversationGetResponse, makeConversationResponse, makeModel, makePendingSseStream, makeRawSseStream, makeSseStream, makeStreamSimpleFn } from "./helpers/dust-fixtures.js";
+import { makeConversationGetResponse, makeConversationResponse, makeModel, makePendingSseStream, makeRawSseStream, makeReconnectingFetch, makeSseStream, makeStreamSimpleFn } from "./helpers/dust-fixtures.js";
 import { useTempAgentDir } from "./helpers/dust-fixtures.js";
 
 describe("dust extension", () => {
@@ -389,6 +389,11 @@ describe("dust extension", () => {
       const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
       for await (const e of stream) events.push(e);
 
+      // finishAborted closes whatever block is open before pushing `error`
+      // (dust-stream.ts) — losing that call would leave the reasoning block
+      // open on the abort path, and only the last-two-types check below would
+      // notice, since the final content is the same either way.
+      expect(events.slice(-2).map((e) => e.type)).toEqual(["thinking_end", "error"]);
       const error = events.at(-1);
       expect(error).toMatchObject({ type: "error", reason: "aborted" });
       expect(error.error.content).toEqual([{ type: "thinking", thinking: "half a thought" }]);
@@ -433,6 +438,17 @@ describe("dust extension", () => {
         { type: "thinking", thinking: "step two" },
         { type: "text", text: "Answer" },
       ]);
+      // The `content` an end event carries is a guess about pi's real
+      // contract (src/dust-types.ts), so it's the field most worth pinning:
+      // each end event must carry its own block's index and full text, not
+      // an empty string or the wrong block's.
+      const thinkingEnds = events.filter((e) => e.type === "thinking_end");
+      expect(thinkingEnds).toEqual([
+        expect.objectContaining({ contentIndex: 0, content: "step one" }),
+        expect.objectContaining({ contentIndex: 1, content: "step two" }),
+      ]);
+      const textEnd = events.find((e) => e.type === "text_end");
+      expect(textEnd).toMatchObject({ contentIndex: 2, content: "Answer" });
     });
 
     it("does not open a block or push a delta for an empty-text token batch", async () => {
@@ -470,7 +486,10 @@ describe("dust extension", () => {
 
       // An unrecognized classification is dropped, not treated as a boundary —
       // the block stays open and the two known batches land in it together.
+      // Both counts matter: a spurious `text_end` here (with no matching
+      // `text_start`) would pass a "reopen" check alone but still be wrong.
       expect(events.filter((e) => e.type === "text_start")).toHaveLength(1);
+      expect(events.filter((e) => e.type === "text_end")).toHaveLength(1);
       const done = events.find((e) => e.type === "done");
       expect(done).toBeDefined();
       expect(done.message.content).toEqual([{ type: "text", text: "Hello" }]);
@@ -483,30 +502,16 @@ describe("dust extension", () => {
     // to hold across a reconnect, not just for a single SSE window.
     it("emits start only once, even when the SSE window reconnects mid-turn", async () => {
       const model = makeModel();
-      const fetchMock = vi.fn()
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }),
-        })
-        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
-        })
+      const fetchMock = makeReconnectingFetch("conv-1", "msg-1", "amsg-1", [
         // First window: some text, then the connection closes without a
         // terminal event — Dust's 60s cap, not the end of the turn.
-        .mockResolvedValueOnce({
-          ok: true,
-          body: makeSseStream([{ type: "generation_tokens", classification: "tokens", text: "Hel" }]),
-        })
+        [{ type: "generation_tokens", classification: "tokens", text: "Hel" }],
         // Reconnect window: finishes the turn.
-        .mockResolvedValueOnce({
-          ok: true,
-          body: makeSseStream([
-            { type: "generation_tokens", classification: "tokens", text: "lo" },
-            { type: "agent_message_success" },
-          ]),
-        });
+        [
+          { type: "generation_tokens", classification: "tokens", text: "lo" },
+          { type: "agent_message_success" },
+        ],
+      ]);
       vi.stubGlobal("fetch", fetchMock);
 
       const events: any[] = [];
@@ -517,6 +522,10 @@ describe("dust extension", () => {
       // The block opened before the reconnect keeps accumulating across it,
       // rather than a second one opening when the window resumes.
       expect(events.filter((e) => e.type === "text_start")).toHaveLength(1);
+      // ...and the window boundary itself must not close it either — a
+      // `text_end` there would render the block finished while the turn
+      // continues. There should be exactly one, at `done`.
+      expect(events.filter((e) => e.type === "text_end")).toHaveLength(1);
       const done = events.find((e) => e.type === "done");
       expect(done).toBeDefined();
       expect(done.message.content).toEqual([{ type: "text", text: "Hello" }]);
@@ -641,6 +650,30 @@ describe("dust extension", () => {
       expect(errorEvent.error.errorMessage).toContain("Agent exploded");
     });
 
+    // Every other terminal exit (agent_message_success, gracefully_stopped,
+    // both abort paths) closes whatever block is open before its terminal
+    // event — a block never told it finished renders as still in progress.
+    // agent_error/user_message_error throw instead of returning, and that
+    // throw path skipped the close; this pins the fix.
+    it("closes the open block before agent_error interrupts a turn with an answer in progress", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "tokens", text: "Half" },
+        { type: "agent_error", error: { message: "Agent exploded" } },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      const events: any[] = [];
+      for await (const e of stream) events.push(e);
+
+      const types = events.map((e) => e.type);
+      expect(types).toContain("text_end");
+      expect(types.indexOf("text_end")).toBeLessThan(types.indexOf("error"));
+      const textEnd = events.find((e) => e.type === "text_end");
+      expect(textEnd).toMatchObject({ contentIndex: 0, content: "Half" });
+    });
+
     it("throws with user message error when user_message_error is received", async () => {
       const model = makeModel();
       const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
@@ -654,6 +687,23 @@ describe("dust extension", () => {
       const errorEvent = events.find((e) => e.type === "error");
       expect(errorEvent).toBeDefined();
       expect(errorEvent.error.errorMessage).toContain("Bad input");
+    });
+
+    it("closes the open block before user_message_error interrupts a turn with reasoning in progress", async () => {
+      const model = makeModel();
+      const fetchMock = makeFirstMessageFetch("conv-1", "msg-1", "amsg-1", [
+        { type: "generation_tokens", classification: "chain_of_thought", text: "half a thought" },
+        { type: "user_message_error", error: { message: "Bad input" } },
+      ]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const stream = streamSimpleFn(model, { messages: [{ role: "user", content: "Hi" }] });
+      const events: any[] = [];
+      for await (const e of stream) events.push(e);
+
+      const types = events.map((e) => e.type);
+      expect(types).toContain("thinking_end");
+      expect(types.indexOf("thinking_end")).toBeLessThan(types.indexOf("error"));
     });
 
     it("throws with session-expired message on 401 from createConversation", async () => {

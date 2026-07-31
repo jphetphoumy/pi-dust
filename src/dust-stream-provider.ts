@@ -37,11 +37,10 @@ function buildAuthHeaders(accessToken: string): Record<string, string> {
 
 function extractMessageText(message: ChatMessageLike): string {
   const rawContent = message.content ?? "";
-  // An answer interleaved with reasoning (dust-stream.ts closes the text block
-  // on every classification switch) arrives here as several text blocks; they
-  // are joined with no separator, so a paragraph break that fell on a
-  // reasoning boundary is lost. Concatenating as-is rather than guessing at a
-  // separator keeps mid-sentence splits intact, which is the common case.
+  // Multiple text blocks (dust-stream.ts splits one whenever the
+  // classification switches between `tokens`, `chain_of_thought` and the
+  // delimiters) join with no separator: if a break ever lands on that
+  // boundary it isn't reinstated. Left as-is rather than guessing at one.
   return Array.isArray(rawContent)
     ? rawContent.filter((block) => block.type === "text").map((block) => block.text ?? "").join("")
     : String(rawContent);
