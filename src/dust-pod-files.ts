@@ -1,8 +1,24 @@
 import { execFileSync } from "node:child_process";
 import { type Dirent, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import { debugLog } from "./dust-debug.js";
 import { errorMessage } from "./dust-validation.js";
+
+/**
+ * Whether a pod-reported relative path stays inside `root` once joined onto it.
+ *
+ * `rel` comes straight off the Dust listing API — the agent's own writes, not
+ * something we chose — so a `../../.ssh/authorized_keys` style entry has to be
+ * caught before it is ever joined onto a local path. `resolve` collapses `..`
+ * segments, so comparing the resolved target against the resolved root catches
+ * every escaping shape (leading `..`, absolute paths, `a/../../b`) in one place,
+ * shared by every caller that turns a pod path into a local one.
+ */
+export function isPodPathSafe(root: string, rel: string): boolean {
+  const base = resolve(root);
+  const target = resolve(base, rel);
+  return target === base || target.startsWith(base + sep);
+}
 
 /**
  * Choosing which local files belong in a Pod.

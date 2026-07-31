@@ -86,6 +86,19 @@ export function toRelativePath(podId: string, canonicalPath: string): string {
 }
 
 /**
+ * Encodes a relative path for use in a URL, one segment at a time.
+ *
+ * A file name is not automatically URL-safe: `#` starts a fragment, `?` starts
+ * a query string, and `%` begins a percent-escape, so `notes#1.md` interpolated
+ * raw targets `/files/pod/notes` with `1.md` dropped from the request entirely.
+ * Each segment is escaped and rejoined with a literal `/`, so the path
+ * structure itself is untouched.
+ */
+export function encodePodPath(relPath: string): string {
+  return relPath.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
  * Issues a private-API request, refreshing once on 401 and waiting out a 429.
  *
  * Ingesting a large tree is many requests and can outlive the ~15 minute access
@@ -333,7 +346,7 @@ export async function movePodFile(
   fromRel: string,
   toRel: string,
 ): Promise<void> {
-  const res = await request(api, `/spaces/${podId}/files/pod/${fromRel}`, {
+  const res = await request(api, `/spaces/${podId}/files/pod/${encodePodPath(fromRel)}`, {
     method: "POST",
     body: JSON.stringify({ destRelativeFilePath: toRel }),
   });
@@ -344,7 +357,7 @@ export async function movePodFile(
 }
 
 export async function downloadPodFile(api: PodApi, podId: string, relPath: string): Promise<Buffer> {
-  const res = await request(api, `/spaces/${podId}/files/pod/${relPath}`);
+  const res = await request(api, `/spaces/${podId}/files/pod/${encodePodPath(relPath)}`);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Pod download failed for ${relPath}: HTTP ${res.status} — ${body.slice(0, 200)}`);
@@ -353,7 +366,7 @@ export async function downloadPodFile(api: PodApi, podId: string, relPath: strin
 }
 
 export async function deletePodFile(api: PodApi, podId: string, relPath: string): Promise<void> {
-  const res = await request(api, `/spaces/${podId}/files/pod/${relPath}`, { method: "DELETE" });
+  const res = await request(api, `/spaces/${podId}/files/pod/${encodePodPath(relPath)}`, { method: "DELETE" });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Pod delete failed for ${relPath}: HTTP ${res.status} — ${body.slice(0, 200)}`);

@@ -480,4 +480,68 @@ describe("dust pod API client", () => {
     expect(toRelativePath("vlt_1", "pod-vlt_1/src/main.py")).toBe("src/main.py");
     expect(toRelativePath("vlt_1", "src/main.py")).toBe("src/main.py");
   });
+
+  describe("path segments with URL-significant characters", () => {
+    // `#` starts a fragment, `?` a query string and `%` a percent-escape, so a
+    // filename with any of them interpolated raw into a URL targets the wrong
+    // resource: `notes#1.md` becomes a request for `notes`, with `1.md`
+    // silently dropped as a client-side fragment.
+
+    it("encodes a `#` in the path when downloading", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(textResponse("body"));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await downloadPodFile(makeApi(), "vlt_1", "notes#1.md");
+
+      expect(calls(fetchMock)[0][0]).toBe(`${BASE}/spaces/vlt_1/files/pod/notes%231.md`);
+    });
+
+    it("encodes a `?` in the path when deleting", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await deletePodFile(makeApi(), "vlt_1", "a?.py");
+
+      expect(calls(fetchMock)[0][0]).toBe(`${BASE}/spaces/vlt_1/files/pod/a%3F.py`);
+    });
+
+    it("encodes the source path when moving, without touching the plain-path destination", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await movePodFile(makeApi(), "vlt_1", "notes#1.md", "dest#2.md");
+
+      const [url, init] = calls(fetchMock)[0];
+      expect(url).toBe(`${BASE}/spaces/vlt_1/files/pod/notes%231.md`);
+      // The destination travels in the JSON body, not the URL, so it is not a
+      // path-escaping hazard and is sent exactly as given.
+      expect(JSON.parse(String(init.body))).toEqual({ destRelativeFilePath: "dest#2.md" });
+    });
+
+    it("still encodes each segment while preserving the directory structure", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(textResponse("body"));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await downloadPodFile(makeApi(), "vlt_1", "src/notes#1.md");
+
+      expect(calls(fetchMock)[0][0]).toBe(`${BASE}/spaces/vlt_1/files/pod/src/notes%231.md`);
+    });
+
+    it("encodes the pre-delete and move-back paths of an upload that collides with a special-character name", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({}))
+        .mockResolvedValueOnce(jsonResponse({ file: { sId: "fil_1", uploadUrl: "https://upload.test/fil_1" } }))
+        .mockResolvedValueOnce(jsonResponse({ file: { path: "pod-vlt_1/notes#1_fil_abc.md" } }))
+        .mockResolvedValueOnce(jsonResponse({}));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await uploadPodFile(makeApi(), "vlt_1", "notes#1.md", Buffer.from("x"));
+
+      const [deleteUrl] = calls(fetchMock)[0];
+      expect(deleteUrl).toBe(`${BASE}/spaces/vlt_1/files/pod/notes%231.md`);
+      const [moveUrl, moveInit] = calls(fetchMock)[3];
+      expect(moveUrl).toBe(`${BASE}/spaces/vlt_1/files/pod/notes%231_fil_abc.md`);
+      expect(JSON.parse(String(moveInit.body))).toEqual({ destRelativeFilePath: "notes#1.md" });
+    });
+  });
 });

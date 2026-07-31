@@ -683,6 +683,73 @@ describe("pod sync", () => {
     });
   });
 
+  /**
+   * A pod entry's path is whatever the agent wrote through the free tools —
+   * untrusted input, in other words. A `../../.ssh/authorized_keys` style path
+   * must never be joined onto the local root and written; there is no prompt
+   * on the automatic post-turn pull for the user to catch it at.
+   */
+  describe("pod paths that would escape the project root", () => {
+    it("skips a pulled entry whose path climbs above the project root", async () => {
+      const pod = makeFakePod({ "../evil.txt": { content: "pwned", ms: 500 } });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(report.pulled).toEqual([]);
+      expect(report.skipped).toEqual([
+        { rel: "../evil.txt", reason: expect.stringContaining("escapes") },
+      ]);
+      expect(existsSync(join(root, "..", "evil.txt"))).toBe(false);
+    });
+
+    it("never adopts a skill-shaped entry whose path escapes the root", async () => {
+      // Same untrusted rel feeds adoptedSkillPath, so a traversal has to be
+      // caught before it ever reaches that branch, not just the plain write.
+      const pod = makeFakePod({
+        "skills/foo/../../../evil.txt": { content: "pwned", ms: 500 },
+      });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(report.adopted).toEqual([]);
+      expect(report.pulled).toEqual([]);
+      expect(existsSync(join(root, "..", "evil.txt"))).toBe(false);
+    });
+
+    it("does not let an unsafe pod path block the rest of the sync", async () => {
+      const pod = makeFakePod({
+        "../evil.txt": { content: "pwned", ms: 500 },
+        "main.py": { content: "fine", ms: 500 },
+      });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, { push: false, pull: true });
+
+      expect(report.pulled).toEqual(["main.py"]);
+      expect(readLocal("main.py")).toBe("fine");
+    });
+  });
+
+  /**
+   * The pre-turn/post-bash push re-runs the same discovery `/ingest` uses, but
+   * without `/ingest`'s guardrail: a bash command that scaffolds thousands of
+   * files into a tracked directory would otherwise queue them all against
+   * Dust's rate limit and stall the turn.
+   */
+  it("caps rediscovered files at the ingest limit instead of queuing everything", async () => {
+    const pod = makeFakePod({});
+    const total = 510;
+    for (let i = 0; i < total; i++) writeLocal(`gen/f${i}.py`, `x${i}`);
+    const bound = binding();
+
+    const report = await syncPod(pod.api, root, bound, { push: true, pull: false });
+
+    expect(report.pushed.length).toBe(500);
+    expect(report.skipped.some((s) => /cap/i.test(s.reason))).toBe(true);
+  });
+
   it("summarises a report in both directions", () => {
     expect(describeReport({ pushed: ["a"], pulled: ["b", "c"], conflicted: ["d"], skipped: [], adopted: [] }))
       .toBe("↑ 1 pushed, ↓ 2 pulled, ⚠ 1 conflicted");

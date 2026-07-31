@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import { POD_AGENTS_MD } from "./dust-pod-agents-md.js";
-import { selectIngestableFiles } from "./dust-pod-files.js";
+import { isPodPathSafe, MAX_INGEST_FILES, selectIngestableFiles } from "./dust-pod-files.js";
 import { fingerprintSkill, isPodSkillPath } from "./dust-pod-skills.js";
 import {
   downloadPodFile,
@@ -329,7 +329,16 @@ export async function syncPod(
 
   const entries = await listPodFiles(api, binding.podId);
   // Both loops feed one counter, so the indicator does not restart halfway.
-  const discovered = push ? selectIngestableFiles(root, binding.pathspecs ?? []) : [];
+  //
+  // Re-running the same selection every push has no cap of its own — unlike
+  // `/ingest`, which refuses over MAX_INGEST_FILES outright — so a bash command
+  // that scaffolds thousands of files into a tracked, non-ignored directory
+  // would otherwise queue every one of them against Dust's 40/min rate limit on
+  // the very next turn. Applying the same cap here bounds that, and the
+  // overage is reported rather than silently dropped.
+  const rediscovered = push ? selectIngestableFiles(root, binding.pathspecs ?? []) : [];
+  const discovered = rediscovered.slice(0, MAX_INGEST_FILES);
+  const cappedCount = rediscovered.length - discovered.length;
   const total = entries.length + discovered.length;
   let done = 0;
   const step = (): void => options.onProgress?.(++done, total);
@@ -345,6 +354,18 @@ export async function syncPod(
   for (const entry of entries) {
     step();
     const rel = toRelativePath(binding.podId, entry.path);
+
+    // `rel` is whatever the agent wrote through the pod's free tools — never
+    // something we chose — so a `../../.ssh/authorized_keys` style path has to
+    // be caught before it is joined onto `root` anywhere, including the
+    // adopted-skill branch below. Skipping the one bad entry keeps the rest of
+    // the sync intact rather than failing the whole run over it.
+    if (!isPodPathSafe(root, rel)) {
+      debugLog("dust:pod", "Skipping pod entry whose path escapes the project root", { root, rel });
+      report.skipped.push({ rel, reason: "path escapes the project root" });
+      continue;
+    }
+
     // Ours, not theirs: neither pulled down nor treated as a conflict.
     if (isPodOwnedPath(rel, binding)) continue;
 
@@ -419,6 +440,19 @@ export async function syncPod(
   }
 
   if (push) {
+    if (cappedCount > 0) {
+      // Silently truncating would leave the user wondering why a scaffolded
+      // file never reached the agent; naming the cap here reuses the same
+      // surfacing `skipped` already gets everywhere else (console.error on the
+      // automatic paths, a notify on `/ingest sync`).
+      report.skipped.push({
+        rel: "*",
+        reason:
+          `${rediscovered.length} files matched, over the ${MAX_INGEST_FILES} cap — `
+          + `${cappedCount} were not queued. Narrow with /ingest <pathspec>.`,
+      });
+    }
+
     // Anything the pod does not have but the selection says it should: files we
     // already track that have vanished from the pod, and files the user has
     // created locally since the ingest. Re-running the same selection is what

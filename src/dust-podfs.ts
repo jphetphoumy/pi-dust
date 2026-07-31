@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isPodPathSafe } from "./dust-pod-files.js";
 import {
   archivePod,
   deletePod,
@@ -116,6 +117,14 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
               label: "pull",
               run: async (row) => {
                 const rel = String(row.value);
+                // `rel` is a pod-reported path, not one the user typed — a
+                // `../../.ssh/authorized_keys` style entry must not be joined
+                // onto `root` and written just because the user pressed `p`.
+                if (!isPodPathSafe(root, rel)) {
+                  panel?.setBusy(`Pull failed: ${rel} escapes the project root`);
+                  setTimeout(() => panel?.setBusy(null), 1500);
+                  return;
+                }
                 panel?.setBusy(`Pulling ${rel}…`);
                 try {
                   const content = await downloadPodFile(api, binding.podId, rel);

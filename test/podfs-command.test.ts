@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -132,6 +132,21 @@ describe("/podfs and /pods", () => {
 
       // Parent directories are created, so a nested pod file can land anywhere.
       expect(readFileSync(join(root, "src/util.py"), "utf8")).toBe("x = 1");
+    });
+
+    it("refuses to pull a pod path that would escape the project root", async () => {
+      // The pod listing is untrusted input — the agent's own writes — so a
+      // `../../.ssh/authorized_keys` style entry must not be joined onto
+      // `root` just because the user pressed `p`.
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("../evil.txt")]);
+      const download = vi.spyOn(podApi, "downloadPodFile");
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("p").run(opened!.options.rows[0], 0);
+
+      expect(download).not.toHaveBeenCalled();
+      expect(opened?.setBusy.mock.calls.map((call) => call[0]).join(" ")).toContain("escapes the project root");
+      expect(existsSync(join(root, "..", "evil.txt"))).toBe(false);
     });
 
     it("reports a failed pull in the panel rather than throwing", async () => {
