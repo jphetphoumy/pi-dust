@@ -79,6 +79,13 @@ export interface ListPanelOptions {
   actions?: ListAction[];
   /** Shown in place of the list when there is nothing to show. */
   emptyMessage?: string;
+  /**
+   * Picks the row to focus initially, given the rows the panel was built with.
+   * Return an out-of-range index (or omit the option) to fall back to row 0 —
+   * e.g. a caller that reopens the panel after an edit, wanting to land back
+   * near where the user was rather than at the top.
+   */
+  initialFocus?: (rows: ListRow[]) => number;
 }
 
 /**
@@ -110,6 +117,8 @@ export class DustPodListPanel implements Component {
     private done: (result: ListRow[] | undefined) => void,
   ) {
     this.rows = options.rows.map((row) => ({ ...row }));
+    const initial = options.initialFocus?.(this.rows) ?? 0;
+    if (initial >= 0 && initial < this.rows.length) this.focus = initial;
   }
 
   /** Replaces the list in place, for an action that changed the underlying data. */
@@ -121,8 +130,20 @@ export class DustPodListPanel implements Component {
 
   invalidate(): void { /* nothing cached between renders */ }
 
+  /**
+   * Collapses whitespace in the busy message before it is stored.
+   *
+   * This is a rendering invariant, not cosmetic tidying: `busy` is written
+   * straight into a single line by `render()`, and `visibleWidth("\n")` is 0,
+   * so an embedded newline scores zero width, slips past the truncation check,
+   * and breaks the panel's frame. Callers pass through API error bodies
+   * (archive/restore/reload failures, pod-file deletes, …) which are untrusted
+   * text and do carry newlines in practice — collapsing here, once, covers
+   * every call site instead of relying on each one to have sanitised its own
+   * message first.
+   */
   setBusy(message: string | null): void {
-    this.busy = message;
+    this.busy = message === null ? null : message.replace(/\s+/g, " ");
     this.requestRender();
   }
 
@@ -230,8 +251,13 @@ export class DustPodListPanel implements Component {
     const twisty = this.options.tree ? (row.expandable ? (row.expanded ? "▾ " : "▸ ") : "  ") : "";
     const indent = "  ".repeat(row.depth ?? 0);
     const pointer = focused ? "› " : "  ";
-    const detail = row.detail ? ` ${th.fg("dim", row.detail)}` : "";
-    const label = focused ? th.fg("accent", row.label) : row.label;
+    // Same rendering invariant as `setBusy`: `row.label`/`detail` can be a pod
+    // file name or an API-derived string, both untrusted, and a stray newline
+    // would break the frame the same way.
+    const detailText = row.detail?.replace(/\s+/g, " ");
+    const detail = detailText ? ` ${th.fg("dim", detailText)}` : "";
+    const labelText = row.label.replace(/\s+/g, " ");
+    const label = focused ? th.fg("accent", labelText) : labelText;
     return truncate(`  ${pointer}${ticked}${indent}${twisty}${label}${detail}`, width);
   }
 

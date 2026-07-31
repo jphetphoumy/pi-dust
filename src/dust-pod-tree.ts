@@ -122,7 +122,16 @@ export function filePathsUnder(node: PodTreeNode): string[] {
   return node.children.flatMap((child) => filePathsUnder(child));
 }
 
-/** Directory paths at or below `node` — the set an expand-all has to cover. */
+/** Files at or below `node`, with size — for the flat-listing fallback when a host has no panel surface. */
+export function fileEntriesUnder(node: PodTreeNode): PodTreeEntry[] {
+  if (node.children === undefined) return [{ path: node.path, bytes: node.bytes }];
+  return node.children.flatMap((child) => fileEntriesUnder(child));
+}
+
+/**
+ * Directory paths at or below `node` — what `reload()` prunes `expanded`
+ * against, so a directory the pod no longer has drops out of it.
+ */
 export function directoryPathsUnder(nodes: PodTreeNode[]): string[] {
   return nodes.flatMap((node) =>
     node.children === undefined ? [] : [node.path, ...directoryPathsUnder(node.children)],

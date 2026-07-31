@@ -434,6 +434,24 @@ files against a rate-limited API, and the slower loop is the one that finishes.
 Every path is checked with `isPodPathSafe` before it is written — the listing is
 untrusted input, since the agent writes it.
 
+A folder delete needs a confirm dialog, and the dialog needs the panel out of
+the way to be reachable, so the handler runs `openListPanel` in a loop rather
+than once. `panel?.close()` resolves the open call with `undefined` — the same
+value Esc produces — so on its own that would read as the user cancelling and
+throw away whatever they had ticked. `dialogPending` is how the delete branch
+tells the loop the difference: while it is set, the loop knows the panel came
+down for a dialog, not because the user is done, and reopens the picker once
+the dialog settles instead of returning. That promise is awaited twice — once
+inline, since the action itself is dispatched as `void action.run(...)` and
+nothing else observes its rejection, and once by the loop — so it must never
+reject; every stage inside it that can throw (the confirm call, each file
+delete, the watermark save, the tree refresh) gets its own try/catch that
+reports what actually happened instead of letting the whole IIFE reject. The
+reopened picker is not a fresh one: `pendingFocus`, recorded just before the
+close, becomes `initialFocus` on the next `openListPanel` call, so the cursor
+lands back near the folder that was just acted on rather than snapping to the
+top of a list that may now be shorter.
+
 ### The `[DustSkills]` startup section
 
 `src/dust-pod-skills-banner.ts` adds a `[DustSkills]` section under pi's startup

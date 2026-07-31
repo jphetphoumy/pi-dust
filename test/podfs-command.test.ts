@@ -8,6 +8,7 @@ import * as podRuntime from "../src/dust-pod-runtime.js";
 import * as podUi from "../src/dust-pod-ui.js";
 import { registerDustPodFsCommand, registerDustPodsCommand } from "../src/dust-podfs.js";
 import { DustSessionRuntime } from "../src/dust-runtime.js";
+import * as dustState from "../src/dust-state.js";
 import { getPodBinding, savePodBinding } from "../src/dust-state.js";
 import { useTempAgentDir } from "./helpers/dust-fixtures.js";
 
@@ -267,6 +268,33 @@ describe("/podfs and /pods", () => {
       expect(Object.keys(getPodBinding(root)?.seen ?? {})).toEqual(["z.py"]);
     });
 
+    it("drops a folder's watermarks in a single state save, not one per file", async () => {
+      // Per-file saves mean a full read-modify-write of dust-state.json per
+      // file, which a folder delete can do hundreds of times over.
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        seen: {
+          "src/a.py": { podMs: 1, hash: "h" },
+          "src/lib/b.py": { podMs: 1, hash: "h" },
+          "z.py": { podMs: 1, hash: "h" },
+        },
+      });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        podFile("src/a.py"),
+        podFile("src/lib/b.py"),
+        podFile("z.py"),
+      ]);
+      vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+      const save = vi.spyOn(dustState, "savePodBinding");
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("d").run(opened!.options.rows[0], 0);
+
+      expect(save).toHaveBeenCalledTimes(1);
+      expect(Object.keys(getPodBinding(root)?.seen ?? {})).toEqual(["z.py"]);
+    });
+
     it("keeps a folder when the confirmation is declined", async () => {
       vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py")]);
       const del = vi.spyOn(podApi, "deletePodFile");
@@ -277,6 +305,222 @@ describe("/podfs and /pods", () => {
 
       expect(del).not.toHaveBeenCalled();
       expect(messages().join(" ")).toContain("Kept src/");
+    });
+
+    it("reopens the picker — and keeps the ticked selection — when a folder delete is declined", async () => {
+      // Closing the panel to show the confirm dialog resolves openListPanel
+      // with `undefined`, the same value Esc produces. Without the fix that
+      // reads as the user cancelling and the ticked files are thrown away.
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py"), podFile("z.py")]);
+      const del = vi.spyOn(podApi, "deletePodFile");
+      confirmAnswer = false;
+      let calls = 0;
+      interact = async (options) => {
+        calls++;
+        if (calls > 1) return;
+        options.tree!.toggleSelect(options.rows[1]); // tick z.py
+        await options.actions!.find((candidate) => candidate.key === "d")!.run(options.rows[0], 0);
+      };
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(del).not.toHaveBeenCalled();
+      expect(calls).toBe(2);
+      const rows = opened?.options.rows ?? [];
+      expect(rows.find((row) => row.label === "z.py")?.selected).toBe(true);
+    });
+
+    it("reopens the picker and keeps the ticked selection when the post-delete refresh fails", async () => {
+      // The folder delete itself succeeded — the files are gone from the pod —
+      // but the listing call that refreshes the tree afterwards can still
+      // reject. Without the fix that unhandled rejection propagates out of the
+      // `/podfs` handler: the picker never reopens and the ticked selection is
+      // thrown away, even though the delete the loop exists to protect went
+      // through.
+      vi.spyOn(podApi, "listPodFiles")
+        .mockResolvedValueOnce([podFile("src/a.py"), podFile("z.py")])
+        .mockRejectedValueOnce(new Error("HTTP 500"));
+      vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+      let calls = 0;
+      interact = async (options) => {
+        calls++;
+        if (calls > 1) return;
+        options.tree!.toggleSelect(options.rows[1]); // tick z.py
+        await options.actions!.find((candidate) => candidate.key === "d")!.run(options.rows[0], 0);
+      };
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(calls).toBe(2);
+      const rows = opened?.options.rows ?? [];
+      expect(rows.find((row) => row.label === "z.py")?.selected).toBe(true);
+      expect(messages().join(" ")).toContain("Could not refresh pod files");
+    });
+
+    it("reports the watermark save failing without undoing the notice that files were deleted", async () => {
+      // The files are already gone from the pod at this point — only the
+      // state-file save that clears their watermarks fails (read-only FS, full
+      // disk, ...). Without the fix this used to surface as a generic "could
+      // not refresh" message, with the "Deleted N files" notice never firing
+      // at all because it sat after the failing save.
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        seen: { "src/a.py": { podMs: 1, hash: "h" } },
+      });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py")]);
+      vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+      vi.spyOn(dustState, "savePodBinding").mockImplementation(() => {
+        throw new Error("EROFS: read-only file system");
+      });
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("d").run(opened!.options.rows[0], 0);
+
+      expect(messages().join(" ")).toContain("Deleted 1 file");
+      const errorNotice = notices.find(([, level]) => level === "error");
+      expect(errorNotice?.[0]).toContain("could not clear its sync watermarks");
+      expect(errorNotice?.[0]).toContain("re-uploaded on the next turn");
+    });
+
+    it("still refreshes the listing when the watermark save failed", async () => {
+      // The save failing says nothing about whether the pod can be listed
+      // again. Skipping the refresh left the reopened picker showing files
+      // that were already gone, until the user pressed `r`.
+      // The watermark has to exist, or `forgetWatermarks` has nothing to save
+      // and never reaches the throwing call at all.
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        seen: { "src/a.py": { podMs: 1, hash: "h" } },
+      });
+      const list = vi.spyOn(podApi, "listPodFiles")
+        .mockResolvedValueOnce([podFile("src/a.py"), podFile("z.py")])
+        .mockResolvedValue([podFile("z.py")]);
+      vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+      vi.spyOn(dustState, "savePodBinding").mockImplementation(() => {
+        throw new Error("EROFS: read-only file system");
+      });
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("d").run(opened!.options.rows[0], 0);
+
+      // The second listing is the refresh; without it the picker would reopen
+      // still showing the deleted folder.
+      expect(list).toHaveBeenCalledTimes(2);
+    });
+
+    it("reports 0 deleted, not a false 'Deleted' notice, when the confirm dialog itself rejects", async () => {
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py")]);
+      const del = vi.spyOn(podApi, "deletePodFile");
+      const ctxWithFailingConfirm = () => ({
+        ui: {
+          notify: (message: string, level: string) => { notices.push([message, level]); },
+          confirm: async () => {
+            throw new Error("dialog surface unavailable");
+          },
+        },
+      });
+
+      await register(registerDustPodFsCommand)("", ctxWithFailingConfirm());
+      await action("d").run(opened!.options.rows[0], 0);
+
+      expect(del).not.toHaveBeenCalled();
+      expect(messages().join(" ")).not.toContain("Deleted");
+      expect(messages().join(" ")).toContain("Could not confirm deleting src/");
+    });
+
+    it("keeps the picker reopening even when the confirm dialog rejects", async () => {
+      // The dialogPending promise must never reject, whatever step inside it
+      // throws — otherwise the reopen loop breaks and the ticked selection is
+      // lost along with an unhandled rejection.
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py"), podFile("z.py")]);
+      let calls = 0;
+      const ctxWithFailingConfirm = () => ({
+        ui: {
+          notify: (message: string, level: string) => { notices.push([message, level]); },
+          confirm: async () => {
+            throw new Error("dialog surface unavailable");
+          },
+        },
+      });
+      interact = async (options) => {
+        calls++;
+        if (calls > 1) return;
+        options.tree!.toggleSelect(options.rows[1]); // tick z.py
+        await options.actions!.find((candidate) => candidate.key === "d")!.run(options.rows[0], 0);
+      };
+
+      await register(registerDustPodFsCommand)("", ctxWithFailingConfirm());
+
+      expect(calls).toBe(2);
+      const rows = opened?.options.rows ?? [];
+      expect(rows.find((row) => row.label === "z.py")?.selected).toBe(true);
+    });
+
+    it("keeps the focus near a deleted folder when the picker reopens", async () => {
+      vi.spyOn(podApi, "listPodFiles")
+        .mockResolvedValueOnce([podFile("a/x.py"), podFile("b/y.py"), podFile("c/z.py")])
+        .mockResolvedValueOnce([podFile("a/x.py"), podFile("c/z.py")]);
+      vi.spyOn(podApi, "deletePodFile").mockResolvedValue(undefined);
+      let calls = 0;
+      let secondOptions: Omit<ListPanelOptions, "height"> | null = null;
+      interact = async (options) => {
+        calls++;
+        if (calls > 1) {
+          secondOptions = options;
+          return;
+        }
+        // The user was focused on b/, which the delete removes entirely.
+        await options.actions!.find((candidate) => candidate.key === "d")!.run(options.rows[1], 1);
+      };
+
+      await register(registerDustPodFsCommand)("", ctx());
+
+      expect(calls).toBe(2);
+      const rows = secondOptions!.rows;
+      const idx = secondOptions!.initialFocus?.(rows);
+      // b/ is gone; the nearest surviving row is what now sits where it did.
+      expect(rows[idx as number]?.label).toBe("c/");
+    });
+
+    it("notifies the full failure list for a folder pull, not just the busy line's first failure", async () => {
+      // Each file used to be pulled on its own, so every failure was seen. A
+      // folder pull's busy line shows only the first and is wiped after
+      // 1500ms — the rest must not be silently dropped.
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("src/a.py"), podFile("src/b.py")]);
+      vi.spyOn(podApi, "downloadPodFile")
+        .mockRejectedValueOnce(new Error("HTTP 500"))
+        .mockRejectedValueOnce(new Error("HTTP 403"));
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("p").run(opened!.options.rows[0], 0);
+
+      const warning = notices.find(([, level]) => level === "warning");
+      expect(warning?.[0]).toContain("src/a.py: HTTP 500");
+      expect(warning?.[0]).toContain("src/b.py: HTTP 403");
+    });
+
+    it("passes a multi-line API error straight through to the panel's setBusy", async () => {
+      // A raw response body — pretty-printed JSON or an HTML error page — can
+      // carry newlines straight through `errorMessage`. Collapsing that
+      // whitespace is now `DustPodListPanel.setBusy`'s job (see
+      // "collapses a newline in the busy message" in pod-list-panel.test.ts),
+      // not this handler's — the mocked panel here does not sanitise, so this
+      // only confirms the message still reaches `setBusy` on failure.
+      const messy = new Error('HTTP 500 — {\n  "error": "boom"\n}');
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("a.py"), podFile("b.py")]);
+      vi.spyOn(podApi, "downloadPodFile").mockRejectedValue(messy);
+      vi.spyOn(podApi, "deletePodFile").mockRejectedValue(messy);
+
+      await register(registerDustPodFsCommand)("", ctx());
+      await action("p").run(opened!.options.rows[0], 0);
+      await action("d").run(opened!.options.rows[1], 1);
+
+      const busyStrings = (opened?.setBusy.mock.calls.map((call) => call[0]) ?? []).filter(
+        (msg): msg is string => msg !== null,
+      );
+      expect(busyStrings.some((msg) => msg.includes("boom"))).toBe(true);
     });
 
     it("tells the user to ingest first when nothing is bound", async () => {
@@ -323,8 +567,8 @@ describe("/podfs and /pods", () => {
       await action("p").run(opened!.options.rows[0], 0);
 
       const busy = opened?.setBusy.mock.calls.map((call) => call[0]).join(" ");
-      expect(busy).toContain("Pulled 0 files");
-      expect(busy).toContain("a.py: HTTP 500");
+      expect(busy).toContain("Pulled 0, 1 failed — a.py: HTTP 500");
+      expect(busy).not.toContain("\n");
     });
 
     it("deletes a file and forgets its watermark, so the next push cannot restore it", async () => {
@@ -371,11 +615,14 @@ describe("/podfs and /pods", () => {
 
     it("falls back to a notification when the host has no panel surface", async () => {
       vi.spyOn(podUi, "supportsPanels").mockReturnValue(false);
-      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("a.py", 100)]);
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([podFile("a.py", 1536)]);
 
       await register(registerDustPodFsCommand)("", ctx());
 
+      // The per-file size, same as the panel's detail column, so the flat
+      // fallback still says how big a file is before someone pulls it.
       expect(messages()[0]).toContain("a.py");
+      expect(messages()[0]).toContain("1.5 kB");
       expect(opened).toBeNull();
     });
 

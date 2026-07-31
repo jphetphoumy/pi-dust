@@ -18,6 +18,7 @@ import type { DustPodListPanel, ListRow } from "./dust-pod-list-panel.js";
 import {
   buildPodTree,
   directoryPathsUnder,
+  fileEntriesUnder,
   filePathsUnder,
   flattenPodTree,
   isDirectory,
@@ -51,10 +52,25 @@ function rootOf(runtime: DustSessionRuntime): string {
  * file the user just deleted would come straight back on the next turn.
  */
 function forgetWatermark(root: string, rel: string): void {
+  forgetWatermarks(root, [rel]);
+}
+
+/**
+ * Forgets several files' sync watermarks in one state-file save.
+ *
+ * A folder delete can touch hundreds of paths; calling `forgetWatermark` per
+ * file would be a full read-modify-write of dust-state.json each time.
+ */
+function forgetWatermarks(root: string, rels: readonly string[]): void {
   const binding = getPodBinding(root);
-  if (!binding?.seen[rel]) return;
-  delete binding.seen[rel];
-  savePodBinding(root, binding);
+  if (!binding) return;
+  let changed = false;
+  for (const rel of rels) {
+    if (!binding.seen[rel]) continue;
+    delete binding.seen[rel];
+    changed = true;
+  }
+  if (changed) savePodBinding(root, binding);
 }
 
 /** The outcome of pulling a set of pod files, so the caller can word the report. */
@@ -99,9 +115,22 @@ async function pullPodPaths(
   return summary;
 }
 
-function pullReport(summary: PullSummary, root: string): string {
+/**
+ * Reports a pull's outcome.
+ *
+ * `oneLine` keeps `panel.setBusy()`'s single row short — the first failure
+ * plus a count of the rest, rather than every one. The full per-file report is
+ * for the `notify` path used once the panel has closed, where multiple lines
+ * are fine.
+ */
+function pullReport(summary: PullSummary, root: string, oneLine: boolean): string {
   const head = `Pulled ${summary.pulled} file${summary.pulled === 1 ? "" : "s"} to ${root}`;
   if (summary.failures.length === 0) return `${head}.`;
+  if (oneLine) {
+    const first = summary.failures[0];
+    const rest = summary.failures.length > 1 ? ` (+${summary.failures.length - 1} more)` : "";
+    return `Pulled ${summary.pulled}, ${summary.failures.length} failed — ${first}${rest}`;
+  }
   return `${head}; ${summary.failures.length} failed:\n  ${summary.failures.join("\n  ")}`;
 }
 
@@ -181,11 +210,11 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
       const allFiles = (): string[] => tree.flatMap((node) => filePathsUnder(node));
 
       if (!supportsPanels(runtimeCtx)) {
-        const paths = allFiles();
+        const files = tree.flatMap((node) => fileEntriesUnder(node));
         notify(
-          paths.length === 0
+          files.length === 0
             ? `Pod "${binding.name}" is empty.`
-            : `Pod "${binding.name}":\n${paths.map((path) => `  ${path}`).join("\n")}`,
+            : `Pod "${binding.name}":\n${files.map(({ path, bytes }) => `  ${path}  ${formatBytes(bytes)}`).join("\n")}`,
           "info",
         );
         return;
@@ -202,7 +231,7 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
         flattenPodTree(tree, expanded).map((node) => treeRow(node, expanded, selected));
       const render = (): void => panel?.setRows(toRows());
 
-      const reload = async (): Promise<void> => {
+      const refreshTree = async (): Promise<void> => {
         tree = await loadTree();
         // Directories the user opened stay open; a directory the pod no longer
         // has drops out rather than lingering as a claim about a missing path.
@@ -211,125 +240,220 @@ export function registerDustPodFsCommand(pi: ExtensionAPI, runtime: DustSessionR
         for (const path of [...selected]) {
           if (!live.has(path)) selected.delete(path);
         }
+      };
+
+      const reload = async (): Promise<void> => {
+        await refreshTree();
         render();
       };
 
+      // Whitespace collapsing (including a pulled-through API error body's
+      // newlines) lives in `DustPodListPanel.setBusy` itself now, so every
+      // caller — this one and `/pods` below — gets it for free.
+      const setBusy = (message: string | null): void => panel?.setBusy(message);
+
       /** Reports an action's outcome, then hands the panel back to the user. */
       const flash = (message: string): void => {
-        panel?.setBusy(message);
-        setTimeout(() => panel?.setBusy(null), 1500);
+        setBusy(message);
+        setTimeout(() => setBusy(null), 1500);
       };
 
-      const picked = await openListPanel(
-        runtimeCtx,
-        {
-          title: `Pod "${binding.name}" files`,
-          rows: toRows(),
-          emptyMessage: "This pod holds no files yet.",
-          tree: {
-            toggleSelect: (row) => {
-              toggleSelection(row.value as PodTreeNode, selected);
-              render();
-            },
-            toggleAll: () => {
-              const files = allFiles();
-              const clearing = files.every((path) => selected.has(path));
-              selected.clear();
-              if (!clearing) for (const path of files) selected.add(path);
-              render();
-            },
-            setExpanded: (row, open) => {
-              const node = row.value as PodTreeNode;
-              if (open) expanded.add(node.path);
-              else expanded.delete(node.path);
-              render();
-            },
-          },
-          confirmHint: () => `enter pull ${selected.size}`,
-          actions: [
-            {
-              key: "p",
-              label: "pull this",
-              run: async (row) => {
+      // A directory delete has to bring the panel down for the confirm dialog
+      // to be reachable, which resolves `openListPanel` with `undefined` — the
+      // same value Esc produces. Left alone, that reads as the user cancelling
+      // and throws away whatever they had ticked. `dialogPending` is how the
+      // directory-delete branch tells this loop "I closed it, wait for the
+      // dialog, then put the picker back" instead of "the user is done".
+      let dialogPending: Promise<void> | null = null;
+      let picked: ListRow[] | undefined | null;
+      // Set right before a directory delete closes the panel, so the reopened
+      // picker can land back near where the user was instead of at the top.
+      // Consumed (and cleared) by the very next `openListPanel` call.
+      let pendingFocus: { path: string; index: number } | null = null;
+      // A dialog round trip only ever follows a real keypress, so this is a
+      // backstop against a runaway loop, not a limit anyone should hit.
+      const maxReopens = 1000;
+      const focusNear = (target: { path: string; index: number }) => (rows: ListRow[]): number => {
+        const exact = rows.findIndex((row) => (row.value as PodTreeNode).path === target.path);
+        return exact >= 0 ? exact : Math.min(target.index, rows.length - 1);
+      };
+      for (let attempt = 0; attempt < maxReopens; attempt++) {
+        dialogPending = null;
+        const focusOn = pendingFocus;
+        pendingFocus = null;
+        picked = await openListPanel(
+          runtimeCtx,
+          {
+            title: `Pod "${binding.name}" files`,
+            rows: toRows(),
+            emptyMessage: "This pod holds no files yet.",
+            initialFocus: focusOn ? focusNear(focusOn) : undefined,
+            tree: {
+              toggleSelect: (row) => {
+                toggleSelection(row.value as PodTreeNode, selected);
+                render();
+              },
+              toggleAll: () => {
+                const files = allFiles();
+                const clearing = files.every((path) => selected.has(path));
+                selected.clear();
+                if (!clearing) for (const path of files) selected.add(path);
+                render();
+              },
+              setExpanded: (row, open) => {
                 const node = row.value as PodTreeNode;
-                const paths = filePathsUnder(node);
-                panel?.setBusy(`Pulling ${node.path}…`);
-                const summary = await pullPodPaths(api, binding.podId, root, paths, (done, total) => {
-                  if (total > 1) panel?.setBusy(`Pulling ${node.path}… ${done + 1}/${total}`);
-                });
-                flash(pullReport(summary, root));
+                if (open) expanded.add(node.path);
+                else expanded.delete(node.path);
+                render();
               },
             },
-            {
-              key: "d",
-              label: "delete",
-              run: async (row) => {
-                const node = row.value as PodTreeNode;
-                const paths = filePathsUnder(node);
-                // A folder delete is many deletions behind one keypress, so it
-                // asks first — and the panel has to come down for the dialog to
-                // be reachable, the same way /pods delete does.
-                if (isDirectory(node)) {
-                  panel?.close();
-                  const confirmed = await runtimeCtx.ui?.confirm?.(
-                    `Delete ${paths.length} file${paths.length === 1 ? "" : "s"} under ${node.path}/`,
-                    `This removes them from pod "${binding.name}". Local files are untouched.`,
-                  );
-                  if (!confirmed) {
-                    notify(`Kept ${node.path}/.`, "info");
+            confirmHint: () => `enter pull ${selected.size}`,
+            actions: [
+              {
+                key: "p",
+                label: "pull this",
+                run: async (row) => {
+                  const node = row.value as PodTreeNode;
+                  const paths = filePathsUnder(node);
+                  setBusy(`Pulling ${node.path}…`);
+                  const summary = await pullPodPaths(api, binding.podId, root, paths, (done, total) => {
+                    if (total > 1) setBusy(`Pulling ${node.path}… ${done + 1}/${total}`);
+                  });
+                  flash(pullReport(summary, root, true));
+                  // The busy line only ever shows the first failure; the rest
+                  // would otherwise be silently dropped once it clears — unlike
+                  // the Enter path, which notifies the full report already.
+                  if (summary.failures.length > 0) {
+                    notify(pullReport(summary, root, false), "warning");
+                  }
+                },
+              },
+              {
+                key: "d",
+                label: "delete",
+                run: async (row, index) => {
+                  const node = row.value as PodTreeNode;
+                  const paths = filePathsUnder(node);
+                  // A folder delete is many deletions behind one keypress, so it
+                  // asks first — and the panel has to come down for the dialog to
+                  // be reachable, the same way /pods delete does.
+                  if (isDirectory(node)) {
+                    pendingFocus = { path: node.path, index };
+                    panel?.close();
+                    // The panel is down for the dialog, not because the user is
+                    // done — the loop around this call awaits this promise, then
+                    // reopens the picker so `selected` (untouched by any of this)
+                    // is not silently thrown away. This must never reject: it is
+                    // awaited both here (un-caught, since `run` is dispatched as
+                    // `void action.run(...)`) and by the reopen loop below — a
+                    // rejection either would surface as an unhandled rejection or
+                    // an uncaught throw out of the whole `/podfs` handler, with
+                    // the picker never reopening and the ticked selection lost.
+                    // So each stage that can throw gets its own catch, worded for
+                    // what actually failed rather than folding everything into
+                    // "could not refresh".
+                    dialogPending = (async () => {
+                      let confirmed: boolean | undefined;
+                      try {
+                        confirmed = await runtimeCtx.ui?.confirm?.(
+                          `Delete ${paths.length} file${paths.length === 1 ? "" : "s"} under ${node.path}/`,
+                          `This removes them from pod "${binding.name}". Local files are untouched.`,
+                        );
+                      } catch (err) {
+                        notify(`Could not confirm deleting ${node.path}/: ${errorMessage(err)}`, "error");
+                        return;
+                      }
+                      if (!confirmed) {
+                        notify(`Kept ${node.path}/.`, "info");
+                        return;
+                      }
+                      const deletedPaths: string[] = [];
+                      for (const rel of paths) {
+                        try {
+                          await deletePodFile(api, binding.podId, rel);
+                          deletedPaths.push(rel);
+                        } catch (err) {
+                          notify(`Delete failed for ${rel}: ${errorMessage(err)}`, "error");
+                        }
+                      }
+                      // The notice reflects what really left the pod, so it must
+                      // fire before anything below — the watermark save or the
+                      // tree refresh — gets a chance to fail.
+                      if (deletedPaths.length > 0) {
+                        notify(
+                          `Deleted ${deletedPaths.length} file${deletedPaths.length === 1 ? "" : "s"} from ${node.path}/.`,
+                          "info",
+                        );
+                      }
+                      try {
+                        // One save for the whole folder — per-file would mean a
+                        // full rewrite of dust-state.json per file.
+                        forgetWatermarks(root, deletedPaths);
+                      } catch (err) {
+                        // The files are already gone from the pod; only the
+                        // watermark save failed. Say so precisely — leaving the
+                        // watermark behind means the pre-turn push may re-upload
+                        // these files on the next turn, undoing the delete.
+                        notify(
+                          `Deleted ${node.path}/ but could not clear its sync watermarks: ${errorMessage(err)}. These files may be re-uploaded on the next turn.`,
+                          "error",
+                        );
+                        // Deliberately falls through to the refresh: the save
+                        // failing says nothing about whether the listing can be
+                        // re-fetched, and skipping it would leave the reopened
+                        // picker showing files that are already gone.
+                      }
+                      try {
+                        await refreshTree();
+                      } catch (err) {
+                        notify(`Could not refresh pod files after deleting ${node.path}/: ${errorMessage(err)}`, "error");
+                      }
+                    })();
+                    await dialogPending;
                     return;
                   }
-                  let deleted = 0;
-                  for (const rel of paths) {
-                    try {
-                      await deletePodFile(api, binding.podId, rel);
-                      forgetWatermark(root, rel);
-                      deleted++;
-                    } catch (err) {
-                      notify(`Delete failed for ${rel}: ${errorMessage(err)}`, "error");
-                    }
-                  }
-                  notify(`Deleted ${deleted} file${deleted === 1 ? "" : "s"} from ${node.path}/.`, "info");
-                  return;
-                }
 
-                panel?.setBusy(`Deleting ${node.path}…`);
-                try {
-                  await deletePodFile(api, binding.podId, node.path);
-                  // Drop the watermark too, or the next push restores it.
-                  forgetWatermark(root, node.path);
-                  await reload();
-                  panel?.setBusy(null);
-                } catch (err) {
-                  flash(`Delete failed: ${errorMessage(err)}`);
-                }
+                  setBusy(`Deleting ${node.path}…`);
+                  try {
+                    await deletePodFile(api, binding.podId, node.path);
+                    // Drop the watermark too, or the next push restores it.
+                    forgetWatermark(root, node.path);
+                    await reload();
+                    setBusy(null);
+                  } catch (err) {
+                    flash(`Delete failed: ${errorMessage(err)}`);
+                  }
+                },
               },
-            },
-            {
-              key: "r",
-              label: "reload",
-              run: async () => {
-                panel?.setBusy("Reloading…");
-                try {
-                  await reload();
-                  panel?.setBusy(null);
-                } catch (err) {
-                  flash(`Reload failed: ${errorMessage(err)}`);
-                }
+              {
+                key: "r",
+                label: "reload",
+                run: async () => {
+                  setBusy("Reloading…");
+                  try {
+                    await reload();
+                    setBusy(null);
+                  } catch (err) {
+                    flash(`Reload failed: ${errorMessage(err)}`);
+                  }
+                },
               },
-            },
-          ],
-        },
-        (created) => {
-          panel = created;
-        },
-      );
+            ],
+          },
+          (created) => {
+            panel = created;
+          },
+        );
+
+        if (!dialogPending) break;
+        await dialogPending;
+      }
 
       // In tree mode the panel resolves only to say how it closed; the ticked
       // paths live here, because a collapsed folder's files are not rows.
       if (picked !== undefined && picked !== null && selected.size > 0) {
         const summary = await pullPodPaths(api, binding.podId, root, [...selected]);
-        notify(pullReport(summary, root), summary.failures.length > 0 ? "warning" : "info");
+        notify(pullReport(summary, root, false), summary.failures.length > 0 ? "warning" : "info");
       }
 
       refreshPodStatus(runtime, root);

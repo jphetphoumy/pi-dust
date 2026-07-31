@@ -182,6 +182,28 @@ describe("pod list panel", () => {
     expect(panel.render(80).at(-1)).toContain("Pulling a.py…");
   });
 
+  it("collapses a newline in the busy message so it still renders on one line", () => {
+    // A raw API error body (archive/restore/reload failures, pod-file
+    // deletes, ...) can carry newlines straight through `errorMessage`, and
+    // `visibleWidth("\n")` is 0 — the width-based truncation would not catch
+    // it, breaking the panel frame across several call sites at once.
+    const { panel } = makePanel();
+
+    panel.setBusy('HTTP 500 — {\n  "error": "boom"\n}');
+
+    const rendered = panel.render(80);
+    expect(rendered.some((line) => line.includes("\n"))).toBe(false);
+    expect(rendered.at(-1)).toContain('HTTP 500 — { "error": "boom" }');
+  });
+
+  it("collapses a newline in a row label so it still renders on one line", () => {
+    const { panel } = makePanel({ rows: [{ label: "weird\nname.py" }] });
+
+    const rendered = panel.render(80);
+    expect(rendered.some((line) => line.includes("\n"))).toBe(false);
+    expect(rendered.join("\n")).toContain("weird name.py");
+  });
+
   it("replaces the list after an action, keeping the focus in range", () => {
     const { panel } = makePanel();
 
@@ -224,6 +246,42 @@ describe("pod list panel", () => {
     panel.close();
 
     expect(done).toHaveBeenCalledWith(undefined);
+  });
+
+  it("focuses the row initialFocus picks, instead of the top", () => {
+    const done = vi.fn();
+    const requestRender = vi.fn();
+    const panel = new DustPodListPanel(
+      theme,
+      {
+        title: "Files",
+        rows: [{ label: "a.py" }, { label: "b.py" }, { label: "c.py" }],
+        height: 12,
+        initialFocus: (rows) => rows.findIndex((row) => row.label === "b.py"),
+      },
+      requestRender,
+      done,
+    );
+
+    expect(rowsOf(panel)[1]).toContain("› b.py");
+  });
+
+  it("falls back to the top row when initialFocus has nothing to pick", () => {
+    const done = vi.fn();
+    const requestRender = vi.fn();
+    const panel = new DustPodListPanel(
+      theme,
+      {
+        title: "Files",
+        rows: [{ label: "a.py" }, { label: "b.py" }],
+        height: 12,
+        initialFocus: () => -1,
+      },
+      requestRender,
+      done,
+    );
+
+    expect(rowsOf(panel)[0]).toContain("› a.py");
   });
 
   describe("tree mode", () => {
