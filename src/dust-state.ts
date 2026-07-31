@@ -56,6 +56,20 @@ export interface DustPodBinding {
   /** Skill names synced into the pod by `/dust-skills`. */
   skills?: string[];
   /**
+   * Per-skill digest of what was actually uploaded, keyed by skill name.
+   *
+   * `skills` alone records a *selection*: it survives the skill being edited on
+   * disk afterwards, so the pod's copy silently drifts from the local one and
+   * the agent reads stale instructions. Comparing a fresh `fingerprintSkill`
+   * against this turns "you picked it" into "this exact content is up there",
+   * without a network round trip.
+   *
+   * Optional and written only by `/dust-skills`, so a binding from before this
+   * existed still loads — its skills simply report as unverified until the next
+   * sync fills them in.
+   */
+  skillFingerprints?: Record<string, string>;
+  /**
    * Hash of the AGENTS.md last written to the pod.
    *
    * Lets a turn skip the upload when the instructions have not changed, which

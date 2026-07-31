@@ -12,6 +12,7 @@ import { registerDustIngestCommand } from "./dust-pod-command.js";
 import { registerDustPodFsCommand, registerDustPodsCommand } from "./dust-podfs.js";
 import { registerDustSkillsCommand } from "./dust-skills-command.js";
 import { registerDustStatusCommand } from "./dust-status.js";
+import { registerDustSkillsBanner } from "./dust-pod-skills-banner.js";
 import { registerDustToolRenderer } from "./dust-tool-render.js";
 import { registerDustWorkspaceCommand } from "./dust-workspace.js";
 
@@ -48,6 +49,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   registerDustToolRenderer(pi);
+  registerDustSkillsBanner(pi);
   registerDustApprovalMode(pi, runtime);
   registerDustWorkspaceCommand(pi, runtime);
   registerDustIngestCommand(pi, runtime);

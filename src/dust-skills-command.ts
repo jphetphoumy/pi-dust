@@ -4,6 +4,7 @@ import { podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
 import { podApiFor } from "./dust-pod-runtime.js";
 import {
   discoverLocalSkills,
+  fingerprintSkill,
   type LocalSkill,
   MAX_SKILL_FILES,
   podSkillPathsFor,
@@ -12,7 +13,7 @@ import {
 } from "./dust-pod-skills.js";
 import { openListPanel } from "./dust-pod-ui.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
-import { getPodBinding, savePodBinding } from "./dust-state.js";
+import { type DustPodBinding, getPodBinding, savePodBinding } from "./dust-state.js";
 import type { PiRuntimeContext } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
 
@@ -26,6 +27,76 @@ function skillDetail(skill: LocalSkill): string {
   return `${formatSize(skill.bytes)}, ${skill.files.length} file${skill.files.length === 1 ? "" : "s"}`;
 }
 
+/** Digests for exactly `chosen`, so a de-selected skill leaves no stale claim. */
+function fingerprintsFor(chosen: LocalSkill[]): Record<string, string> {
+  return Object.fromEntries(chosen.map((skill) => [skill.name, fingerprintSkill(skill)]));
+}
+
+/**
+ * `/dust-skills sync` — re-upload the skills already selected.
+ *
+ * The pod's copy of a skill is a snapshot taken when it was synced. Editing the
+ * skill locally afterwards leaves that snapshot in place, and since the agent
+ * reads the pod rather than the disk it goes on following the old version with
+ * nothing to say so. This is the fix, and it deliberately skips the picker: the
+ * selection is not what changed.
+ *
+ * A skill recorded as synced but no longer on disk is dropped rather than
+ * carried: it cannot be re-uploaded, and leaving it in `skills` would keep
+ * AGENTS.md pointing the agent at a directory the pod no longer has a source
+ * for.
+ */
+async function resyncSelectedSkills(args: {
+  api: PodApi;
+  binding: DustPodBinding;
+  root: string;
+  available: LocalSkill[];
+  runtime: DustSessionRuntime;
+  notify: (message: string, level?: string) => void;
+}): Promise<void> {
+  const { api, binding, root, available, runtime, notify } = args;
+  const selected = binding.skills ?? [];
+
+  if (selected.length === 0) {
+    notify("No skills are synced into this pod yet. Run /dust-skills to choose some.", "info");
+    return;
+  }
+
+  const byName = new Map(available.map((skill) => [skill.name, skill]));
+  const chosen = selected.map((name) => byName.get(name)).filter((skill): skill is LocalSkill => skill !== undefined);
+  const missing = selected.filter((name) => !byName.has(name));
+
+  try {
+    const result = await syncSkillsToPod(
+      api,
+      binding.podId,
+      chosen,
+      podProgressReporter(runtime, binding.name),
+    );
+    binding.skills = chosen.map((skill) => skill.name);
+    binding.skillFingerprints = fingerprintsFor(chosen);
+    // The pod's copies moved, so the instructions have to be rewritten — and
+    // when a skill was dropped, the listing itself is now wrong.
+    binding.agentsMdHash = undefined;
+    savePodBinding(root, binding);
+    refreshPodStatus(runtime, root);
+
+    notify(
+      `Re-synced ${chosen.length} skill${chosen.length === 1 ? "" : "s"} ` +
+        `(${result.uploaded.length} files) into "${binding.name}".`,
+      "info",
+    );
+    if (missing.length > 0) {
+      notify(`Dropped ${missing.join(", ")} — no longer on disk.`, "warning");
+    }
+    for (const { rel, reason } of result.skipped) {
+      notify(`Skipped ${rel}: ${reason}`, "warning");
+    }
+  } catch (err) {
+    notify(`Skill re-sync failed: ${errorMessage(err)}`, "error");
+  }
+}
+
 /**
  * `/dust-skills` — choose which of pi's skills to put in the pod.
  *
@@ -37,11 +108,17 @@ function skillDetail(skill: LocalSkill): string {
  * The size and file count are on every row because a skill directory can be
  * megabytes — uploads are one request per file, so picking a large one is a
  * minutes-long operation the user should be able to see coming.
+ *
+ * `/dust-skills sync` re-uploads the current selection without the picker. Once
+ * a skill is in the pod, editing it locally leaves the pod's copy behind — the
+ * agent goes on reading the old version — and re-ticking the same boxes to fix
+ * that is busywork. This is also what refreshes the fingerprints the
+ * `[DustSkills]` section checks.
  */
 export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSessionRuntime): void {
   pi.registerCommand("dust-skills", {
-    description: "Choose which pi skills to sync into the Dust Pod, so the agent reads them for free",
-    handler: async (_args, ctx) => {
+    description: "Choose which pi skills to sync into the Dust Pod (`sync` re-uploads the current set)",
+    handler: async (args, ctx) => {
       const runtimeCtx = ctx as PiRuntimeContext;
       const notify = (message: string, level = "info"): void =>
         runtimeCtx.ui?.notify?.(message, level);
@@ -62,6 +139,12 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
       }
 
       const available = discoverLocalSkills(root);
+
+      if (args.trim().toLowerCase() === "sync") {
+        await resyncSelectedSkills({ api, binding, root, available, runtime, notify });
+        return;
+      }
+
       if (available.length === 0) {
         notify("No pi skills found to sync.", "info");
         return;
@@ -128,6 +211,10 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
         // Recorded so the next turn's AGENTS.md lists exactly these, and so the
         // picker reopens with them already ticked.
         binding.skills = chosen.map((skill) => skill.name);
+        // Built fresh from `chosen`, never merged into the previous map: a
+        // de-selected skill's files are deleted from the pod, so keeping its
+        // digest would claim a skill is synced when it is gone.
+        binding.skillFingerprints = fingerprintsFor(chosen);
         // The instructions have to be rewritten now the skill set has moved.
         binding.agentsMdHash = undefined;
         savePodBinding(root, binding);

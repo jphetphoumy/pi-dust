@@ -1,5 +1,6 @@
 import { formatSkillsForPrompt, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import type { Skill } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
@@ -152,6 +153,35 @@ export function discoverLocalSkills(
 /** Pod-relative path a skill's file takes. */
 export function podSkillPath(skillName: string, relFile: string): string {
   return `${POD_SKILLS_PREFIX}/${skillName}/${relFile}`;
+}
+
+/**
+ * A digest of everything that was uploaded for a skill.
+ *
+ * This is what makes "synced" a checkable claim rather than a record of intent.
+ * `binding.skills` alone only says the user once picked a name: it survives the
+ * skill being edited afterwards, and the copy in the pod then silently differs
+ * from the one on disk — the agent reads stale instructions and nothing says so.
+ *
+ * File *names* are hashed alongside the bytes, so a rename or an added
+ * reference file counts as a change even when no existing file was edited. A
+ * file that cannot be read is folded in as a marker rather than throwing: a
+ * skill that lost a file since the sync is exactly a skill worth reporting as
+ * stale.
+ */
+export function fingerprintSkill(skill: LocalSkill): string {
+  const digest = createHash("sha256");
+  for (const relFile of [...skill.files].sort()) {
+    digest.update(relFile);
+    digest.update("\0");
+    try {
+      digest.update(readFileSync(resolve(skill.baseDir, relFile)));
+    } catch {
+      digest.update("<unreadable>");
+    }
+    digest.update("\0");
+  }
+  return digest.digest("hex");
 }
 
 /**

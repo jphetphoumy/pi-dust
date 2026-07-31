@@ -132,6 +132,105 @@ describe("/dust-skills", () => {
     expect(messages()[0]).toContain("Synced 1 skill");
   });
 
+  it("records a fingerprint per skill, so 'synced' becomes checkable", async () => {
+    // Without this, `skills` is a record of intent: it survives the skill being
+    // edited afterwards, and nothing can tell that the pod's copy has drifted.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    const recorded = getPodBinding(root)?.skillFingerprints;
+    expect(recorded?.herdr).toEqual(expect.any(String));
+    // It is the digest of what is on disk right now.
+    const [skill] = podSkills.discoverLocalSkills(root);
+    expect(recorded?.herdr).toBe(podSkills.fingerprintSkill(skill));
+  });
+
+  it("forgets the fingerprint of a de-selected skill", async () => {
+    // Its files are deleted from the pod, so a lingering digest would claim a
+    // skill is synced when it is gone.
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: {},
+      skills: ["herdr", "other"],
+      skillFingerprints: { herdr: "h", other: "o" },
+    });
+    writeSkill("herdr");
+    writeSkill("other");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    expect(Object.keys(getPodBinding(root)?.skillFingerprints ?? {})).toEqual(["herdr"]);
+  });
+
+  it("`sync` re-uploads the recorded selection without reopening the picker", async () => {
+    // The point of the subcommand: after editing a skill, getting the pod back
+    // in step should not mean re-ticking the same boxes.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr"] });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    expect(podUi.openListPanel).not.toHaveBeenCalled();
+    expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
+    const synced = vi.mocked(podSkills.syncSkillsToPod).mock.calls[0][2];
+    expect(synced.map((skill) => skill.name)).toEqual(["herdr"]);
+    expect(messages()[0]).toContain("Re-synced");
+  });
+
+  it("`sync` refreshes the fingerprints, so the section stops reporting stale", async () => {
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: {},
+      skills: ["herdr"],
+      skillFingerprints: { herdr: "digest-from-before-the-edit" },
+    });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    const [skill] = podSkills.discoverLocalSkills(root);
+    expect(getPodBinding(root)?.skillFingerprints?.herdr).toBe(podSkills.fingerprintSkill(skill));
+  });
+
+  it("`sync` drops a skill that has gone from disk", async () => {
+    // Re-uploading is impossible and claiming it is synced would be a lie, so
+    // the selection has to shrink to what still exists.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr", "vanished"] });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    expect(getPodBinding(root)?.skills).toEqual(["herdr"]);
+    expect(messages().join(" ")).toContain("vanished");
+  });
+
+  it("`sync` says so when nothing has been selected yet", async () => {
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    expect(podSkills.syncSkillsToPod).not.toHaveBeenCalled();
+    expect(messages()[0]).toContain("No skills");
+  });
+
+  it("`sync` rewrites the instructions, since the pod's copies moved", async () => {
+    savePodBinding(root, {
+      podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr"], agentsMdHash: "stale",
+    });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    expect(getPodBinding(root)?.agentsMdHash).toBeUndefined();
+  });
+
   it("accepts an empty selection as 'offer the agent none'", async () => {
     savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr"] });
     writeSkill("herdr");
