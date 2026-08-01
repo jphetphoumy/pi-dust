@@ -44,8 +44,29 @@ describe("/ingest command", () => {
     writeFileSync(path, content);
   }
 
+  /**
+   * Runs git against the throwaway fixture repo at `root` — never the real
+   * one this test file lives in.
+   *
+   * A plain `execFileSync("git", ...)` inherits `process.env`, which is safe
+   * when the suite runs standalone but not when it runs as a descendant of
+   * this repo's own pre-commit hook (`npm test` under `simple-git-hooks`):
+   * git hook processes get `GIT_DIR`/`GIT_INDEX_FILE` set in their
+   * environment, pointing at the enclosing repo, and child processes inherit
+   * them. With `GIT_DIR` set but `GIT_WORK_TREE` unset, git falls back to
+   * treating the *current directory* as the work tree — so `git add -A` here
+   * would stage `root`'s handful of fixture files as the enclosing repo's
+   * entire tree, staging a deletion for every real file not present in
+   * `root`. Scrubbing the repo-locating `GIT_*` vars forces this `git` to
+   * discover the repo from `cwd` alone, the same as running the suite
+   * standalone.
+   */
   function git(...args: string[]): void {
-    execFileSync("git", args, { cwd: root, stdio: "ignore" });
+    const env = { ...process.env };
+    for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR"]) {
+      delete env[key];
+    }
+    execFileSync("git", args, { cwd: root, stdio: "ignore", env });
   }
 
   beforeEach(() => {
