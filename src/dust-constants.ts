@@ -22,3 +22,13 @@ export const DUST_HEADERS = {
 };
 
 export const DUST_MCP_PROTOCOL_VERSION = "2025-06-18";
+
+/**
+ * Per-tool timeout advertised to Dust via `_meta.dust.timeoutMs` in tools/list
+ * responses. Dust's own MCP request timeout defaults to 3 minutes, which
+ * expires while our tools/call handler is still blocked on the local
+ * approval dialog. Dust's Temporal activity ceiling is
+ * `max(10min, 3min) + 60s` = 11 minutes and ignores anything we declare above
+ * it, so 10 minutes is the largest value that is actually honoured end to end.
+ */
+export const MCP_TOOL_TIMEOUT_MS = 10 * 60 * 1000;

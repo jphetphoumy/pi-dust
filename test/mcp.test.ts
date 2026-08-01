@@ -751,7 +751,7 @@ describe("dust extension", () => {
       expect(tools.some((t: any) => t.name === "edit")).toBe(true);
     });
 
-    it("tools/list response tools have name, description, and inputSchema", async () => {
+    it("tools/list response tools carry name, description, inputSchema and the Dust timeout override", async () => {
       const { capturedStreamSimple } = await setupWithMcpListener();
 
       const toolsListRequest = { jsonrpc: "2.0", id: "req-list-2", method: "tools/list", params: {} };
@@ -773,6 +773,10 @@ describe("dust extension", () => {
       expect(typeof bashTool.description).toBe("string");
       expect(bashTool.description.length).toBeGreaterThan(0);
       expect(bashTool.inputSchema).toMatchObject({ type: "object" });
+      // `_meta.dust.timeoutMs` must survive JSON.stringify to /mcp/results —
+      // it's what stops Dust's 3-minute default from expiring while the
+      // local approval dialog is still open.
+      expect(bashTool._meta).toEqual({ dust: { timeoutMs: 600_000 } });
     });
 
     it("responds to tools/call bash with the command output", async () => {

@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
+import { MCP_TOOL_TIMEOUT_MS } from "../src/dust-constants.js";
 import { buildConfirmMessage, executeMcpTool, getMcpTools } from "../src/dust-tools.js";
 
 function makeTempDir(prefix: string): string {
@@ -44,6 +45,16 @@ describe("dust local tools", () => {
       expect(tool.description, `${tool.name} description`).toBeTruthy();
       // TypeBox schemas are already JSON Schema, so they pass through to MCP.
       expect(tool.inputSchema, `${tool.name} schema`).toMatchObject({ type: "object" });
+    }
+  });
+
+  it("advertises a Dust timeout override on every tool, under the 11-minute activity ceiling", () => {
+    // Dust's default MCP request timeout is 3 minutes and expires while the
+    // local approval dialog is open; `_meta.dust.timeoutMs` overrides it.
+    // Dust's Temporal activity ceiling is max(10min, 3min) + 60s = 11 minutes.
+    expect(MCP_TOOL_TIMEOUT_MS).toBeLessThan(11 * 60 * 1000);
+    for (const tool of getMcpTools(makeCtx(process.cwd()))) {
+      expect(tool._meta, `${tool.name} _meta`).toEqual({ dust: { timeoutMs: MCP_TOOL_TIMEOUT_MS } });
     }
   });
 

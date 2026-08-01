@@ -8,6 +8,7 @@ import {
   createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { MCP_TOOL_TIMEOUT_MS } from "./dust-constants.js";
 import type { McpToolArgs } from "./dust-types.js";
 import { errorMessage } from "./dust-validation.js";
 
@@ -20,6 +21,12 @@ export interface McpToolSpec {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /**
+   * Dust reads `_meta.dust.timeoutMs` per tool and overrides its 3-minute
+   * default MCP request timeout. Without it, a slow local approval dialog
+   * times the call out on Dust's side before the tool ever runs.
+   */
+  _meta: { dust: { timeoutMs: number } };
 }
 
 /**
@@ -67,6 +74,7 @@ export function getMcpTools(ctx?: ExtensionContext): McpToolSpec[] {
     name: definition.name,
     description: definition.description,
     inputSchema: definition.parameters as unknown as Record<string, unknown>,
+    _meta: { dust: { timeoutMs: MCP_TOOL_TIMEOUT_MS } },
   }));
 }
 

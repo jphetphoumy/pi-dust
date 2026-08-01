@@ -2,7 +2,7 @@ import { CANCELLED_TOOL_MESSAGE, DUST_MCP_PROTOCOL_VERSION, MCP_REGISTRATION_LOS
 import { debugLog } from "./dust-debug.js";
 import type { JsonObject } from "./dust-types.js";
 import { parseMcpRegisterResponse, parseMcpRequest, isRecord } from "./dust-validation.js";
-import { type McpToolResult } from "./dust-tools.js";
+import { type McpToolResult, type McpToolSpec } from "./dust-tools.js";
 
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
@@ -130,7 +130,7 @@ interface ListenMcpRequestsOptions {
   serverId: string;
   abortController: AbortController;
   buildConfirmMessage: (toolName: string, args: JsonObject) => string;
-  getTools: () => Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
+  getTools: () => McpToolSpec[];
   executeMcpTool: (name: string, args: JsonObject) => Promise<McpToolResult>;
   getConfirmFn: () => (title: string, message: string) => Promise<boolean>;
   getPendingApprovalPromise: () => Promise<void> | null;
