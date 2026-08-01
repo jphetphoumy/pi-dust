@@ -248,17 +248,50 @@ Responsibilities:
 - recognize a lost registration (403/404) as distinct from a dead session, and
   signal it so the runtime clears state for `dust-stream-provider.ts` to
   re-register on the next turn instead of running toolless
+- refuse a `tools/call` for a tool pi's active set no longer includes
+  (`isToolActive`), ahead of the approval prompt and before any queued
+  pre-approval is consumed — see the known limitation below
+
+**Known limitation — the advertised catalogue is a turn-boundary snapshot, not live.**
+Dust reads our MCP tool catalogue at most once per registration
+(`tools/list`) and caches it for the whole run
+(`listToolsForClientSideMCPServer`); it does not implement MCP's
+`notifications/tools/list_changed`, so there is no in-band way to tell it the
+catalogue moved. `dust-stream-provider.ts` compensates by diffing pi's active
+tools (via `dust-tools.ts`'s `advertisedToolNames`) at the top of every turn
+and re-registering (`runtime.clearMcpState()` + `ensureMcpServer`) when that
+diff changes — see `DustSessionRuntime#toolCatalogueChanged`. The listener's
+`getTools` closure also records what it actually just handed Dust
+(`DustSessionRuntime#recordAdvertisedTools`), reconciling the baseline with
+ground truth rather than trusting the diff's own prediction, since a
+registration can happen (a lost heartbeat, a stale extension handle on the
+triggering turn) at a moment the diff itself couldn't observe.
+
+This staleness is advertisement-only, not a hole in enforcement: what a tool
+call can actually *do* is gated independently and instantly, at the listener
+(`isToolActive` in `dust-mcp.ts`'s `listenMcpRequests`, checked ahead of the
+approval prompt and before any queued pre-approval is consumed) — so a
+`setActiveTools` call mid-turn is authoritative for execution immediately,
+even though Dust's own cached catalogue still lists the disabled tool until
+the next re-registration. Tools registered by other pi extensions are still
+never visible to Dust at all, because our catalogue only ever contains the
+fixed set of pi built-ins this extension knows how to execute (routing
+arbitrary pi tools through this bridge is tracked separately, issue #52).
 
 ### `src/dust-tools.ts`
 
 Local tool catalog and executors.
 
-Provided tools:
+Provided tools (pi's own built-ins, intersected with pi's currently active
+tool set — see the limitation above):
 
 - `bash`
 - `read`
 - `write` (create or overwrite — `edit` is substitution-only and cannot create)
 - `edit`
+- `grep`
+- `find`
+- `ls`
 
 The module also formats the confirmation message shown to the user before a
 tool runs.
@@ -310,6 +343,9 @@ That container tracks:
 - an in-flight refresh promise, shared so concurrent 401s from the event
   stream, the MCP listener, the MCP heartbeat and `/status` credit fetches
   single-flight
+- the tool catalogue last advertised to Dust, so a change to pi's active
+  tools forces exactly one re-registration (see the known limitation under
+  `src/dust-mcp.ts`)
 
 This runtime state is reset when sessions switch, credentials are invalidated,
 or the extension needs to clear MCP state — which also happens when the MCP

@@ -415,4 +415,87 @@ describe("dust runtime", () => {
       expect(usageCalls).toBe(2);
     });
   });
+
+  describe("tool catalogue diff (issue #51)", () => {
+    it("reports no change on the first observation — there is no baseline yet", () => {
+      const runtime = new DustSessionRuntime();
+
+      expect(runtime.toolCatalogueChanged(["bash", "read"])).toBe(false);
+    });
+
+    it("ignores ordering — it is a set comparison", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.toolCatalogueChanged(["bash", "read"]);
+
+      expect(runtime.toolCatalogueChanged(["read", "bash"])).toBe(false);
+    });
+
+    it("reports a change when the set shrinks, then settles — no re-registration loop", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.toolCatalogueChanged(["bash", "read"]);
+
+      expect(runtime.toolCatalogueChanged(["read"])).toBe(true);
+      expect(runtime.toolCatalogueChanged(["read"])).toBe(false);
+    });
+
+    it("an unreadable turn (null) neither reports a change nor clobbers the baseline", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.toolCatalogueChanged(["bash", "read"]);
+
+      expect(runtime.toolCatalogueChanged(null)).toBe(false);
+      // The baseline from before the null turn is still in force.
+      expect(runtime.toolCatalogueChanged(["read"])).toBe(true);
+    });
+
+    it("clearMcpState does not reset the baseline", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.toolCatalogueChanged(["bash", "read"]);
+
+      runtime.clearMcpState();
+
+      expect(runtime.toolCatalogueChanged(["read"])).toBe(true);
+    });
+
+    it("resetSessionState resets the baseline — a new session starts with none", () => {
+      const runtime = new DustSessionRuntime();
+      runtime.toolCatalogueChanged(["bash", "read"]);
+
+      runtime.resetSessionState();
+
+      expect(runtime.toolCatalogueChanged(["read"])).toBe(false);
+    });
+
+    it("does not mutate the array passed in", () => {
+      const runtime = new DustSessionRuntime();
+      const names = ["read", "bash"];
+
+      runtime.toolCatalogueChanged(names);
+
+      expect(names).toEqual(["read", "bash"]);
+    });
+
+    it("recordAdvertisedTools overwrites the baseline unconditionally, reconciling it with ground truth", () => {
+      const runtime = new DustSessionRuntime();
+      // toolCatalogueChanged left a stale baseline behind (e.g. an
+      // unreadable turn kept whatever predated it).
+      runtime.toolCatalogueChanged(["bash", "read"]);
+
+      // Dust actually fetched the catalogue and got something else — record
+      // what was really handed over.
+      runtime.recordAdvertisedTools(["read"]);
+
+      // The next diff compares against the true value, not the stale guess.
+      expect(runtime.toolCatalogueChanged(["read"])).toBe(false);
+      expect(runtime.toolCatalogueChanged(["bash", "read"])).toBe(true);
+    });
+
+    it("recordAdvertisedTools does not mutate the array passed in", () => {
+      const runtime = new DustSessionRuntime();
+      const names = ["read", "bash"];
+
+      runtime.recordAdvertisedTools(names);
+
+      expect(names).toEqual(["read", "bash"]);
+    });
+  });
 });

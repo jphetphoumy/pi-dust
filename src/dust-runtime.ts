@@ -248,6 +248,19 @@ export class DustSessionRuntime {
   private lastTurnCancelled = false;
   /** Agent messages the user cancelled, for correlating late tool calls. */
   private cancelledAgentMessages = new Set<string>();
+  /**
+   * The tool catalogue last observed at a turn boundary, sorted.
+   *
+   * Dust reads our catalogue once, at MCP registration, and caches it for the
+   * whole run (`listToolsForClientSideMCPServer`); it does not handle
+   * `notifications/tools/list_changed`. Re-registering is the only way to
+   * move it, so each turn compares what we would advertise now against this
+   * snapshot — see `toolCatalogueChanged()`.
+   *
+   * Null means "no baseline yet": the very first turn of a session, or right
+   * after `resetSessionState()`.
+   */
+  private lastAdvertisedTools: string[] | null = null;
 
   beginTurn(
     conversationSId: string,
@@ -457,6 +470,64 @@ export class DustSessionRuntime {
     }
   }
 
+  /**
+   * Whether the catalogue Dust holds is stale, recording `names` as the new
+   * baseline.
+   *
+   * Invariants that keep this from looping:
+   * - the snapshot is stored on every call, changed or not, so one change
+   *   triggers exactly one re-registration and the turn after it agrees;
+   * - no baseline (first turn) is never "changed" — `ensureMcpServer` is
+   *   about to register with the current catalogue anyway, so reporting a
+   *   change here would only clear state that is already clear;
+   * - `names === null` means the registry was unreadable, which is an
+   *   absence of information, not a change. The previous baseline is
+   *   deliberately kept rather than overwritten, so a single unreadable turn
+   *   does not blind the comparison on the turn after it.
+   *
+   * Deliberately NOT reset by `clearMcpState()` — that method fires from
+   * arbitrary async callbacks (heartbeat 403, listener SSE 404, mid-turn),
+   * and a switched session (`/new`, `/resume`, `/fork` — `attachConversation`
+   * in dust-session-events.ts) goes through `clearMcpState()`, not
+   * `resetSessionState()`. Keeping the baseline there is safe *because*
+   * `mcpServerId` is already null on those paths: `ensureMcpServer`
+   * re-registers unconditionally regardless of what this diff reports, and
+   * `recordAdvertisedTools()` (called from the MCP listener's `getTools`,
+   * whenever Dust actually fetches the fresh registration's catalogue) is
+   * what reconciles the baseline with ground truth afterwards — see its
+   * doc. `resetSessionState()` clears it directly too, since a brand new
+   * session has no baseline to speak of yet.
+   */
+  toolCatalogueChanged(names: readonly string[] | null): boolean {
+    if (names === null) return false;
+    const next = [...names].sort();
+    const previous = this.lastAdvertisedTools;
+    this.lastAdvertisedTools = next;
+    if (previous === null) return false;
+    return previous.length !== next.length || previous.some((name, i) => name !== next[i]);
+  }
+
+  /**
+   * Records `names` as the catalogue actually just handed to Dust —
+   * unconditionally, unlike `toolCatalogueChanged`'s speculative write.
+   *
+   * Called from the MCP listener's `getTools` closure (dust-stream-provider.ts)
+   * every time Dust calls `tools/list`, which is the one moment the baseline
+   * can be made to exactly match what Dust has cached, rather than what the
+   * turn-boundary diff *predicted* it would be. That prediction can miss:
+   * pi's active tools may be unreadable on the turn that triggers a
+   * registration (so `toolCatalogueChanged` deliberately left the old
+   * baseline untouched), and `tools/list` itself fires whenever Dust gets
+   * around to it, not necessarily inside the turn that registered. Without
+   * this, such a registration's real catalogue could permanently disagree
+   * with the baseline, and a later turn's diff — comparing fresh, readable
+   * active tools against that wrong baseline — could find "no change" and
+   * never correct Dust's actual stale copy.
+   */
+  recordAdvertisedTools(names: readonly string[]): void {
+    this.lastAdvertisedTools = [...names].sort();
+  }
+
   clearMcpState(): void {
     // Switching session or losing credentials ends any turn in flight; its
     // local tools must not keep running against the old session.
@@ -487,6 +558,7 @@ export class DustSessionRuntime {
     this.credits.reset();
     this.clearRefreshedAccessToken();
     this.clearMcpState();
+    this.lastAdvertisedTools = null;
   }
 }
 
