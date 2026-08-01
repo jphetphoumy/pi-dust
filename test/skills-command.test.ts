@@ -258,6 +258,19 @@ describe("/dust-skills", () => {
     expect(messages().join(" ")).toContain("vanished");
   });
 
+  it("`sync` deletes a vanished skill's pod copy, not just its name from the selection", async () => {
+    // Leaving the pod files behind would make the next sync's adoption logic
+    // find an untracked skills/<name>/ subtree with a SKILL.md and treat the
+    // skill the user just deleted as agent-authored, installing it right back
+    // into .pi/skills/<name>/.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr", "vanished"] });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    expect(podSkills.removeSkillsFromPod).toHaveBeenCalledWith(expect.anything(), "vlt_1", ["vanished"]);
+  });
+
   it("`sync` drops a vanished skill's own watermarks too, not just its name", async () => {
     // Once `vanished` leaves `binding.skills`, its files stop being routed by
     // syncPod's synced-skill branch. A stale watermark left behind — no local

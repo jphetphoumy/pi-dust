@@ -69,6 +69,13 @@ async function resyncSelectedSkills(args: {
   const missing = selected.filter((name) => !byName.has(name));
 
   try {
+    // A `missing` skill's pod copy has to go, not just its name from the
+    // selection — otherwise the next sync's adoption logic finds an
+    // untracked, un-watermarked `skills/<name>/` subtree with a SKILL.md and
+    // treats the skill the user just deleted as one the agent authored,
+    // installing it right back into `.pi/skills/<name>/`.
+    await removeSkillsFromPod(api, binding.podId, missing);
+
     const result = await syncSkillsToPod(
       api,
       binding.podId,
