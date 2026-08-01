@@ -156,6 +156,20 @@ export function podSkillPath(skillName: string, relFile: string): string {
 }
 
 /**
+ * Splits a pod-relative path under `skills/` into the skill name and the
+ * file's path within it, or `null` when `rel` is not skill-shaped.
+ *
+ * The inverse of `podSkillPath`, used on the pull side where the extension
+ * only has the pod's flat listing to work from.
+ */
+export function splitPodSkillPath(rel: string): { name: string; relFile: string } | null {
+  const match = /^skills\/([^/]+)\/(.+)$/.exec(rel);
+  if (!match) return null;
+  const [, name, relFile] = match as unknown as [string, string, string];
+  return { name, relFile };
+}
+
+/**
  * A digest of everything that was uploaded for a skill.
  *
  * This is what makes "synced" a checkable claim rather than a record of intent.
@@ -182,6 +196,20 @@ export function fingerprintSkill(skill: LocalSkill): string {
     digest.update("\0");
   }
   return digest.digest("hex");
+}
+
+/**
+ * `fingerprintSkill`, but reading the file list fresh off disk instead of
+ * trusting a `LocalSkill.files` snapshot.
+ *
+ * After a pod-side pull writes into a skill's directory, any `LocalSkill`
+ * held from before that write is stale — the pod may have added or removed a
+ * file `skillFiles` never walked. This is the disk-truthful digest for that
+ * moment.
+ */
+export function fingerprintSkillAt(baseDir: string): string {
+  const { files } = skillFiles(baseDir);
+  return fingerprintSkill({ name: "", description: "", baseDir, filePath: "", files, bytes: 0 });
 }
 
 /**

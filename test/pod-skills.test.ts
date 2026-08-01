@@ -12,6 +12,7 @@ import {
   podSkillPath,
   removeSkillsFromPod,
   skillSearchDirs,
+  splitPodSkillPath,
   stripSkillsListing,
   syncSkillsToPod,
 } from "../src/dust-pod-skills.js";
@@ -270,8 +271,6 @@ describe("pod skills", () => {
   });
 
   describe("path ownership", () => {
-    const bound = (skills: string[]) => ({ podId: "vlt_1", name: "proj", seen: {}, skills });
-
     it("builds pod paths under the skills prefix", () => {
       expect(podSkillPath("herdr", "SKILL.md")).toBe("skills/herdr/SKILL.md");
     });
@@ -294,13 +293,25 @@ describe("pod skills", () => {
       expect(isPodSkillPath("skills/herdr/SKILL.md", [])).toBe(false);
     });
 
-    it("keeps the extension's own pod files out of the pull direction", () => {
-      // Otherwise AGENTS.md and copies of the user's skill files would be
-      // written into their project as if they had authored them.
-      expect(isPodOwnedPath("AGENTS.md", bound([]))).toBe(true);
-      expect(isPodOwnedPath("skills/herdr/SKILL.md", bound(["herdr"]))).toBe(true);
-      expect(isPodOwnedPath("src/main.py", bound(["herdr"]))).toBe(false);
-      expect(isPodOwnedPath("skills/theirs/x.md", bound(["herdr"]))).toBe(false);
+    it("keeps only the extension's own rendered files out of the pull direction", () => {
+      // AGENTS.md is never pulled. A synced skill's files are NOT excluded
+      // here any more — they come back through syncPod's skill-routing branch
+      // instead, which is what fixes #54.
+      expect(isPodOwnedPath("AGENTS.md")).toBe(true);
+      expect(isPodOwnedPath("skills/herdr/SKILL.md")).toBe(false);
+      expect(isPodOwnedPath("src/main.py")).toBe(false);
+      expect(isPodOwnedPath("skills/theirs/x.md")).toBe(false);
+    });
+
+    it("splits a pod skill path into the skill name and its file", () => {
+      expect(splitPodSkillPath("skills/herdr/SKILL.md")).toEqual({ name: "herdr", relFile: "SKILL.md" });
+      expect(splitPodSkillPath("skills/herdr/refs/a.md")).toEqual({ name: "herdr", relFile: "refs/a.md" });
+    });
+
+    it("does not split a path that is not skill-shaped", () => {
+      expect(splitPodSkillPath("src/main.py")).toBeNull();
+      expect(splitPodSkillPath("skills/herdr")).toBeNull();
+      expect(splitPodSkillPath("AGENTS.md")).toBeNull();
     });
   });
 

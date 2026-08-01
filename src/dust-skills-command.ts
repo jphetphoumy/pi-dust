@@ -5,6 +5,7 @@ import { podApiFor } from "./dust-pod-runtime.js";
 import {
   discoverLocalSkills,
   fingerprintSkill,
+  isPodSkillPath,
   type LocalSkill,
   MAX_SKILL_FILES,
   podSkillPathsFor,
@@ -183,7 +184,13 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
       // `skills/` is a plausible project directory, so a skill whose name
       // collides with one the user already tracks there would have its files
       // overwritten by ours — and then excluded from syncing back down.
-      const tracked = Object.keys(binding.seen);
+      //
+      // A currently-synced skill's own watermarks are excluded from this
+      // check: they route back to that skill's real local directory (see
+      // `syncSyncedSkillEntry` in dust-pod-sync.ts), not to `skills/<name>/`
+      // on disk, so re-picking a skill the user already selected must not
+      // trip a false "you already have files there" warning.
+      const tracked = Object.keys(binding.seen).filter((rel) => !isPodSkillPath(rel, binding.skills ?? []));
       const collisions = chosen
         .map((skill) => skill.name)
         .filter((name) => tracked.some((rel) => rel.startsWith(podSkillPathsFor(name))));

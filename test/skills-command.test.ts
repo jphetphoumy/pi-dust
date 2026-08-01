@@ -317,6 +317,26 @@ describe("/dust-skills", () => {
     expect(podSkills.syncSkillsToPod).not.toHaveBeenCalled();
   });
 
+  it("does not flag a skill's own watermarks as a collision with itself", async () => {
+    // A pod-side pull to a synced skill (#54) leaves watermarks under
+    // `skills/<name>/` in `seen`, routed to the skill's real local directory
+    // rather than to disk at that path. Re-picking the same skill here must
+    // not read its own bookkeeping as "the project already has files there".
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: { "skills/herdr/SKILL.md": { podMs: 1, hash: "h" } },
+      skills: ["herdr"],
+    });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    expect(messages().some((m) => m.includes("already has files"))).toBe(false);
+    expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
+  });
+
   it("allows a skill when the project's skills/ holds unrelated files", async () => {
     savePodBinding(root, {
       podId: "vlt_1",
