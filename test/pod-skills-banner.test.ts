@@ -73,6 +73,45 @@ describe("the [DustSkills] startup section", () => {
     expect(banner).toEqual([{ name: "old", state: "unverified" }]);
   });
 
+  it("downgrades a fingerprint match to unverified when the skill has no recorded pod watermark", () => {
+    // A fingerprint match alone only says "we have not edited this since we
+    // tried to upload it" — it says nothing about whether the upload's
+    // watermark settle (see syncSkillsToPod) ever actually confirmed landing
+    // in the pod. `seen` is the only place that confirmation lives.
+    const banner = buildDustSkillsBanner(
+      [skill("unsettled"), skill("confirmed")],
+      {
+        skills: ["unsettled", "confirmed"],
+        skillFingerprints: { unsettled: "fp", confirmed: "fp" },
+        seen: { "skills/confirmed/SKILL.md": { podMs: 1, hash: "h" } },
+      },
+      () => "fp",
+    );
+
+    expect(banner).toEqual([
+      { name: "confirmed", state: "synced" },
+      { name: "unsettled", state: "unverified" },
+    ]);
+  });
+
+  it("leaves synced skills alone when seen is omitted or empty", () => {
+    // Callers that predate this field, or an entirely fresh binding, must not
+    // have every skill downgraded just because `seen` has nothing in it yet.
+    const withoutSeen = buildDustSkillsBanner(
+      [skill("old-caller")],
+      { skills: ["old-caller"], skillFingerprints: { "old-caller": "fp" } },
+      () => "fp",
+    );
+    const withEmptySeen = buildDustSkillsBanner(
+      [skill("old-caller")],
+      { skills: ["old-caller"], skillFingerprints: { "old-caller": "fp" }, seen: {} },
+      () => "fp",
+    );
+
+    expect(withoutSeen).toEqual([{ name: "old-caller", state: "synced" }]);
+    expect(withEmptySeen).toEqual([{ name: "old-caller", state: "synced" }]);
+  });
+
   it("drops a skill that is recorded as synced but no longer on disk", () => {
     // `skills` is the last selection, not a live view.
     const banner = buildDustSkillsBanner(
