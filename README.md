@@ -55,6 +55,12 @@ just setup-dev
 just check
 ```
 
+If you're working inside [herdr](https://herdr.dev), `just feature <name>`
+spins up an isolated worktree, branch, and herdr workspace (with a
+Claude Code instance and a live `hunk` diff tab) for a new feature;
+`just delete <name>` tears it back down. See the
+[development guide](docs/development.md#feature-worktree-harness).
+
 If you use Nix, the repository also provides a dev shell:
 
 ```bash

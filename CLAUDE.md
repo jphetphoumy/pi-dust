@@ -20,6 +20,13 @@ make setup-dev    # First-time setup: install deps + git hooks
 make changelog    # Generate/update CHANGELOG.md
 ```
 
+Feature worktree harness (requires `just`, `herdr`, `claude`, `hunk` on `PATH`, run from inside a herdr pane):
+
+```bash
+just feature <name>  # New worktree + branch + herdr workspace (claude in auto mode + a live hunk diff tab)
+just delete <name>   # Tear down that worktree, branch, and herdr workspace
+```
+
 Run a single test file:
 ```bash
 npx vitest run test/dust-auth.test.ts
