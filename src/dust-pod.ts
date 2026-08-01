@@ -157,7 +157,7 @@ async function requestJson<T>(api: PodApi, path: string, init: RequestInit = {})
   try {
     return JSON.parse(text) as T;
   } catch (err) {
-    throw new Error(`Dust pod API returned non-JSON on ${path}: ${errorMessage(err)}`);
+    throw new Error(`Dust pod API returned non-JSON on ${path}: ${errorMessage(err)}`, { cause: err });
   }
 }
 
