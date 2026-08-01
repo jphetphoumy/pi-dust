@@ -8,7 +8,11 @@ import { clearInvalidated, persistCredentialState } from "./dust-state.js";
 import { createDustStreamHandler } from "./dust-stream-provider.js";
 import type { DustCredentials, ExtensionAPIWithEvents } from "./dust-types.js";
 import { registerDustApprovalMode } from "./dust-approval.js";
+import { registerDustIngestCommand } from "./dust-pod-command.js";
+import { registerDustPodFsCommand, registerDustPodsCommand } from "./dust-podfs.js";
+import { registerDustSkillsCommand } from "./dust-skills-command.js";
 import { registerDustStatusCommand } from "./dust-status.js";
+import { registerDustSkillsBanner } from "./dust-pod-skills-banner.js";
 import { registerDustToolRenderer } from "./dust-tool-render.js";
 import { registerDustWorkspaceCommand } from "./dust-workspace.js";
 
@@ -45,7 +49,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   registerDustToolRenderer(pi);
+  registerDustSkillsBanner(pi);
   registerDustApprovalMode(pi, runtime);
   registerDustWorkspaceCommand(pi, runtime);
+  registerDustIngestCommand(pi, runtime);
+  registerDustPodFsCommand(pi, runtime);
+  registerDustPodsCommand(pi, runtime);
+  registerDustSkillsCommand(pi, runtime);
   registerDustStatusCommand(pi, runtime);
 }

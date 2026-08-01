@@ -46,6 +46,11 @@ export interface UiLike {
   confirm?: (title: string, message: string) => Promise<boolean>;
   notify?: (message: string, level: string) => void;
   select?: WorkspaceSelector;
+  /**
+   * Writes an extension's entry in pi's footer. Keyed so several extensions can
+   * share the row; passing `undefined` removes ours.
+   */
+  setStatus?: (key: string, text: string | undefined) => void;
 }
 
 /**

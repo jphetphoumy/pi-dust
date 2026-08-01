@@ -16,6 +16,18 @@ export function dustApiUrl(region: string): string {
   return region === "europe-west1" ? DUST_EU_URL : DUST_US_URL;
 }
 
+/**
+ * Base for Dust's *private* API (`/api/w/:wId/…`), as opposed to the versioned
+ * `/api/v1` surface the conversation endpoints use.
+ *
+ * These routes sit behind `sessionAuth`, which accepts a bearer token as well
+ * as a cookie, so the WorkOS access token we already hold reaches them — no
+ * extra scope and no API key. Credits and Pod files both live here.
+ */
+export function privateApiBaseUrl(region: string, workspaceId: string): string {
+  return `${dustApiUrl(region)}/api/w/${workspaceId}`;
+}
+
 export function slugify(name: string): string {
   return name
     .replace(/([a-z])([A-Z])/g, "$1-$2")

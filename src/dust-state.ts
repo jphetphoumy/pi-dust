@@ -24,12 +24,59 @@ export interface DustState {
   region?: string;
   username?: string;
   conversations?: Record<string, string>;
+  /** Pod binding per project root, keyed by absolute path. See `DustPodBinding`. */
+  pods?: Record<string, DustPodBinding>;
   /**
    * Set when we detect the stored session is dead (refresh rejected, or Dust
    * answered 401). pi still holds a token-shaped blob in auth.json, so this is
    * how we force the "logged out" path until the next successful login.
    */
   invalidated?: boolean;
+}
+
+/**
+ * A project root ingested into a Dust Pod.
+ *
+ * `seen` is the sync watermark: for each relative path, the pod-side
+ * `lastModifiedMs` and the SHA-256 of the content as of the last time the two
+ * sides agreed. Both halves are needed to tell the three cases apart — pod
+ * changed (download), local changed (upload), or both (conflict, leave alone).
+ */
+export interface DustPodBinding {
+  podId: string;
+  name: string;
+  seen: Record<string, { podMs: number; hash: string }>;
+  /**
+   * The pathspecs `/ingest` was given, replayed by the pre-turn push so files
+   * created since are picked up. Without them the push would either miss new
+   * files or, if it re-selected the whole tree, sweep up everything the user
+   * deliberately left out. Absent means the whole directory.
+   */
+  pathspecs?: string[];
+  /** Skill names synced into the pod by `/dust-skills`. */
+  skills?: string[];
+  /**
+   * Per-skill digest of what was actually uploaded, keyed by skill name.
+   *
+   * `skills` alone records a *selection*: it survives the skill being edited on
+   * disk afterwards, so the pod's copy silently drifts from the local one and
+   * the agent reads stale instructions. Comparing a fresh `fingerprintSkill`
+   * against this turns "you picked it" into "this exact content is up there",
+   * without a network round trip.
+   *
+   * Optional and written only by `/dust-skills`, so a binding from before this
+   * existed still loads — its skills simply report as unverified until the next
+   * sync fills them in.
+   */
+  skillFingerprints?: Record<string, string>;
+  /**
+   * Hash of the AGENTS.md last written to the pod.
+   *
+   * Lets a turn skip the upload when the instructions have not changed, which
+   * saves a request and — more importantly — keeps the file byte-identical so
+   * conversations in the pod keep sharing one cached prompt prefix.
+   */
+  agentsMdHash?: string;
 }
 
 const STATE_KEYS = [
@@ -39,6 +86,7 @@ const STATE_KEYS = [
   "region",
   "username",
   "conversations",
+  "pods",
   "invalidated",
 ] as const satisfies readonly (keyof DustState)[];
 
@@ -255,6 +303,21 @@ export function forgetConversationId(sessionFile: string): void {
   if (!(sessionFile in conversations)) return;
   delete conversations[sessionFile];
   patchDustState({ conversations });
+}
+
+export function getPodBinding(root: string): DustPodBinding | null {
+  return readDustState().pods?.[root] ?? null;
+}
+
+export function savePodBinding(root: string, binding: DustPodBinding): void {
+  patchDustState({ pods: { ...(readDustState().pods ?? {}), [root]: binding } });
+}
+
+export function forgetPodBinding(root: string): void {
+  const pods = { ...(readDustState().pods ?? {}) };
+  if (!(root in pods)) return;
+  delete pods[root];
+  patchDustState({ pods });
 }
 
 export function saveConversationId(sessionFile: string, conversationId: string): void {

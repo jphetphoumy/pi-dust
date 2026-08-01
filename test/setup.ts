@@ -1,5 +1,6 @@
+import fs from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll } from "vitest";
 
@@ -21,6 +22,45 @@ import { afterAll } from "vitest";
 const guardDir = mkdtempSync(join(tmpdir(), "pi-dust-test-guard-"));
 process.env.PI_CODING_AGENT_DIR = guardDir;
 
+/**
+ * Second guard: skills live outside PI_CODING_AGENT_DIR.
+ *
+ * Skill discovery also searches `~/.agents/skills`, the cross-agent location,
+ * which the guard above does not cover — it is derived from `homedir()`, not
+ * from the env var. A test that wrote a fixture skill there would be writing
+ * into the developer's real skill collection, and one that merely *reads* the
+ * default search path would pass or fail depending on which skills they happen
+ * to have installed.
+ *
+ * Both were live problems while this suite was written, so writes under that
+ * directory are refused outright. Tests pass explicit directories to
+ * `discoverLocalSkills` instead.
+ */
+const realSkillsDir = join(homedir(), ".agents", "skills");
+const realWriteFileSync = fs.writeFileSync;
+const realMkdirSync = fs.mkdirSync;
+
+function refuseRealSkillWrites(target: unknown): void {
+  if (typeof target === "string" && target.startsWith(realSkillsDir)) {
+    throw new Error(
+      `Refusing to write inside ${realSkillsDir}: that is the developer's real skill collection. ` +
+        "Pass explicit directories to discoverLocalSkills instead.",
+    );
+  }
+}
+
+fs.writeFileSync = function guardedWriteFileSync(this: unknown, ...args: unknown[]) {
+  refuseRealSkillWrites(args[0]);
+  return (realWriteFileSync as (...a: unknown[]) => unknown).apply(this, args);
+} as typeof fs.writeFileSync;
+
+fs.mkdirSync = function guardedMkdirSync(this: unknown, ...args: unknown[]) {
+  refuseRealSkillWrites(args[0]);
+  return (realMkdirSync as (...a: unknown[]) => unknown).apply(this, args);
+} as typeof fs.mkdirSync;
+
 afterAll(() => {
+  fs.writeFileSync = realWriteFileSync;
+  fs.mkdirSync = realMkdirSync;
   rmSync(guardDir, { recursive: true, force: true });
 });

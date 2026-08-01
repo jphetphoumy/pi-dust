@@ -1,5 +1,5 @@
 import { DUST_HEADERS } from "./dust-constants.js";
-import { dustApiUrl } from "./dust-auth.js";
+import { privateApiBaseUrl } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import type { DustSessionRuntime } from "./dust-runtime.js";
 import type {
@@ -26,7 +26,7 @@ import {
  * already hold is enough — no extra scope, no API key.
  */
 export function creditsBaseUrl(region: string, workspaceId: string): string {
-  return `${dustApiUrl(region)}/api/w/${workspaceId}`;
+  return privateApiBaseUrl(region, workspaceId);
 }
 
 function authHeaders(accessToken: string): Record<string, string> {
