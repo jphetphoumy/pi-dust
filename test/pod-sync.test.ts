@@ -708,6 +708,44 @@ describe("pod sync", () => {
       return { resolveLocalSkills: () => skills };
     }
 
+    it("names the write when a shared-home skill's baseDir sits outside the project", async () => {
+      // Nothing else says where a synced skill's bytes landed — `pulled` is
+      // only ever surfaced as a count — so a write reaching outside the
+      // project would otherwise be invisible.
+      const sharedDir = mkdtempSync(join(tmpdir(), "pi-dust-shared-"));
+      try {
+        const baseDir = join(sharedDir, "herdr");
+        writeSkillDir(baseDir, { "SKILL.md": "old" });
+        const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+        const bound: DustPodBinding = {
+          ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+          skills: ["herdr"],
+        };
+
+        const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+        expect(report.skillWritesOutsideRoot).toEqual({
+          "skills/herdr/SKILL.md": join(baseDir, "SKILL.md"),
+        });
+      } finally {
+        rmSync(sharedDir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not name a pulled skill file's write when it lands inside the project", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+        skills: ["herdr"],
+      };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(report.skillWritesOutsideRoot ?? {}).toEqual({});
+    });
+
     it("reaches the skill's real baseDir, not the literal pod path", async () => {
       const baseDir = join(root, ".agents", "skills", "herdr");
       writeSkillDir(baseDir, { "SKILL.md": "old" });
@@ -815,8 +853,10 @@ describe("pod sync", () => {
 
       const report = await syncPod(pod.api, root, bound, skillsOption());
 
+      // Reported once even though both of the skill's files moved — and
+      // against a real pod path, not a directory prefix.
       expect(report.skipped).toEqual([
-        { rel: "skills/gone/", reason: expect.stringContaining('"gone"') },
+        { rel: "skills/gone/SKILL.md", reason: expect.stringContaining('"gone"') },
       ]);
       expect(report.pulled).toEqual([]);
       expect(existsSync(join(root, "skills"))).toBe(false);

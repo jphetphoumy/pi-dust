@@ -212,6 +212,12 @@ export function fingerprintSkillAt(baseDir: string): string {
   return fingerprintSkill({ name: "", description: "", baseDir, filePath: "", files, bytes: 0 });
 }
 
+/** A sync watermark, in the same shape `DustPodBinding.seen` stores it. */
+export interface PodWatermark {
+  podMs: number;
+  hash: string;
+}
+
 /**
  * Uploads each skill's whole directory.
  *
@@ -219,15 +225,29 @@ export function fingerprintSkillAt(baseDir: string): string {
  * resolve a skill's relative references against its own directory — shipping
  * only the entry point would leave those references pointing at files the pod
  * does not have.
+ *
+ * Also returns a watermark per uploaded file, settled against a fresh listing
+ * the same way `ingestFiles` settles an ordinary ingest. Without this, every
+ * skill file starts with no watermark at all — and `syncSyncedSkillEntry` in
+ * dust-pod-sync.ts reads "no watermark, local file present, pod file present"
+ * as changed-on-both-sides. That makes the *first* pod-side edit after a
+ * `/dust-skills` selection an immediate, permanent conflict: the very failure
+ * mode #54 exists to fix would survive for exactly the files that just got
+ * synced.
  */
 export async function syncSkillsToPod(
   api: PodApi,
   podId: string,
   skills: LocalSkill[],
   onProgress?: SyncProgress,
-): Promise<{ uploaded: string[]; skipped: Array<{ rel: string; reason: string }> }> {
+): Promise<{
+  uploaded: string[];
+  skipped: Array<{ rel: string; reason: string }>;
+  seen: Record<string, PodWatermark>;
+}> {
   const uploaded: string[] = [];
   const skipped: Array<{ rel: string; reason: string }> = [];
+  const hashes = new Map<string, string>();
   const total = skills.reduce((sum, skill) => sum + skill.files.length, 0);
   let done = 0;
 
@@ -245,13 +265,23 @@ export async function syncSkillsToPod(
       try {
         await uploadPodFile(api, podId, podPath, content);
         uploaded.push(podPath);
+        hashes.set(podPath, createHash("sha256").update(content).digest("hex"));
       } catch (err) {
         skipped.push({ rel: podPath, reason: err instanceof Error ? err.message : String(err) });
       }
     }
   }
 
-  return { uploaded, skipped };
+  const seen: Record<string, PodWatermark> = {};
+  if (hashes.size > 0) {
+    for (const entry of await listPodFiles(api, podId)) {
+      const rel = toRelativePath(podId, entry.path);
+      const hash = hashes.get(rel);
+      if (hash) seen[rel] = { podMs: entry.lastModifiedMs, hash };
+    }
+  }
+
+  return { uploaded, skipped, seen };
 }
 
 /**

@@ -181,6 +181,7 @@ describe("pod skills", () => {
       vi.spyOn(podApi, "uploadPodFile").mockImplementation(async (_a, _p, rel) => {
         uploads.push(rel);
       });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([]);
 
       await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "herdr", ["SKILL.md", "references/keys.md"])]);
 
@@ -194,6 +195,7 @@ describe("pod skills", () => {
       vi.spyOn(podApi, "uploadPodFile").mockImplementation(async (_a, _p, rel) => {
         if (rel.endsWith("bad.md")) throw new Error("HTTP 400");
       });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([]);
 
       const result = await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "s", ["SKILL.md", "bad.md"])]);
 
@@ -205,6 +207,7 @@ describe("pod skills", () => {
 
     it("reports progress across every file of every skill as one count", async () => {
       vi.spyOn(podApi, "uploadPodFile").mockResolvedValue(undefined);
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([]);
       const steps: string[] = [];
 
       await syncSkillsToPod(

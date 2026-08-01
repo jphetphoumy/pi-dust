@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ListPanelOptions, ListRow } from "../src/dust-pod-list-panel.js";
 import * as podRuntime from "../src/dust-pod-runtime.js";
@@ -62,7 +62,7 @@ describe("/dust-skills", () => {
       panelOptions = options;
       return panelResult;
     });
-    vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({ uploaded: ["a"], skipped: [] });
+    vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({ uploaded: ["a"], skipped: [], seen: {} });
     vi.spyOn(podSkills, "removeSkillsFromPod").mockResolvedValue([]);
     // Real discovery, but confined to this suite's throwaway agent dir. The
     // default search includes ~/.agents/skills, so without this the assertions
@@ -148,6 +148,40 @@ describe("/dust-skills", () => {
     expect(recorded?.herdr).toBe(podSkills.fingerprintSkill(skill));
   });
 
+  it("seeds a watermark for each uploaded skill file, so the first pod-side edit isn't a conflict", async () => {
+    // Without this, every skill file starts with no watermark at all, and
+    // syncPod's routing branch reads that as changed-on-both-sides the moment
+    // a local file already exists — the very #54 failure mode, for exactly
+    // the files that were just synced.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+    vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({
+      uploaded: ["skills/herdr/SKILL.md"],
+      skipped: [],
+      seen: { "skills/herdr/SKILL.md": { podMs: 500, hash: "deadbeef" } },
+    });
+
+    await handler("", ctx());
+
+    expect(getPodBinding(root)?.seen["skills/herdr/SKILL.md"]).toEqual({ podMs: 500, hash: "deadbeef" });
+  });
+
+  it("drops a de-selected skill's watermarks along with its pod files", async () => {
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: { "skills/old/SKILL.md": { podMs: 1, hash: "h" } },
+      skills: ["old"],
+    });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    expect(getPodBinding(root)?.seen["skills/old/SKILL.md"]).toBeUndefined();
+  });
+
   it("forgets the fingerprint of a de-selected skill", async () => {
     // Its files are deleted from the pod, so a lingering digest would claim a
     // skill is synced when it is gone.
@@ -196,6 +230,20 @@ describe("/dust-skills", () => {
 
     const [skill] = podSkills.discoverLocalSkills(root);
     expect(getPodBinding(root)?.skillFingerprints?.herdr).toBe(podSkills.fingerprintSkill(skill));
+  });
+
+  it("`sync` also seeds a watermark for each re-uploaded file", async () => {
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr"] });
+    writeSkill("herdr");
+    vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({
+      uploaded: ["skills/herdr/SKILL.md"],
+      skipped: [],
+      seen: { "skills/herdr/SKILL.md": { podMs: 700, hash: "cafe" } },
+    });
+
+    await handler("sync", ctx());
+
+    expect(getPodBinding(root)?.seen["skills/herdr/SKILL.md"]).toEqual({ podMs: 700, hash: "cafe" });
   });
 
   it("`sync` drops a skill that has gone from disk", async () => {
@@ -303,6 +351,9 @@ describe("/dust-skills", () => {
   it("refuses a skill whose name collides with the project's own skills/ directory", async () => {
     // `skills/` is no longer ours alone, so syncing over the user's files there
     // would overwrite them and then exclude them from syncing back down.
+    const collidingPath = join(root, "skills", "herdr", "notes.md");
+    mkdirSync(dirname(collidingPath), { recursive: true });
+    writeFileSync(collidingPath, "the user's own file");
     savePodBinding(root, {
       podId: "vlt_1",
       name: "proj",
@@ -335,6 +386,29 @@ describe("/dust-skills", () => {
 
     expect(messages().some((m) => m.includes("already has files"))).toBe(false);
     expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
+  });
+
+  it("still flags a genuine collision even when the colliding name is already synced", async () => {
+    // A name-only filter would suppress this: `herdr` is already in
+    // `binding.skills`, but the project genuinely has a real file at
+    // `skills/herdr/notes.md` on disk — a routed skill's own watermark never
+    // has a file there, so checking for one on disk keeps this case caught.
+    const collidingPath = join(root, "skills", "herdr", "notes.md");
+    mkdirSync(dirname(collidingPath), { recursive: true });
+    writeFileSync(collidingPath, "not from us");
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: { "skills/herdr/notes.md": { podMs: 1, hash: "h" } },
+      skills: ["herdr"],
+    });
+    writeSkill("herdr");
+    panelResult = [{ label: "herdr", value: "herdr", selected: true }];
+
+    await handler("", ctx());
+
+    expect(messages()[0]).toContain("already has files under skills/herdr/");
+    expect(podSkills.syncSkillsToPod).not.toHaveBeenCalled();
   });
 
   it("allows a skill when the project's skills/ holds unrelated files", async () => {
@@ -376,6 +450,7 @@ describe("/dust-skills", () => {
     vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({
       uploaded: [],
       skipped: [{ rel: ".pi-skills/herdr/SKILL.md", reason: "HTTP 400" }],
+      seen: {},
     });
 
     await handler("", ctx());

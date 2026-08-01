@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import { POD_AGENTS_MD } from "./dust-pod-agents-md.js";
@@ -11,7 +11,6 @@ import {
   fingerprintSkillAt,
   isPodSkillPath,
   type LocalSkill,
-  podSkillPathsFor,
   splitPodSkillPath,
 } from "./dust-pod-skills.js";
 import {
@@ -35,6 +34,18 @@ export interface SyncReport {
   skipped: Array<{ rel: string; reason: string }>;
   /** Skills the agent authored in the pod, installed into the project. */
   adopted: string[];
+  /**
+   * Absolute path a synced skill's pulled file actually landed at, keyed by
+   * pod-relative path — populated only when that path falls outside the
+   * project root (a skill synced from a shared home like `~/.agents/skills`).
+   * A subset of `pulled`, called out separately so a write reaching outside
+   * the project is never left as just a number in a counter.
+   *
+   * Optional, and only ever set by `syncPod` itself, so every existing
+   * literal `SyncReport` elsewhere (tests mocking `syncPod`'s return value)
+   * stays valid without having to name a field they have no opinion about.
+   */
+  skillWritesOutsideRoot?: Record<string, string>;
 }
 
 /** Called as each file finishes, for a progress indicator. */
@@ -56,7 +67,7 @@ export interface SyncOptions {
 }
 
 export function emptyReport(): SyncReport {
-  return { pulled: [], pushed: [], conflicted: [], skipped: [], adopted: [] };
+  return { pulled: [], pushed: [], conflicted: [], skipped: [], adopted: [], skillWritesOutsideRoot: {} };
 }
 
 export function isEmptyReport(report: SyncReport): boolean {
@@ -105,13 +116,12 @@ export function detectAdoptableSkills(
   const grouped = new Map<string, string[]>();
 
   for (const rel of rels) {
-    const match = /^skills\/([^/]+)\/(.+)$/.exec(rel);
-    if (!match) continue;
-    const [, name] = match;
-    if (already.has(name as string)) continue;
-    const group = grouped.get(name as string) ?? [];
+    const split = splitPodSkillPath(rel);
+    if (!split) continue;
+    if (already.has(split.name)) continue;
+    const group = grouped.get(split.name) ?? [];
     group.push(rel);
-    grouped.set(name as string, group);
+    grouped.set(split.name, group);
   }
 
   for (const [name, group] of [...grouped]) {
@@ -352,8 +362,9 @@ async function syncSyncedSkillEntry(args: {
   skill: LocalSkill;
   seen: DustPodBinding["seen"];
   report: SyncReport;
+  root: string;
 }): Promise<boolean> {
-  const { api, podId, rel, relFile, entryMs, skill, seen, report } = args;
+  const { api, podId, rel, relFile, entryMs, skill, seen, report, root } = args;
   const watermark = seen[rel];
 
   // The second escape check the ordinary path-safety guard cannot cover: a
@@ -387,6 +398,11 @@ async function syncSyncedSkillEntry(args: {
   writeAbs(target, content);
   seen[rel] = { podMs: entryMs, hash: contentHash };
   report.pulled.push(rel);
+  // Named explicitly when the write landed outside the project — a shared-home
+  // skill's baseDir — so it is never left as just a number in a counter.
+  if (!isPodPathSafe(root, relative(root, target))) {
+    report.skillWritesOutsideRoot = { ...report.skillWritesOutsideRoot, [rel]: target };
+  }
   return true;
 }
 
@@ -501,8 +517,10 @@ export async function syncPod(
         if (!skill) {
           if (!missingSkills.has(skillEntry.name)) {
             missingSkills.add(skillEntry.name);
+            // `rel` — a real file the pod holds — not a directory prefix, so
+            // `report.skipped` stays a list of actual paths throughout.
             report.skipped.push({
-              rel: podSkillPathsFor(skillEntry.name),
+              rel,
               reason: `no local directory for synced skill "${skillEntry.name}" — run /dust-skills sync to reconcile`,
             });
           }
@@ -516,6 +534,7 @@ export async function syncPod(
             skill,
             seen,
             report,
+            root,
           });
           if (pulled) touchedSkills.add(skillEntry.name);
         }

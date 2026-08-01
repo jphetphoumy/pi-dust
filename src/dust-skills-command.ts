@@ -1,11 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { PodApi } from "./dust-pod.js";
 import { podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
 import { podApiFor } from "./dust-pod-runtime.js";
 import {
   discoverLocalSkills,
   fingerprintSkill,
-  isPodSkillPath,
   type LocalSkill,
   MAX_SKILL_FILES,
   podSkillPathsFor,
@@ -76,6 +77,10 @@ async function resyncSelectedSkills(args: {
     );
     binding.skills = chosen.map((skill) => skill.name);
     binding.skillFingerprints = fingerprintsFor(chosen);
+    // Seeds a watermark for every uploaded file. Without it, a pod-side edit
+    // made before the next sync reads as changed-on-both-sides (no watermark,
+    // local file present) and is reported as a conflict instead of pulled.
+    binding.seen = { ...binding.seen, ...result.seen };
     // The pod's copies moved, so the instructions have to be rewritten — and
     // when a skill was dropped, the listing itself is now wrong.
     binding.agentsMdHash = undefined;
@@ -185,12 +190,16 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
       // collides with one the user already tracks there would have its files
       // overwritten by ours — and then excluded from syncing back down.
       //
-      // A currently-synced skill's own watermarks are excluded from this
-      // check: they route back to that skill's real local directory (see
-      // `syncSyncedSkillEntry` in dust-pod-sync.ts), not to `skills/<name>/`
-      // on disk, so re-picking a skill the user already selected must not
-      // trip a false "you already have files there" warning.
-      const tracked = Object.keys(binding.seen).filter((rel) => !isPodSkillPath(rel, binding.skills ?? []));
+      // Kept to watermarks with a real file on disk at that path: a
+      // currently-synced skill's own watermarks under `skills/<name>/` route
+      // back to that skill's real local directory instead (see
+      // `syncSyncedSkillEntry` in dust-pod-sync.ts), so nothing exists at the
+      // literal pod path — re-picking a skill the user already selected must
+      // not trip a false "you already have files there" warning. Filtering by
+      // name alone would also excuse a genuine collision with a project
+      // `skills/<name>/` directory that happens to share a synced skill's
+      // name, which is exactly the case this check exists to catch.
+      const tracked = Object.keys(binding.seen).filter((rel) => existsSync(join(root, rel)));
       const collisions = chosen
         .map((skill) => skill.name)
         .filter((name) => tracked.some((rel) => rel.startsWith(podSkillPathsFor(name))));
@@ -222,6 +231,13 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
         // de-selected skill's files are deleted from the pod, so keeping its
         // digest would claim a skill is synced when it is gone.
         binding.skillFingerprints = fingerprintsFor(chosen);
+        // Seeds a watermark for every uploaded file — see the note on
+        // `syncSkillsToPod` — and drops a de-selected skill's own watermarks,
+        // since `removeSkillsFromPod` just deleted those files from the pod.
+        binding.seen = Object.fromEntries(
+          Object.entries({ ...binding.seen, ...result.seen })
+            .filter(([rel]) => !dropped.some((name) => rel.startsWith(podSkillPathsFor(name)))),
+        );
         // The instructions have to be rewritten now the skill set has moved.
         binding.agentsMdHash = undefined;
         savePodBinding(root, binding);
