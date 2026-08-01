@@ -68,14 +68,64 @@ function currentCwd(ctx?: ExtensionContext): string {
   return ctx?.cwd ?? process.cwd();
 }
 
-/** Tool catalogue advertised to Dust in response to `tools/list`. */
-export function getMcpTools(ctx?: ExtensionContext): McpToolSpec[] {
-  return toolDefinitions(currentCwd(ctx)).map((definition) => ({
+/**
+ * The built-in tools to advertise, given pi's current active tool set.
+ *
+ * `activeToolNames === null` means pi's registry could not be read at all (no
+ * extension handle bound yet, a host without `getActiveTools`, or a stale
+ * extension runner) — not "no tools are active". The full catalogue is
+ * advertised in that case, which is the behaviour that predates this filter.
+ * An *empty array* is different and is honoured literally: the user really
+ * did turn everything off.
+ *
+ * Names pi reports that this extension cannot run (tools contributed by other
+ * extensions) are dropped: `executeMcpTool` only knows the factories above,
+ * so advertising them would hand Dust tools that always answer "Unknown
+ * tool". Surfacing those is tracked separately (issue #52).
+ *
+ * Filters the array `toolDefinitions` returns rather than writing back into
+ * it — `cachedDefinitions` is shared across every caller for a given cwd, so
+ * mutating it would poison the next unfiltered call.
+ */
+function activeDefinitions(
+  cwd: string,
+  activeToolNames: readonly string[] | null,
+): AnyToolDefinition[] {
+  const definitions = toolDefinitions(cwd);
+  if (activeToolNames === null) return definitions;
+  const active = new Set(activeToolNames);
+  return definitions.filter((definition) => active.has(definition.name));
+}
+
+/**
+ * Tool catalogue advertised to Dust in response to `tools/list`, and — more
+ * importantly — at MCP server registration, which is the only time Dust
+ * actually reads it (see the re-registration note in dust-stream-provider.ts).
+ */
+export function getMcpTools(
+  ctx?: ExtensionContext,
+  activeToolNames: readonly string[] | null = null,
+): McpToolSpec[] {
+  return activeDefinitions(currentCwd(ctx), activeToolNames).map((definition) => ({
     name: definition.name,
     description: definition.description,
     inputSchema: definition.parameters as unknown as Record<string, unknown>,
     _meta: { dust: { timeoutMs: MCP_TOOL_TIMEOUT_MS } },
   }));
+}
+
+/**
+ * Names of the tools `getMcpTools` would advertise for this active set — the
+ * catalogue Dust would receive, reduced to its identity. This, not pi's raw
+ * active list, is what dust-stream-provider.ts's turn-boundary diff compares:
+ * a tool registered by another extension changes pi's list without changing
+ * anything Dust can see, and must not cost a re-registration.
+ */
+export function advertisedToolNames(
+  activeToolNames: readonly string[] | null,
+  ctx?: ExtensionContext,
+): string[] {
+  return activeDefinitions(currentCwd(ctx), activeToolNames).map((definition) => definition.name);
 }
 
 function findDefinition(name: string, ctx?: ExtensionContext): AnyToolDefinition | undefined {

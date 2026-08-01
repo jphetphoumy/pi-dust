@@ -61,6 +61,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     await Promise.resolve();
@@ -96,6 +97,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
@@ -125,6 +127,7 @@ describe("dust MCP runtime helpers", () => {
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
         isCancelledRequest: () => false,
+        isToolActive: () => true,
       }),
     ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
 
@@ -157,6 +160,7 @@ describe("dust MCP runtime helpers", () => {
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
         isCancelledRequest: () => false,
+        isToolActive: () => true,
       }),
     ).rejects.toThrow(SESSION_EXPIRED_MESSAGE);
 
@@ -198,6 +202,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     // Enough real elapsed time for the exponential backoff between the 503s
@@ -249,6 +254,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     // No real time needs to pass between the two 401s — the reset happens on
@@ -307,6 +313,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     // getPendingApprovalPromise() and the await right after it are adjacent
@@ -325,6 +332,72 @@ describe("dust MCP runtime helpers", () => {
 
     expect(confirmFn).not.toHaveBeenCalled();
     expect(executeMcpTool).not.toHaveBeenCalled();
+  });
+
+  it("refuses a tools/call for an inactive tool ahead of the approval prompt, without consuming a queued pre-approval (issue #51)", async () => {
+    // The regression this guards against: an earlier version of this gate
+    // lived inside `executeMcpTool`, which only runs *after* a
+    // pre-approval has already been popped off the (FIFO, positional) queue.
+    // A call refused there still consumed the entry meant for a different,
+    // still-legitimate call, letting that next call fall through to
+    // whatever decision happened to be queued next. `isToolActive` must be
+    // checked, and must refuse, before `preApprovedActions` is ever touched.
+    const callRequest = { jsonrpc: "2.0", id: "req-1", method: "tools/call", params: { name: "bash", arguments: {} } };
+    const abortController = new AbortController();
+    const executeMcpTool = vi.fn().mockResolvedValue({ content: [{ type: "text" as const, text: "ok" }], isError: false });
+    const confirmFn = vi.fn().mockResolvedValue(true);
+    // A pre-approval queued for some other, unrelated call — must survive
+    // untouched if `bash` is correctly refused before reaching this map.
+    const preApprovedActions = new Map([["other-action", true]]);
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        body: makeMcpRequestStream([`data: ${JSON.stringify({ eventId: "e1", data: callRequest })}\n\n`]),
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) })
+      // Keeps the loop parked after the one frame above instead of
+      // reconnecting and replaying it.
+      .mockResolvedValueOnce({ ok: true, body: makePendingRequestStream(abortController.signal) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = listenMcpRequests({
+      baseUrl: "https://dust.test/api/v1/w/ws-1",
+      getAuthHeaders: () => ({ Authorization: "Bearer token" }),
+      refreshAuth: async () => false,
+      serverId: "srv-1",
+      abortController,
+      buildConfirmMessage: () => "confirm",
+      executeMcpTool,
+      getTools: () => [],
+      getConfirmFn: () => confirmFn,
+      getPendingApprovalPromise: () => null,
+      preApprovedActions,
+      isCancelledRequest: () => false,
+      isToolActive: (name) => name !== "bash",
+    });
+
+    await vi.waitFor(() => {
+      const resultsCall = (fetchMock.mock.calls as [string, { body?: string }][])
+        .find(([url]) => String(url).includes("/mcp/results"));
+      expect(resultsCall).toBeDefined();
+    });
+
+    const [, resultsInit] = (fetchMock.mock.calls as [string, { body: string }][])
+      .find(([url]) => String(url).includes("/mcp/results"))!;
+    const posted = JSON.parse(resultsInit.body);
+    expect(posted.result.result.isError).toBe(true);
+    expect(posted.result.result.content[0].text).toContain("bash");
+    expect(posted.result.result.content[0].text).toContain("not currently active");
+
+    expect(confirmFn).not.toHaveBeenCalled();
+    expect(executeMcpTool).not.toHaveBeenCalled();
+    // The untouched pre-approval, still there for whoever it was meant for.
+    expect(preApprovedActions.size).toBe(1);
+    expect(preApprovedActions.get("other-action")).toBe(true);
+
+    abortController.abort();
+    await promise;
   });
 
   it.each([403, 404])("throws MCP_REGISTRATION_LOST_MESSAGE on terminal HTTP %i without retrying", async (status) => {
@@ -346,6 +419,7 @@ describe("dust MCP runtime helpers", () => {
         getPendingApprovalPromise: () => null,
         preApprovedActions: new Map(),
         isCancelledRequest: () => false,
+        isToolActive: () => true,
       }),
     ).rejects.toThrow(MCP_REGISTRATION_LOST_MESSAGE);
 
@@ -372,6 +446,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(0);
@@ -395,6 +470,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     await Promise.resolve();
@@ -441,6 +517,7 @@ describe("dust MCP runtime helpers", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     expect(postedBodies).toHaveLength(1);
@@ -560,6 +637,7 @@ describe("dust MCP listener shutdown", () => {
       getPendingApprovalPromise: () => null,
       preApprovedActions: new Map(),
       isCancelledRequest: () => false,
+      isToolActive: () => true,
     });
 
     await Promise.resolve();

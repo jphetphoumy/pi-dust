@@ -142,6 +142,21 @@ interface ListenMcpRequestsOptions {
    * cancelled turn run on the user's machine, so it must not fail open.
    */
   isCancelledRequest: (requestId: unknown) => boolean;
+  /**
+   * True when `name` is currently in pi's active tool set. Dust's catalogue
+   * is a turn-boundary snapshot (see the re-registration note in
+   * dust-stream-provider.ts), so it can still send a `tools/call` for
+   * something the user disabled with `setActiveTools` mid-turn — this is
+   * what makes that actually authoritative instead of merely advisory.
+   * Checked here, before the approval prompt and before `preApprovedActions`
+   * is touched, for the same reason `isCancelledRequest` is: refusing after
+   * popping a pre-approval would consume the entry meant for a different,
+   * still-legitimate call, letting it fall through to whatever decision was
+   * queued next. Implementations must fail OPEN (return true) when pi's
+   * active set cannot be read at all — an unreadable registry disabling
+   * every tool would be worse than the staleness this exists to fix.
+   */
+  isToolActive: (name: string) => boolean;
 }
 
 export async function listenMcpRequests({
@@ -157,6 +172,7 @@ export async function listenMcpRequests({
   getPendingApprovalPromise,
   preApprovedActions,
   isCancelledRequest,
+  isToolActive,
 }: ListenMcpRequestsOptions): Promise<void> {
   const url = `${baseUrl}/mcp/requests?serverId=${encodeURIComponent(serverId)}`;
   let lastEventId: string | null = null;
@@ -296,17 +312,23 @@ export async function listenMcpRequests({
                 }).catch((error) => { console.error(`[dust:mcp] results POST error: ${error}`); });
                 debugLog("dust:mcp", "Posted initialize result", responseMsg);
               } else if (request.method === "tools/list") {
+                // Called once, not inlined twice: `getTools` now has the side
+                // effect of recording the catalogue as the tool-diff baseline
+                // (dust-stream-provider.ts), so a second call after the POST
+                // below would record whatever pi's active tools happen to be
+                // *later*, not what was actually just sent to Dust.
+                const tools = getTools();
                 const responseMsg = {
                   jsonrpc: "2.0",
                   id: request.id,
-                  result: { tools: getTools() },
+                  result: { tools },
                 };
                 await fetch(`${baseUrl}/mcp/results`, {
                   method: "POST",
                   headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
                   body: JSON.stringify({ result: responseMsg, serverId }),
                 }).catch((error) => { console.error(`[dust:mcp] results POST error: ${error}`); });
-                debugLog("dust:mcp", "Posted tools/list result", { toolCount: getTools().length });
+                debugLog("dust:mcp", "Posted tools/list result", { toolCount: tools.length });
               } else if (request.method === "tools/call") {
                 const toolName = typeof request.params?.name === "string" ? request.params.name : "";
                 const toolArgs = isRecord(request.params?.arguments) ? request.params.arguments : {};
@@ -340,8 +362,12 @@ export async function listenMcpRequests({
                 // so this still POSTs a real refusal result back to Dust.
                 let allowed: boolean;
                 const cancelled = isCancelledRequest(request.id);
+                const toolActive = isToolActive(toolName);
                 if (cancelled) {
                   debugLog("dust:mcp", "Refusing tool call from a cancelled turn", { toolName });
+                  allowed = false;
+                } else if (!toolActive) {
+                  debugLog("dust:mcp", "Refusing tool call outside pi's active tool set", { toolName });
                   allowed = false;
                 } else if (preApprovedActions.size > 0) {
                   const firstEntry = preApprovedActions.entries().next();
@@ -362,7 +388,11 @@ export async function listenMcpRequests({
                   );
                 }
 
-                const refusalText = cancelled ? CANCELLED_TOOL_MESSAGE : "Tool execution denied by user.";
+                const refusalText = cancelled
+                  ? CANCELLED_TOOL_MESSAGE
+                  : !toolActive
+                    ? `Tool "${toolName}" is not currently active`
+                    : "Tool execution denied by user.";
                 const toolResult = allowed
                   ? await executeMcpTool(toolName, toolArgs)
                   : { content: [{ type: "text", text: refusalText }], isError: true };

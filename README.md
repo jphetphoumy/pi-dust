@@ -8,7 +8,10 @@
 `pi-dust` is a Pi extension that connects the Dust platform (`dust.tt`) to the
 Pi coding agent runtime. It registers a `dust` provider, handles the WorkOS
 device login flow, streams Dust conversations into Pi, and exposes a small MCP
-tool bridge (`bash`, `read`, `edit`) with local approval.
+tool bridge (`bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`) with local
+approval. The bridged catalogue follows Pi's active tool set and refreshes at
+turn boundaries when it changes — see the known limitation in
+`docs/architecture.md` for what that does and doesn't cover.
 
 ## What you get
 

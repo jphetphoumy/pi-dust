@@ -3,7 +3,12 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
 import { MCP_TOOL_TIMEOUT_MS } from "../src/dust-constants.js";
-import { buildConfirmMessage, executeMcpTool, getMcpTools } from "../src/dust-tools.js";
+import {
+  advertisedToolNames,
+  buildConfirmMessage,
+  executeMcpTool,
+  getMcpTools,
+} from "../src/dust-tools.js";
 
 function makeTempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -135,5 +140,53 @@ describe("dust local tools", () => {
     const result = buildConfirmMessage("custom-tool", { answer: 42, nested: { ok: true } });
 
     expect(result).toBe(JSON.stringify({ answer: 42, nested: { ok: true } }));
+  });
+
+  describe("catalogue filtered by pi's active tools", () => {
+    it("advertises only the active subset", () => {
+      const tools = getMcpTools(makeCtx(process.cwd()), ["read", "grep"]);
+
+      expect(tools.map((t) => t.name)).toEqual(["read", "grep"]);
+      for (const tool of tools) {
+        expect(tool.description, `${tool.name} description`).toBeTruthy();
+        expect(tool.inputSchema, `${tool.name} schema`).toMatchObject({ type: "object" });
+      }
+    });
+
+    it("drops names this extension cannot execute, e.g. from another extension", () => {
+      const tools = getMcpTools(makeCtx(process.cwd()), ["read", "todo_write"]);
+
+      expect(tools.map((t) => t.name)).toEqual(["read"]);
+    });
+
+    it("advertises everything when the active set is unreadable (null)", () => {
+      const withDefault = getMcpTools(makeCtx(process.cwd()));
+      const withExplicitNull = getMcpTools(makeCtx(process.cwd()), null);
+
+      expect(withDefault.length).toBe(7);
+      expect(withExplicitNull.length).toBe(7);
+    });
+
+    it("honours an empty active set literally", () => {
+      const tools = getMcpTools(makeCtx(process.cwd()), []);
+
+      expect(tools).toEqual([]);
+    });
+
+    it("does not poison the per-cwd definition cache for later unfiltered calls", () => {
+      const ctx = makeCtx(process.cwd());
+      const filtered = getMcpTools(ctx, ["read"]);
+      const unfiltered = getMcpTools(ctx);
+
+      expect(filtered.map((t) => t.name)).toEqual(["read"]);
+      expect(unfiltered.length).toBe(7);
+    });
+
+    it("advertisedToolNames mirrors getMcpTools' filtering as plain names", () => {
+      const ctx = makeCtx(process.cwd());
+
+      expect(advertisedToolNames(["read", "grep"], ctx)).toEqual(["read", "grep"]);
+      expect(advertisedToolNames(null, ctx).length).toBe(7);
+    });
   });
 });

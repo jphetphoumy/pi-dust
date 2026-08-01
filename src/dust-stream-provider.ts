@@ -3,7 +3,7 @@ import { dustApiUrl, refreshToken } from "./dust-auth.js";
 import { debugLog } from "./dust-debug.js";
 import { isAbortError, listenMcpRequests, registerMcpServer, startMcpHeartbeat } from "./dust-mcp.js";
 import { createEventStream, findAgentMessageSId, isMissingAgentMessageError, makeEmptyMessage, streamEvents } from "./dust-stream.js";
-import { buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
+import { advertisedToolNames, buildConfirmMessage, executeMcpTool, getMcpTools } from "./dust-tools.js";
 import { appendToolEntry } from "./dust-tool-render.js";
 import type { ChatMessageLike, DustCredentials, DustModel, StreamContextLike, StreamOptionsLike, ToolApproveExecutionEvent } from "./dust-types.js";
 import { errorMessage, isRecord, parseConversationCreateResponse, parseConversationFetchResponse, parsePostMessageResponse } from "./dust-validation.js";
@@ -39,6 +39,35 @@ function buildAuthHeaders(accessToken: string): Record<string, string> {
     Authorization: `Bearer ${accessToken}`,
     ...DUST_HEADERS,
   };
+}
+
+/**
+ * pi's currently active tool names, or null when the registry cannot be read.
+ *
+ * `getActiveTools()` itself is cheap and side-effect free, but three things
+ * can make it unavailable, and none of them may take a turn down with it:
+ * `runtime.pi` is null until the extension is bound, hosts older than the API
+ * do not implement it at all, and pi's extension runner throws once the
+ * extension handle is stale. Every one of those means "unknown", which
+ * `activeDefinitions` (dust-tools.ts) treats as "advertise everything", never
+ * as "advertise nothing".
+ */
+function readActiveToolNames(runtime: DustSessionRuntime): string[] | null {
+  const pi = runtime.pi;
+  if (!pi || typeof pi.getActiveTools !== "function") return null;
+  try {
+    const names = pi.getActiveTools();
+    return Array.isArray(names) ? names.filter((name): name is string => typeof name === "string") : null;
+  } catch (err) {
+    debugLog("dust:mcp", "Could not read pi's active tools", { error: errorMessage(err) });
+    return null;
+  }
+}
+
+/** The catalogue Dust would be handed right now, or null if pi cannot be read. */
+function currentAdvertisedTools(runtime: DustSessionRuntime): string[] | null {
+  const active = readActiveToolNames(runtime);
+  return active === null ? null : advertisedToolNames(active, runtime.extensionContext as never);
 }
 
 function extractMessageText(message: ChatMessageLike): string {
@@ -250,6 +279,10 @@ async function ensureMcpServer(
   authHeaders: Record<string, string>,
   refreshAuth: () => Promise<boolean>,
 ): Promise<void> {
+  // A no-op whenever a registration is already live — which is exactly what
+  // makes `dustRealStream`'s pre-call to `runtime.clearMcpState()` meaningful:
+  // clearing `mcpServerId` there is the only way to make this fall through
+  // and register a fresh catalogue after pi's active tool set changes.
   if (runtime.mcpServerId) {
     return;
   }
@@ -299,7 +332,25 @@ async function ensureMcpServer(
     serverId,
     abortController,
     buildConfirmMessage,
-    getTools: () => getMcpTools(runtime.extensionContext as never),
+    getTools: () => {
+      const tools = getMcpTools(runtime.extensionContext as never, readActiveToolNames(runtime));
+      // The one moment we know, for certain, what Dust is about to cache —
+      // see `recordAdvertisedTools`'s doc for why this is more trustworthy
+      // than the turn-boundary diff's own prediction.
+      runtime.recordAdvertisedTools(tools.map((tool) => tool.name));
+      return tools;
+    },
+    // Fails open (true) when pi's active tools cannot be read — an
+    // unreadable registry must not disable every tool, the same fallback the
+    // advertised catalogue itself uses. Checked by the listener before the
+    // approval prompt, ahead of `preApprovedActions`: gating inside
+    // `executeMcpTool` below would run after a pre-approval was already
+    // popped for this call, positionally misapplying it to whatever request
+    // comes next.
+    isToolActive: (name: string) => {
+      const active = readActiveToolNames(runtime);
+      return active === null || advertisedToolNames(active, runtime.extensionContext as never).includes(name);
+    },
     executeMcpTool: async (name, args) => {
       // Second line of defence behind the listener's own check: the turn can be
       // cancelled while a tool sits at the approval prompt, and running it then
@@ -781,6 +832,25 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
         // `DustSessionRuntime#refreshAccessToken()`'s doc for why this is a
         // single shared method rather than each caller rolling its own body.
         const refreshAuth = (): Promise<boolean> => runtime.refreshAccessToken(liveCred);
+
+        // Dust reads the client-side MCP catalogue exactly once, when the
+        // server is registered, and caches it as the run's tool
+        // configuration (`listToolsForClientSideMCPServer`). It ignores
+        // `notifications/tools/list_changed`, so there is no in-band way to
+        // tell it the catalogue moved: a tool the user disabled with
+        // `setActiveTools` would go on being callable from Dust's stale
+        // copy. Re-registering is the only lever, and a turn boundary is the
+        // only safe place to pull it — this is best effort, not instant: a
+        // change made mid-turn takes effect on the following turn. Tools
+        // registered by *other* pi extensions remain invisible to Dust
+        // regardless, since our catalogue is a fixed set of built-ins this
+        // extension knows how to execute (issue #52 tracks routing arbitrary
+        // pi tools through this bridge).
+        const advertised = currentAdvertisedTools(runtime);
+        if (runtime.toolCatalogueChanged(advertised)) {
+          debugLog("dust:mcp", "Active tool set changed, re-registering MCP server", { tools: advertised });
+          runtime.clearMcpState();
+        }
 
         await ensureMcpServer(runtime, baseUrl, resolveAuthHeaders(), refreshAuth);
 
