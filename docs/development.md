@@ -78,6 +78,38 @@ This runs:
 - `npm run lint`
 - `npm run coverage`
 
+## Feature worktree harness
+
+To work on a feature in an isolated git worktree with its own herdr
+workspace, use:
+
+```bash
+just feature <name>
+```
+
+This:
+
+- fetches `origin/master` and creates a worktree at
+  `../pi-dust-worktrees/<name>` on a new `feat/<name>` branch
+- opens a herdr workspace labeled `<name>` for that worktree
+- starts a Claude Code instance in auto permission mode in the
+  workspace's root pane
+- opens a second `hunk` tab running a live `hunk diff master --watch`
+  so changes can be reviewed as the agent works
+
+Requires the `just`, `herdr`, `claude`, and `hunk` CLIs on `PATH`, and
+must be run from inside a herdr-managed pane (`HERDR_ENV=1`).
+
+When the feature is done, tear it all down with:
+
+```bash
+just delete <name>
+```
+
+This closes the herdr workspace, removes the git worktree, and deletes
+the local `feat/<name>` branch. The mapping from feature name to herdr
+workspace id is tracked in `.herdr-workspaces/` (gitignored).
+
 ## Commit policy
 
 The repository enforces Conventional Commits through the `commit-msg` hook.
