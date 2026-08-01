@@ -268,23 +268,27 @@ describe("dust loop command", () => {
     await commands.get("loop")!("/x", ctx);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
 
-    // Consume the loop's own settle, arming its cooldown.
+    // Consume the loop's own settle, arming its cooldown for t=0..5000.
     const onSettled = events.get("agent_settled")!;
     onSettled({}, ctx);
 
-    // A second settle before the cooldown fires — e.g. the user ran an
-    // unrelated /ask in between — must not reset or double the cooldown, or
-    // spend an iteration on activity the loop didn't cause.
+    // A stray settle partway through that cooldown — e.g. the user ran an
+    // unrelated /ask — must not re-arm (push out) the deadline. If the guard
+    // were missing, this second call would restart the 5s timer and the send
+    // below (at the original t=5000) would not have fired yet.
+    await vi.advanceTimersByTimeAsync(3_000);
     onSettled({}, ctx);
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
     expect(runtime.loop?.iterations).toBe(2);
 
     // The next iteration's own send re-arms `expectingSettle`; a stray settle
-    // that arrives before *its* cooldown fires is likewise ignored.
-    onSettled({}, ctx); // this is the real settle for iteration 2
-    onSettled({}, ctx); // stray — must be ignored
-    await vi.advanceTimersByTimeAsync(5_000);
+    // that arrives before *its* cooldown fires is likewise ignored rather
+    // than restarting that cooldown.
+    onSettled({}, ctx); // real settle for iteration 2, arms t=0..5000
+    await vi.advanceTimersByTimeAsync(3_000);
+    onSettled({}, ctx); // stray — must not push the deadline out
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
   });
 
@@ -382,7 +386,7 @@ describe("dust loop command", () => {
     expect(pi.registerCommand).toHaveBeenCalledWith("loop", expect.anything());
   });
 
-  it("does not crash the process when sendUserMessage throws mid-iteration", async () => {
+  it("does not crash, and self-heals on the next tick, when an interval loop's send throws", async () => {
     const runtime = new DustSessionRuntime();
     const ctx = makeCtx();
     applyRuntimeContext(runtime, ctx);
@@ -393,5 +397,82 @@ describe("dust loop command", () => {
 
     await expect(commands.get("loop")!("5m /x", ctx)).resolves.toBeUndefined();
     expect(runtime.loop).not.toBeNull();
+    expect(runtime.loop?.iterations).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // the throwing call, then a normal tick
+    expect(runtime.loop?.iterations).toBe(1);
+  });
+
+  it("stops itself, rather than wedging forever, when a self-paced loop's send throws", async () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const { commands, pi } = register(runtime);
+    pi.sendUserMessage.mockImplementationOnce(() => {
+      throw new Error("boom");
+    });
+
+    await commands.get("loop")!("/x", ctx);
+
+    // A failed send never starts a turn, so `agent_settled` will never arrive
+    // to advance a self-paced loop — unlike interval mode, it has no other
+    // tick to self-heal on. It must stop itself instead of sitting there
+    // with a footer still claiming to be live.
+    expect(runtime.loop).toBeNull();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("sending the next iteration failed"), "warning");
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("dust-loop", undefined);
+  });
+
+  it("refuses to start a self-paced loop when the host exposes no event API, but interval mode still works", () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
+    const pi = {
+      registerCommand: vi.fn((name: string, cfg: any) => commands.set(name, cfg.handler)),
+      sendUserMessage: vi.fn(),
+    } as any;
+    registerDustLoopCommand(pi, runtime);
+    runtime.pi = pi;
+
+    return commands.get("loop")!("/x", ctx).then(() => {
+      expect(runtime.loop).toBeNull();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("event API"), "warning");
+
+      return commands.get("loop")!("5m /x", ctx).then(() => {
+        expect(runtime.loop?.mode).toBe("interval");
+        expect(pi.sendUserMessage).toHaveBeenCalledWith("/x");
+      });
+    });
+  });
+
+  it("applies the -- escape after an interval token too", async () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const { commands, pi } = register(runtime);
+
+    await commands.get("loop")!("5m -- off", ctx);
+    expect(runtime.loop?.payload).toBe("off");
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("off");
+  });
+
+  it("suppresses the 'Loop stopped.' toast when the loop stops itself at the iteration cap", async () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const { commands, events, pi } = register(runtime);
+
+    await commands.get("loop")!("/x", ctx);
+    const onSettled = events.get("agent_settled")!;
+    for (let i = 0; i < 19; i++) {
+      onSettled({}, ctx);
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(20);
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith("Loop stopped.", "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("20-iteration"), "warning");
   });
 });

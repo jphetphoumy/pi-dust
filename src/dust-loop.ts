@@ -96,7 +96,10 @@ export function parseLoopArgs(raw: string): LoopRequest {
       intervalMs = null;
     } else {
       mode = "interval";
-      payload = remainder;
+      // The `-- ` escape is only needed pre-interval (where a bare reserved
+      // word would otherwise be read as a stop/status request); honor it here
+      // too so `/loop 5m -- off` doesn't send the literal string "-- off".
+      payload = remainder === "--" ? "" : remainder.startsWith("-- ") ? remainder.slice(3).trimStart() : remainder;
       intervalMs = durationMs;
     }
   }
@@ -166,11 +169,16 @@ function agentIsIdle(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): boole
 /**
  * Cancels the active loop, if any.
  *
- * `reason` distinguishes a user-initiated stop (notified) from session
- * teardown (silent — the user didn't ask, and a session that's ending has no
- * one left to read the notification).
+ * `reason` distinguishes a user-initiated stop (notified) from every other
+ * stop, which is silent because the caller already notified with wording
+ * specific to why (iteration cap, a failed send) or there is no one left to
+ * read a notification (session teardown).
  */
-export function stopDustLoop(runtime: DustSessionRuntime, ctx?: PiRuntimeContext, reason: "user" | "session" = "user"): void {
+export function stopDustLoop(
+  runtime: DustSessionRuntime,
+  ctx?: PiRuntimeContext,
+  reason: "user" | "session" | "limit" | "error" = "user",
+): void {
   const had = runtime.loop !== null;
   runtime.clearLoopState();
   showStatus(runtime, ctx);
@@ -231,10 +239,19 @@ function runIteration(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void
 
     if (loop.maxIterations !== null && loop.iterations >= loop.maxIterations) {
       notify(runtime, `Loop reached its ${loop.maxIterations}-iteration limit and stopped.`, "warning", ctx);
-      stopDustLoop(runtime, ctx, "session");
+      stopDustLoop(runtime, ctx, "limit");
     }
   } catch (err) {
     debugLog("dust:loop", "Iteration failed", { error: String(err) });
+    // Interval mode self-heals on its next tick. Self-paced mode has no such
+    // tick — it advances only from expectingSettle/agent_settled, and a
+    // failed send here means neither of those will ever fire again — so
+    // leaving `loop` in place would wedge it forever with a footer still
+    // claiming it's live. Stop it instead of silently going dark.
+    if (loop.mode === "selfPaced") {
+      notify(runtime, "Loop stopped: sending the next iteration failed.", "warning", ctx);
+      stopDustLoop(runtime, ctx, "error");
+    }
   }
 }
 
@@ -255,7 +272,15 @@ function startLoop(
   runtime: DustSessionRuntime,
   request: Extract<LoopRequest, { kind: "start" }>,
   ctx: PiRuntimeContext,
+  supportsSettleEvents: boolean,
 ): void {
+  if (request.mode === "selfPaced" && !supportsSettleEvents) {
+    // Self-paced mode advances only via `agent_settled`; without it the loop
+    // would fire once and then sit forever, its footer still claiming it's
+    // live. Refuse rather than silently do nothing.
+    notify(runtime, "Self-paced loops need pi's event API, which this host doesn't expose. Use an interval instead, e.g. /loop 5m ...", "warning", ctx);
+    return;
+  }
   const replacing = runtime.loop !== null;
   runtime.clearLoopState();
 
@@ -297,6 +322,9 @@ function startLoop(
 }
 
 export function registerDustLoopCommand(pi: ExtensionAPI, runtime: DustSessionRuntime): void {
+  const piWithEvents = pi as ExtensionAPIWithEvents;
+  const supportsSettleEvents = typeof piWithEvents.on === "function";
+
   pi.registerCommand("loop", {
     description: "Re-run a prompt or command on an interval (/loop 5m /cmd) or self-paced (/loop /cmd); /loop off to stop",
     handler: async (args, ctx) => {
@@ -316,7 +344,7 @@ export function registerDustLoopCommand(pi: ExtensionAPI, runtime: DustSessionRu
           notify(runtime, request.message, "warning", runtimeCtx);
           return;
         case "start":
-          startLoop(runtime, request, runtimeCtx);
+          startLoop(runtime, request, runtimeCtx, supportsSettleEvents);
           return;
       }
     },
@@ -325,11 +353,10 @@ export function registerDustLoopCommand(pi: ExtensionAPI, runtime: DustSessionRu
   // `session_shutdown` is pi's session-lifecycle event, so that half of loop
   // cleanup is wired from dust-session-events.ts (the module that owns every
   // other lifecycle hook) instead of here — see registerDustSessionEvents.
-  const piWithEvents = pi as ExtensionAPIWithEvents;
-  if (typeof piWithEvents.on === "function") {
+  if (supportsSettleEvents) {
     const registerEvent = piWithEvents.on as (event: string, handler: (event: unknown, ctx: PiRuntimeContext) => unknown) => void;
     registerEvent("agent_settled", (_event, ctx) => handleAgentSettled(runtime, ctx));
   } else {
-    debugLog("dust:loop", "Extension event API unavailable; /loop off is the only way to stop a loop");
+    debugLog("dust:loop", "Extension event API unavailable; self-paced loops are disabled, /loop off is the only way to stop an interval loop");
   }
 }
