@@ -26,6 +26,11 @@ turn boundaries when it changes — see the known limitation in
   - **Conversations**: your top conversations by credits
   - Gauges fill against the allowance Dust reports; override with
     `PI_DUST_MONTHLY_CREDITS` (default `8000`)
+- `/loop <interval> <prompt|/command>` — re-runs a prompt or slash command on a
+  recurring cadence (`30s`, `5m`, `1h`; sub-30s intervals are clamped up to the
+  floor); `/loop <prompt|/command>` with no interval self-paces instead,
+  re-firing as soon as the previous run settles (capped at 20 iterations).
+  `/loop off` stops it, and a loop never survives a session switch or restart.
 - Local quality gates: lint, typecheck, tests, coverage
 - CI, changelog, release automation, Dependabot, and git hooks
 

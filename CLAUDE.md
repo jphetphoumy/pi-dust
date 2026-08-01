@@ -48,6 +48,7 @@ The project is organized as 27 TypeScript modules in `src/`, each with a single 
 | `dust-conversation.ts` | Decides and verifies which Dust conversation a session continues |
 | `dust-state.ts` | Extension-owned state file (`dust-state.json`) |
 | `dust-approval.ts` | Tool approval mode registration |
+| `dust-loop.ts` | `/loop` command — recurring or self-paced re-invocation of a prompt/command |
 | `dust-tool-render.ts` | Renders Dust-driven tool calls in Pi's transcript |
 | `dust-workspace.ts` | `/workspace` command registration |
 | `dust-status.ts` | `/status` command; opens the interactive panel |

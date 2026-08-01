@@ -4,6 +4,7 @@ import { describeConversation, resolveAttachment, verifyConversation } from "./d
 import type { ConversationAttachment } from "./dust-conversation.js";
 import { debugLog } from "./dust-debug.js";
 import { refreshApprovalStatus } from "./dust-approval.js";
+import { stopDustLoop } from "./dust-loop.js";
 import { refreshPodStatus } from "./dust-pod-status.js";
 import { appendDustSkillsBanner, shouldAppendBannerFor } from "./dust-pod-skills-banner.js";
 import { applyRuntimeContext, HOST_TOKEN_ASSUMED_TTL_MS, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
@@ -281,6 +282,10 @@ export function registerDustSessionEvents(
     // pointed at a thread its first message never reached.
     applyRuntimeContext(runtime, ctx);
     refreshApprovalStatus(runtime, ctx);
+    // Belt-and-braces: a loop must never bleed into a new session, even on a
+    // host that skipped `session_shutdown` for this transition. `stopDustLoop`
+    // already redraws the footer, so no separate refresh is needed here.
+    stopDustLoop(runtime, ctx, "session");
     // Show the pod in the footer straight away. Syncs refresh it, but the first
     // one is a turn away, and a session resumed in an ingested project should
     // say so before the user types anything.
