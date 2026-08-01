@@ -258,6 +258,29 @@ describe("/dust-skills", () => {
     expect(messages().join(" ")).toContain("vanished");
   });
 
+  it("`sync` drops a vanished skill's own watermarks too, not just its name", async () => {
+    // Once `vanished` leaves `binding.skills`, its files stop being routed by
+    // syncPod's synced-skill branch. A stale watermark left behind — no local
+    // file at that literal path, but a watermark that says it moved — would
+    // read as changed-on-both-sides forever: a permanent conflict with no way
+    // to resolve it.
+    savePodBinding(root, {
+      podId: "vlt_1",
+      name: "proj",
+      seen: {
+        "skills/vanished/SKILL.md": { podMs: 1, hash: "h" },
+        "skills/herdr/SKILL.md": { podMs: 1, hash: "h2" },
+      },
+      skills: ["herdr", "vanished"],
+    });
+    writeSkill("herdr");
+
+    await handler("sync", ctx());
+
+    const seen = getPodBinding(root)?.seen ?? {};
+    expect(seen["skills/vanished/SKILL.md"]).toBeUndefined();
+  });
+
   it("`sync` says so when nothing has been selected yet", async () => {
     savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
     writeSkill("herdr");

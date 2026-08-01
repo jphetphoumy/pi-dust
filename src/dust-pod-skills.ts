@@ -274,10 +274,21 @@ export async function syncSkillsToPod(
 
   const seen: Record<string, PodWatermark> = {};
   if (hashes.size > 0) {
-    for (const entry of await listPodFiles(api, podId)) {
-      const rel = toRelativePath(podId, entry.path);
-      const hash = hashes.get(rel);
-      if (hash) seen[rel] = { podMs: entry.lastModifiedMs, hash };
+    try {
+      for (const entry of await listPodFiles(api, podId)) {
+        const rel = toRelativePath(podId, entry.path);
+        const hash = hashes.get(rel);
+        if (hash) seen[rel] = { podMs: entry.lastModifiedMs, hash };
+      }
+    } catch (err) {
+      // The uploads already landed; a failed settle must not fail the whole
+      // sync. If it did, the caller would never record `binding.skills` for
+      // files that really are in the pod — and the next `syncPod` would then
+      // see the user's own just-uploaded skill as untouched (no watermark, no
+      // `binding.skills` entry) and hand it to `detectAdoptableSkills`, which
+      // installs it a second time as if the agent had authored it. Degrading
+      // to no watermarks is strictly the pre-fix behavior, not a regression.
+      debugLog("dust:pod", "Could not settle skill watermarks after upload", { error: String(err) });
     }
   }
 

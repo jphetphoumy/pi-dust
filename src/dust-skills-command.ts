@@ -80,7 +80,16 @@ async function resyncSelectedSkills(args: {
     // Seeds a watermark for every uploaded file. Without it, a pod-side edit
     // made before the next sync reads as changed-on-both-sides (no watermark,
     // local file present) and is reported as a conflict instead of pulled.
-    binding.seen = { ...binding.seen, ...result.seen };
+    //
+    // A `missing` skill's own watermarks are dropped along with it: once its
+    // name leaves `binding.skills`, its files are no longer routed by
+    // `syncSyncedSkillEntry`, and a stale watermark with no local file at that
+    // literal path would otherwise read as changed-on-both-sides forever —
+    // reported as a conflict every sync with no way to resolve it.
+    binding.seen = Object.fromEntries(
+      Object.entries({ ...binding.seen, ...result.seen })
+        .filter(([rel]) => !missing.some((name) => rel.startsWith(podSkillPathsFor(name)))),
+    );
     // The pod's copies moved, so the instructions have to be rewritten — and
     // when a skill was dropped, the listing itself is now wrong.
     binding.agentsMdHash = undefined;

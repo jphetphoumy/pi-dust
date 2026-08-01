@@ -654,9 +654,13 @@ export async function syncPod(
     const toUpload: string[] = [];
     for (const rel of missing) {
       // A synced skill's watermark key maps to `skill.baseDir`, not
-      // `join(root, rel)` — pushing it is `/dust-skills sync`'s job, not
-      // this sync's, the same rule the pull side follows.
-      if (isPodSkillPath(rel, binding.skills ?? [])) continue;
+      // `join(root, rel)` — pushing it is `/dust-skills sync`'s job, not this
+      // sync's, the same rule the pull side follows. Guarded by `existsSync`
+      // too: a name added to `binding.skills` by adoption bypasses the
+      // `/dust-skills` picker's collision check, so a genuine project file at
+      // that same literal path must still be pushed rather than silently
+      // dropped from the sync.
+      if (isPodSkillPath(rel, binding.skills ?? []) && !existsSync(join(root, rel))) continue;
       if (podPaths.has(rel)) step();
       else toUpload.push(rel);
     }

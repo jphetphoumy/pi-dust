@@ -944,6 +944,22 @@ describe("pod sync", () => {
       expect(readLocal("skills/other/notes.md")).toBe("mine");
     });
 
+    it("still pushes a genuine project file whose path collides with a synced skill name", async () => {
+      // The `/dust-skills` picker's collision check would normally prevent
+      // this, but adoption adds a name to `binding.skills` without going
+      // through that check — so a project `skills/<name>/…` file created
+      // afterwards must still be pushed, not silently dropped because its
+      // path happens to look like a routed skill watermark.
+      writeLocal("skills/herdr/notes.md", "mine");
+      const pod = makeFakePod({});
+      const bound: DustPodBinding = { ...binding(), skills: ["herdr"] };
+
+      const report = await syncPod(pod.api, root, bound, { push: true, pull: false, ...skillsOption() });
+
+      expect(report.pushed).toContain("skills/herdr/notes.md");
+      expect(pod.files.get("skills/herdr/notes.md")?.content).toBe("mine");
+    });
+
     it("never runs local-skill discovery when nothing in the pod needs it", async () => {
       const pod = makeFakePod({ "main.py": { content: "x", ms: 100 } });
       writeLocal("main.py", "x");
