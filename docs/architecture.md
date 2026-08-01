@@ -526,14 +526,59 @@ classify each skill.
 | `stale` | they no longer do; the agent is reading instructions the user has changed |
 | `unverified` | binding predates fingerprints, so there is nothing to compare — deliberately *not* reported as stale |
 
-The check is entirely local, so it costs no network call at startup. It does not
-detect pod-side deletion; only a listing would, which belongs in `/dust-skills`
-rather than in session start.
+`synced` also requires a recorded pod watermark under `skills/<name>/` in
+`binding.seen`, not just a fingerprint match: a fingerprint match alone only
+says "we have not edited this since we tried to upload it", not "the upload
+confirmed landing in the pod" (`syncSkillsToPod`'s watermark settle can fail
+without failing the sync itself). A skill with a matching fingerprint but no
+watermark reads `unverified` instead.
+
+The check is entirely local, so it costs no network call at startup — this was
+a deliberate choice, not an oversight. `listPodFiles` retries a 429 on Dust's
+upload-rate-limit schedule (`RATE_LIMIT_BACKOFF_MS`, up to ~50s total), and the
+banner is rendered synchronously on the session-start path; paying for a
+listing there risks a visibly hung startup to fix a section that already tells
+half the truth for free. The tradeoff: the banner cannot see a pod-side edit or
+deletion on its own. `/dust-skills diff`, below, is where that other half
+lives, paid for explicitly rather than on every session start.
 
 `/dust-skills sync` re-uploads the recorded selection without reopening the
 picker — the selection is not what changed — refreshes the fingerprints, drops
 any skill that has gone from disk, and clears `agentsMdHash` so the instructions
-are rewritten.
+are rewritten. It also runs the same comparison `/dust-skills diff` does first,
+as a preview: what changed since the last sync, on either side, before paying
+for the re-upload.
+
+#### `/dust-skills diff`
+
+`src/dust-pod-skills-diff.ts` is the honest, two-way version of the check
+above: one `listPodFiles` call (never a per-file download — that would
+reintroduce the one-request-per-file cost `/dust-skills sync` already pays),
+compared against `binding.seen`'s per-file watermarks the same way `syncPod`'s
+own routing does (`entry.lastModifiedMs > watermark.podMs`), plus the half a
+timestamp comparison alone misses: a watermarked path **absent** from the
+listing is a pod-side deletion.
+
+Its state model is deliberately separate from `DustSkillState` above rather
+than widening it — the banner has no listing to compare against, so it could
+never produce the pod-aware states, and giving it values it cannot emit would
+be worse than the narrower set it already has honestly.
+
+| State | Meaning |
+|---|---|
+| `synced` | both a local fingerprint and a pod watermark are on record, and neither moved |
+| `local-changed` | disk differs from the digest recorded at sync; the pod is untouched |
+| `pod-changed` | a pod file is new, newer than its watermark, or a watermarked file is gone from the pod |
+| `both-changed` | both sides moved — the next `syncPod` reports this as a conflict rather than picking a winner |
+| `pod-only` | a skill-shaped subtree (one with a `SKILL.md`) is in the pod, nothing matches it on disk |
+| `local-only` | a selected local skill has no files in the pod at all |
+| `missing` | recorded as synced, present on neither side |
+| `unverified` | present on both sides, but with no recorded baseline for at least one of them |
+
+The universe compared is `binding.skills` union whatever skill-shaped pod
+subtrees exist — never every skill discovered on disk, since an unselected
+skill has no relationship with this pod and could collide with an unrelated
+project `skills/<name>/` directory of the same name.
 
 #### Adopting a skill the agent wrote
 

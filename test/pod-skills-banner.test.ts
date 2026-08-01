@@ -73,6 +73,53 @@ describe("the [DustSkills] startup section", () => {
     expect(banner).toEqual([{ name: "old", state: "unverified" }]);
   });
 
+  it("downgrades a fingerprint match to unverified when the skill has no recorded pod watermark", () => {
+    // A fingerprint match alone only says "we have not edited this since we
+    // tried to upload it" — it says nothing about whether the upload's
+    // watermark settle (see syncSkillsToPod) ever actually confirmed landing
+    // in the pod. `seen` is the only place that confirmation lives.
+    const banner = buildDustSkillsBanner(
+      [skill("unsettled"), skill("confirmed")],
+      {
+        skills: ["unsettled", "confirmed"],
+        skillFingerprints: { unsettled: "fp", confirmed: "fp" },
+        seen: { "skills/confirmed/SKILL.md": { podMs: 1, hash: "h" } },
+      },
+      () => "fp",
+    );
+
+    expect(banner).toEqual([
+      { name: "confirmed", state: "synced" },
+      { name: "unsettled", state: "unverified" },
+    ]);
+  });
+
+  it("leaves synced skills alone only when seen is entirely omitted", () => {
+    // A binding that predates this field can genuinely lack it at runtime
+    // despite the type — that is the only case allowed to skip the check.
+    const withoutSeen = buildDustSkillsBanner(
+      [skill("old-caller")],
+      { skills: ["old-caller"], skillFingerprints: { "old-caller": "fp" } },
+      () => "fp",
+    );
+
+    expect(withoutSeen).toEqual([{ name: "old-caller", state: "synced" }]);
+  });
+
+  it("downgrades to unverified when seen is present but empty, not just when it lacks this skill's entry", () => {
+    // An explicitly empty `seen` is the normal shape of a brand-new binding —
+    // not a legacy signal — so it must not be treated as "nothing to check
+    // against" the way an entirely absent `seen` is. Confirming a skill
+    // actually landed in the pod is exactly what this check exists to do.
+    const withEmptySeen = buildDustSkillsBanner(
+      [skill("brand-new")],
+      { skills: ["brand-new"], skillFingerprints: { "brand-new": "fp" }, seen: {} },
+      () => "fp",
+    );
+
+    expect(withEmptySeen).toEqual([{ name: "brand-new", state: "unverified" }]);
+  });
+
   it("drops a skill that is recorded as synced but no longer on disk", () => {
     // `skills` is the last selection, not a live view.
     const banner = buildDustSkillsBanner(
@@ -199,7 +246,7 @@ describe("wiring the [DustSkills] section into startup", () => {
     vi.spyOn(state, "getPodBinding").mockReturnValue({
       podId: "vlt_1",
       name: "proj",
-      seen: {},
+      seen: { "skills/synced/SKILL.md": { podMs: 1, hash: "h" } },
       skills: ["synced"],
       skillFingerprints: { synced: "matching" },
     } as never);

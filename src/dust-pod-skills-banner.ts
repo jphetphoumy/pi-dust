@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { debugLog } from "./dust-debug.js";
-import { discoverLocalSkills, fingerprintSkill, type LocalSkill } from "./dust-pod-skills.js";
+import { discoverLocalSkills, fingerprintSkill, podSkillPathsFor, type LocalSkill } from "./dust-pod-skills.js";
 import { getPodBinding } from "./dust-state.js";
 
 /**
@@ -49,6 +49,18 @@ export interface BannerData {
 export interface BannerBinding {
   skills?: string[];
   skillFingerprints?: Record<string, string>;
+  /**
+   * Per-file pod watermarks, keyed the same way `DustPodBinding.seen` is.
+   *
+   * Optional, and only ever used to withhold a `synced` claim — never to
+   * detect a pod-side change itself, which needs a `listPodFiles` call this
+   * section deliberately does not make (see `appendDustSkillsBanner`'s own
+   * note on the cost of one). Its only job here is telling "we uploaded this
+   * and confirmed it landed" apart from "we uploaded this and never checked",
+   * the latter being exactly what a failed watermark settle in
+   * `syncSkillsToPod` leaves behind.
+   */
+  seen?: Record<string, unknown>;
 }
 
 /**
@@ -68,15 +80,27 @@ export function buildDustSkillsBanner(
   fingerprint: (skill: LocalSkill) => string = fingerprintSkill,
 ): DustSkillEntry[] {
   const synced = new Set(binding.skills ?? []);
+  // Only consulted to downgrade a `synced` claim, and gated on `seen` existing
+  // at all rather than being non-empty: a binding written before this field
+  // existed can genuinely lack it at runtime despite the type, and that is the
+  // only case allowed to skip the check. A binding that *has* `seen` — the
+  // normal case, even a brand-new one with nothing in it yet — has to earn
+  // `synced` per skill: a global "seen has anything at all" gate would keep
+  // claiming `synced` for a skill whose own watermark settle failed, for as
+  // long as some *other* skill in the same pod happened to have one.
+  const hasWatermark = (name: string): boolean =>
+    Object.keys(binding.seen ?? {}).some((rel) => rel.startsWith(podSkillPathsFor(name)));
+
   return skills
     .filter((skill) => synced.has(skill.name))
     .map((skill) => {
       const recorded = binding.skillFingerprints?.[skill.name];
       if (recorded === undefined) return { name: skill.name, state: "unverified" as const };
-      return {
-        name: skill.name,
-        state: (recorded === fingerprint(skill) ? "synced" : "stale") as DustSkillState,
-      };
+      if (recorded !== fingerprint(skill)) return { name: skill.name, state: "stale" as const };
+      if (binding.seen !== undefined && !hasWatermark(skill.name)) {
+        return { name: skill.name, state: "unverified" as const };
+      }
+      return { name: skill.name, state: "synced" as const };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -101,7 +125,9 @@ export function formatDustSkillsBanner(
   // The hint only appears when there is something to act on; a tag the user
   // cannot do anything about is just noise.
   const needsSync = options.hint && entries.some((entry) => entry.state !== "synced");
-  return needsSync ? `  ${list}\n  Run /dust-skills sync to bring the pod up to date.` : `  ${list}`;
+  return needsSync
+    ? `  ${list}\n  Run /dust-skills sync to bring the pod up to date, or /dust-skills diff to compare against the pod.`
+    : `  ${list}`;
 }
 
 interface ThemeLike {

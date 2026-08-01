@@ -1,9 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { PodApi } from "./dust-pod.js";
+import { debugLog } from "./dust-debug.js";
+import { listPodFiles, type PodApi } from "./dust-pod.js";
 import { podProgressReporter, refreshPodStatus } from "./dust-pod-status.js";
 import { podApiFor } from "./dust-pod-runtime.js";
+import { diffSkills, formatSkillDiff } from "./dust-pod-skills-diff.js";
 import {
   discoverLocalSkills,
   fingerprintSkill,
@@ -68,6 +70,19 @@ async function resyncSelectedSkills(args: {
   const chosen = selected.map((name) => byName.get(name)).filter((skill): skill is LocalSkill => skill !== undefined);
   const missing = selected.filter((name) => !byName.has(name));
 
+  // A preview, not a gate: uploads are one request per file against a
+  // rate-limited API, so seeing what actually changed before committing to a
+  // full re-upload is the point of this command over the plain picker. A
+  // listing failure must never block an upload that would otherwise have
+  // worked, so it falls back to today's blind behaviour instead of aborting.
+  try {
+    const podEntries = await listPodFiles(api, binding.podId);
+    const diffs = diffSkills({ local: chosen, binding, podEntries, podId: binding.podId });
+    notify(formatSkillDiff(diffs, binding.name), "info");
+  } catch (err) {
+    debugLog("dust:skills", "Could not preview the skill diff before syncing", { error: errorMessage(err) });
+  }
+
   try {
     // A `missing` skill's pod copy has to go, not just its name from the
     // selection — otherwise the next sync's adoption logic finds an
@@ -120,6 +135,32 @@ async function resyncSelectedSkills(args: {
 }
 
 /**
+ * `/dust-skills diff` — compare the local skills against what the pod holds.
+ *
+ * `[DustSkills]` only ever checks the disk fingerprint against the digest
+ * recorded at the last sync, so a pod-side edit or deletion never shows up
+ * there. This is the two-way version: one `listPodFiles` call, no downloads,
+ * so it costs a single request rather than the one-per-file price a real sync
+ * pays. Read-only — it must never settle a watermark or touch the binding,
+ * or it would erase the very pod-changed signal the user just asked for.
+ */
+async function reportSkillDiff(args: {
+  api: PodApi;
+  binding: DustPodBinding;
+  available: LocalSkill[];
+  notify: (message: string, level?: string) => void;
+}): Promise<void> {
+  const { api, binding, available, notify } = args;
+  try {
+    const podEntries = await listPodFiles(api, binding.podId);
+    const diffs = diffSkills({ local: available, binding, podEntries, podId: binding.podId });
+    notify(formatSkillDiff(diffs, binding.name), "info");
+  } catch (err) {
+    notify(`Skill diff failed: ${errorMessage(err)}`, "error");
+  }
+}
+
+/**
  * `/dust-skills` — choose which of pi's skills to put in the pod.
  *
  * Selected skills are the only ones the pod's AGENTS.md offers, and the agent
@@ -135,11 +176,17 @@ async function resyncSelectedSkills(args: {
  * a skill is in the pod, editing it locally leaves the pod's copy behind — the
  * agent goes on reading the old version — and re-ticking the same boxes to fix
  * that is busywork. This is also what refreshes the fingerprints the
- * `[DustSkills]` section checks.
+ * `[DustSkills]` section checks. It also previews what changed, from one
+ * `listPodFiles` call, before paying for the re-upload.
+ *
+ * `/dust-skills diff` runs that same comparison on its own, without uploading
+ * anything — the honest, two-way version of what `[DustSkills]` can only check
+ * one side of.
  */
 export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSessionRuntime): void {
   pi.registerCommand("dust-skills", {
-    description: "Choose which pi skills to sync into the Dust Pod (`sync` re-uploads the current set)",
+    description:
+      "Choose which pi skills to sync into the Dust Pod (`sync` re-uploads the current set, `diff` compares it against the pod)",
     handler: async (args, ctx) => {
       const runtimeCtx = ctx as PiRuntimeContext;
       const notify = (message: string, level = "info"): void =>
@@ -161,9 +208,15 @@ export function registerDustSkillsCommand(pi: ExtensionAPI, runtime: DustSession
       }
 
       const available = discoverLocalSkills(root);
+      const sub = args.trim().toLowerCase();
 
-      if (args.trim().toLowerCase() === "sync") {
+      if (sub === "sync") {
         await resyncSelectedSkills({ api, binding, root, available, runtime, notify });
+        return;
+      }
+
+      if (sub === "diff") {
+        await reportSkillDiff({ api, binding, available, notify });
         return;
       }
 

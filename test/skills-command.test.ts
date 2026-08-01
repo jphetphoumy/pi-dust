@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ListPanelOptions, ListRow } from "../src/dust-pod-list-panel.js";
+import * as dustPod from "../src/dust-pod.js";
 import * as podRuntime from "../src/dust-pod-runtime.js";
 import * as podSkills from "../src/dust-pod-skills.js";
 import * as podUi from "../src/dust-pod-ui.js";
@@ -64,6 +65,7 @@ describe("/dust-skills", () => {
     });
     vi.spyOn(podSkills, "syncSkillsToPod").mockResolvedValue({ uploaded: ["a"], skipped: [], seen: {} });
     vi.spyOn(podSkills, "removeSkillsFromPod").mockResolvedValue([]);
+    vi.spyOn(dustPod, "listPodFiles").mockResolvedValue([]);
     // Real discovery, but confined to this suite's throwaway agent dir. The
     // default search includes ~/.agents/skills, so without this the assertions
     // would depend on whichever skills the developer happens to have installed.
@@ -213,7 +215,23 @@ describe("/dust-skills", () => {
     expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
     const synced = vi.mocked(podSkills.syncSkillsToPod).mock.calls[0][2];
     expect(synced.map((skill) => skill.name)).toEqual(["herdr"]);
-    expect(messages()[0]).toContain("Re-synced");
+    // A diff preview lands first, then the actual re-sync result.
+    expect(messages().some((message) => message.includes("Re-synced"))).toBe(true);
+  });
+
+  it("`sync` still uploads blind when the preview listing fails", async () => {
+    // A preview is a nicety, not a gate: a listing failure must never block an
+    // upload that would otherwise have worked, so it falls back to today's
+    // blind behaviour instead of aborting the sync.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr"] });
+    writeSkill("herdr");
+    vi.mocked(dustPod.listPodFiles).mockRejectedValue(new Error("HTTP 500"));
+
+    await handler("sync", ctx());
+
+    expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
+    expect(messages().some((message) => message.includes("Re-synced"))).toBe(true);
+    expect(messages().some((message) => message.startsWith("Skills in pod"))).toBe(false);
   });
 
   it("`sync` refreshes the fingerprints, so the section stops reporting stale", async () => {
@@ -503,5 +521,118 @@ describe("/dust-skills", () => {
     await handler("", ctx());
 
     expect(messages()[0]).toContain("Skill sync failed: HTTP 500");
+  });
+
+  describe("`diff`", () => {
+    it("needs a pod, since there is nothing to compare against without one", async () => {
+      writeSkill("herdr");
+
+      await handler("diff", ctx());
+
+      expect(messages()[0]).toContain("No pod bound");
+      expect(dustPod.listPodFiles).not.toHaveBeenCalled();
+    });
+
+    it("reports synced when the local fingerprint matches and the pod has a matching watermark", async () => {
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        skills: ["herdr"],
+        skillFingerprints: {},
+        seen: { "skills/herdr/SKILL.md": { podMs: 100, hash: "h" } },
+      });
+      writeSkill("herdr");
+      const [skill] = podSkills.discoverLocalSkills(root);
+      const binding = getPodBinding(root)!;
+      binding.skillFingerprints = { herdr: podSkills.fingerprintSkill(skill) };
+      savePodBinding(root, binding);
+      vi.mocked(dustPod.listPodFiles).mockResolvedValue([
+        { path: "pod-vlt_1/skills/herdr/SKILL.md", fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 100 },
+      ]);
+
+      await handler("diff", ctx());
+
+      expect(messages()[0]).toContain("herdr: synced");
+    });
+
+    it("reports pod-changed when a pod file is newer than its recorded watermark", async () => {
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        skills: ["herdr"],
+        seen: { "skills/herdr/SKILL.md": { podMs: 100, hash: "h" } },
+      });
+      writeSkill("herdr");
+      const [skill] = podSkills.discoverLocalSkills(root);
+      const binding = getPodBinding(root)!;
+      binding.skillFingerprints = { herdr: podSkills.fingerprintSkill(skill) };
+      savePodBinding(root, binding);
+      vi.mocked(dustPod.listPodFiles).mockResolvedValue([
+        { path: "pod-vlt_1/skills/herdr/SKILL.md", fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 999 },
+      ]);
+
+      await handler("diff", ctx());
+
+      expect(messages()[0]).toContain("herdr: pod-changed");
+    });
+
+    it("reports pod-changed with the deletion called out when a watermarked pod file is gone", async () => {
+      savePodBinding(root, {
+        podId: "vlt_1",
+        name: "proj",
+        skills: ["herdr"],
+        seen: {
+          "skills/herdr/SKILL.md": { podMs: 100, hash: "h" },
+          "skills/herdr/notes.md": { podMs: 100, hash: "h2" },
+        },
+      });
+      writeSkill("herdr", ["notes.md"]);
+      const [skill] = podSkills.discoverLocalSkills(root);
+      const binding = getPodBinding(root)!;
+      binding.skillFingerprints = { herdr: podSkills.fingerprintSkill(skill) };
+      savePodBinding(root, binding);
+      // Only SKILL.md is still in the pod's listing; notes.md was deleted there.
+      vi.mocked(dustPod.listPodFiles).mockResolvedValue([
+        { path: "pod-vlt_1/skills/herdr/SKILL.md", fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 100 },
+      ]);
+
+      await handler("diff", ctx());
+
+      expect(messages()[0]).toContain("herdr: pod-changed");
+      expect(messages()[0]).toContain("deleted");
+    });
+
+    it("reports pod-only for a skill-shaped pod subtree with nothing selected locally", async () => {
+      savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {} });
+      vi.mocked(dustPod.listPodFiles).mockResolvedValue([
+        { path: "pod-vlt_1/skills/authored/SKILL.md", fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+      ]);
+
+      await handler("diff", ctx());
+
+      expect(messages()[0]).toContain("authored: pod-only");
+    });
+
+    it("reports the listing failure and touches nothing", async () => {
+      savePodBinding(root, { podId: "vlt_1", name: "proj", skills: ["herdr"], seen: {} });
+      writeSkill("herdr");
+      const before = getPodBinding(root);
+      vi.mocked(dustPod.listPodFiles).mockRejectedValue(new Error("HTTP 500"));
+
+      await handler("diff", ctx());
+
+      expect(messages()[0]).toBe("Skill diff failed: HTTP 500");
+      expect(getPodBinding(root)).toEqual(before);
+    });
+
+    it("never opens the picker or uploads anything — it is read-only", async () => {
+      savePodBinding(root, { podId: "vlt_1", name: "proj", skills: ["herdr"], seen: {} });
+      writeSkill("herdr");
+
+      await handler("diff", ctx());
+
+      expect(podUi.openListPanel).not.toHaveBeenCalled();
+      expect(podSkills.syncSkillsToPod).not.toHaveBeenCalled();
+    });
   });
 });
