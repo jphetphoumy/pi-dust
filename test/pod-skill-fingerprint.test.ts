@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { fingerprintSkill, type LocalSkill } from "../src/dust-pod-skills.js";
+import { fingerprintSkill, fingerprintSkillAt, type LocalSkill } from "../src/dust-pod-skills.js";
 
 /**
  * The fingerprint is what turns "you picked this skill" into "this exact
@@ -71,5 +71,31 @@ describe("skill fingerprints", () => {
     const gone = { ...skill({ "SKILL.md": "hi" }), files: ["SKILL.md", "deleted.md"] };
 
     expect(() => fingerprintSkill(gone)).not.toThrow();
+  });
+
+  describe("fingerprintSkillAt", () => {
+    it("matches fingerprintSkill when the file list is current", () => {
+      const one = skill({ "SKILL.md": "hello", "ref.md": "extra" });
+
+      expect(fingerprintSkillAt(dir)).toBe(fingerprintSkill(one));
+    });
+
+    it("picks up a file added on disk that a stale LocalSkill.files omits", () => {
+      // This is the whole reason it exists: after a pod-side pull writes a new
+      // file into the skill directory, any `LocalSkill` held from before that
+      // write has a `files` list that no longer matches disk.
+      const before = skill({ "SKILL.md": "hello" });
+      const staleFingerprint = fingerprintSkill(before);
+      writeFileSync(join(dir, "ref.md"), "new from the pod");
+
+      expect(fingerprintSkillAt(dir)).not.toBe(staleFingerprint);
+    });
+
+    it("returns a stable value for a directory that does not exist, without throwing", () => {
+      const missing = join(dir, "does-not-exist");
+
+      expect(() => fingerprintSkillAt(missing)).not.toThrow();
+      expect(fingerprintSkillAt(missing)).toBe(fingerprintSkillAt(missing));
+    });
   });
 });

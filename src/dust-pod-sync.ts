@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { SESSION_EXPIRED_MESSAGE } from "./dust-constants.js";
 import { debugLog } from "./dust-debug.js";
 import { POD_AGENTS_MD } from "./dust-pod-agents-md.js";
 import { isPodPathSafe, MAX_INGEST_FILES, selectIngestableFiles } from "./dust-pod-files.js";
-import { fingerprintSkill, isPodSkillPath } from "./dust-pod-skills.js";
+import {
+  discoverLocalSkills,
+  fingerprintSkill,
+  fingerprintSkillAt,
+  isPodSkillPath,
+  type LocalSkill,
+  splitPodSkillPath,
+} from "./dust-pod-skills.js";
 import {
   downloadPodFile,
   listPodFiles,
@@ -27,6 +34,18 @@ export interface SyncReport {
   skipped: Array<{ rel: string; reason: string }>;
   /** Skills the agent authored in the pod, installed into the project. */
   adopted: string[];
+  /**
+   * Absolute path a synced skill's pulled file actually landed at, keyed by
+   * pod-relative path — populated only when that path falls outside the
+   * project root (a skill synced from a shared home like `~/.agents/skills`).
+   * A subset of `pulled`, called out separately so a write reaching outside
+   * the project is never left as just a number in a counter.
+   *
+   * Optional, and only ever set by `syncPod` itself, so every existing
+   * literal `SyncReport` elsewhere (tests mocking `syncPod`'s return value)
+   * stays valid without having to name a field they have no opinion about.
+   */
+  skillWritesOutsideRoot?: Record<string, string>;
 }
 
 /** Called as each file finishes, for a progress indicator. */
@@ -36,10 +55,19 @@ export interface SyncOptions {
   push?: boolean;
   pull?: boolean;
   onProgress?: SyncProgress;
+  /**
+   * Where to look up a synced skill's real local directory, for routing a
+   * pod-side edit back onto disk. Defaults to `discoverLocalSkills(root)`.
+   *
+   * Injectable so a test never has to touch the real skill homes under
+   * `homedir()`, and so the (real) implementation's directory walks only run
+   * when a synced-skill entry is actually in play — see `skillLookup` below.
+   */
+  resolveLocalSkills?: () => LocalSkill[];
 }
 
 export function emptyReport(): SyncReport {
-  return { pulled: [], pushed: [], conflicted: [], skipped: [], adopted: [] };
+  return { pulled: [], pushed: [], conflicted: [], skipped: [], adopted: [], skillWritesOutsideRoot: {} };
 }
 
 export function isEmptyReport(report: SyncReport): boolean {
@@ -88,13 +116,12 @@ export function detectAdoptableSkills(
   const grouped = new Map<string, string[]>();
 
   for (const rel of rels) {
-    const match = /^skills\/([^/]+)\/(.+)$/.exec(rel);
-    if (!match) continue;
-    const [, name] = match;
-    if (already.has(name as string)) continue;
-    const group = grouped.get(name as string) ?? [];
+    const split = splitPodSkillPath(rel);
+    if (!split) continue;
+    if (already.has(split.name)) continue;
+    const group = grouped.get(split.name) ?? [];
     group.push(rel);
-    grouped.set(name as string, group);
+    grouped.set(split.name, group);
   }
 
   for (const [name, group] of [...grouped]) {
@@ -137,26 +164,23 @@ function fingerprintAdopted(root: string, name: string, rels: readonly string[])
 }
 
 /**
- * Files the extension put in the pod for the agent, not the user's content.
+ * A file the extension put in the pod for the agent, never the user's content.
  *
- * These must never be pulled onto disk: AGENTS.md is a rendering of the system
- * prompt and `skills/<name>/` holds copies of the user's own skill files, so
- * writing either into the project would litter it with tooling that then looks
- * like something they wrote.
- *
- * Matched against the synced set rather than the bare `skills/` prefix, so a
- * project that genuinely has a `skills/` directory still syncs it.
+ * AGENTS.md is a rendering of the system prompt — pulling it onto disk would
+ * litter the project with tooling that then looks like something the user
+ * wrote. A synced skill's files are *not* covered here: those come back
+ * through `syncSyncedSkillEntry`, which routes them to the skill's real local
+ * directory instead of excluding them outright.
  */
-export function isPodOwnedPath(rel: string, binding: DustPodBinding): boolean {
-  return rel === POD_AGENTS_MD || isPodSkillPath(rel, binding.skills ?? []);
+export function isPodOwnedPath(rel: string): boolean {
+  return rel === POD_AGENTS_MD;
 }
 
 function hashOf(content: Buffer | string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-function readLocal(root: string, rel: string): Buffer | null {
-  const path = join(root, rel);
+function readAbs(path: string): Buffer | null {
   try {
     return readFileSync(path);
   } catch {
@@ -164,11 +188,18 @@ function readLocal(root: string, rel: string): Buffer | null {
   }
 }
 
-function writeLocal(root: string, rel: string, content: Buffer): void {
-  const path = join(root, rel);
+function writeAbs(path: string, content: Buffer): void {
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, content);
+}
+
+function readLocal(root: string, rel: string): Buffer | null {
+  return readAbs(join(root, rel));
+}
+
+function writeLocal(root: string, rel: string, content: Buffer): void {
+  writeAbs(join(root, rel), content);
 }
 
 /**
@@ -294,6 +325,87 @@ function applyOutcomes(outcomes: readonly UploadOutcome[], binding: DustPodBindi
   }
 }
 
+/**
+ * Routes a pod-side edit to a synced (not merely adopted) skill's file back
+ * to that skill's real local directory — `.pi/skills/<name>/` for one that
+ * was itself adopted, or wherever `discoverLocalSkills` resolves the name to
+ * otherwise (see `skillSearchDirs` in dust-pod-skills.ts) — instead of the
+ * literal `skills/<name>/…` pod path, which is not somewhere pi looks.
+ *
+ * This is what fixes #54: before this, every such entry was excluded from
+ * the pull outright (`isPodOwnedPath`), so an agent's edit to a synced
+ * skill's SKILL.md could never reach disk.
+ *
+ * A skill resolved from a shared home (`~/.agents/skills`, the agent's own
+ * skills dir) writes back to that shared copy, changing the skill for every
+ * project on the machine that uses it. Whether that is the right call, or a
+ * pod-side edit should instead land project-locally, is the namespacing
+ * question #55 is for — not settled here.
+ *
+ * Mirrors the ordinary watermark/conflict rules in `syncPod`'s main loop
+ * exactly, just against `skill.baseDir` instead of `root`: identical bytes
+ * converge the watermark silently; changed on both sides is a conflict, left
+ * untouched; otherwise the file is written and the watermark advances. The
+ * caller is expected to have already checked the entry is pod-changed and
+ * this is a pull — same as it must for the missing-skill case, which never
+ * reaches this function at all.
+ *
+ * Returns `true` when the skill's file was actually written, so the caller
+ * knows whose fingerprint needs refreshing.
+ */
+async function syncSyncedSkillEntry(args: {
+  api: PodApi;
+  podId: string;
+  rel: string;
+  relFile: string;
+  entryMs: number;
+  skill: LocalSkill;
+  seen: DustPodBinding["seen"];
+  report: SyncReport;
+  root: string;
+}): Promise<boolean> {
+  const { api, podId, rel, relFile, entryMs, skill, seen, report, root } = args;
+  const watermark = seen[rel];
+
+  // The second escape check the ordinary path-safety guard cannot cover: a
+  // shared-home skill's `baseDir` is deliberately outside `root`, so a
+  // pod-supplied `relFile` still has to be kept inside *that* directory.
+  if (!isPodPathSafe(skill.baseDir, relFile)) {
+    debugLog("dust:pod", "Skipping synced-skill entry whose path escapes its skill directory", {
+      baseDir: skill.baseDir,
+      relFile,
+    });
+    report.skipped.push({ rel, reason: "path escapes the skill directory" });
+    return false;
+  }
+
+  const target = resolve(skill.baseDir, relFile);
+  const local = readAbs(target);
+  const localHash = local ? hashOf(local) : null;
+  const localChanged = watermark ? localHash !== watermark.hash : local !== null;
+
+  const content = await downloadPodFile(api, podId, rel);
+  const contentHash = hashOf(content);
+
+  if (contentHash === localHash) {
+    seen[rel] = { podMs: entryMs, hash: contentHash };
+    return false;
+  }
+  if (localChanged) {
+    report.conflicted.push(rel);
+    return false;
+  }
+  writeAbs(target, content);
+  seen[rel] = { podMs: entryMs, hash: contentHash };
+  report.pulled.push(rel);
+  // Named explicitly when the write landed outside the project — a shared-home
+  // skill's baseDir — so it is never left as just a number in a counter.
+  if (!isPodPathSafe(root, relative(root, target))) {
+    report.skillWritesOutsideRoot = { ...report.skillWritesOutsideRoot, [rel]: target };
+  }
+  return true;
+}
+
 /** Replaces the provisional MAX_SAFE_INTEGER watermarks with the pod's real mtimes. */
 async function settleWatermarks(api: PodApi, binding: DustPodBinding): Promise<void> {
   for (const entry of await listPodFiles(api, binding.podId)) {
@@ -351,6 +463,24 @@ export async function syncPod(
     : new Map<string, string[]>();
   const adoptedPaths = new Set([...adoptable.values()].flat());
 
+  // Names already synced by `/dust-skills`, whose files route back to their
+  // real local directory instead of the ordinary watermark path. Discovery
+  // (four directory walks, two under homedir()) is memoized and only run the
+  // first time an entry actually needs it, so a sync with no synced skills —
+  // most pre-turn pushes — pays nothing for this.
+  const syncedSkillNames = new Set(binding.skills ?? []);
+  let localSkills: Map<string, LocalSkill> | null = null;
+  const skillLookup = (name: string): LocalSkill | undefined => {
+    localSkills ??= new Map(
+      (options.resolveLocalSkills ?? (() => discoverLocalSkills(root)))().map((skill) => [skill.name, skill]),
+    );
+    return localSkills.get(name);
+  };
+  // Reported once per skill even when several of its files moved, and only
+  // once its files are worth mentioning — see the pod-changed check below.
+  const missingSkills = new Set<string>();
+  const touchedSkills = new Set<string>();
+
   for (const entry of entries) {
     step();
     const rel = toRelativePath(binding.podId, entry.path);
@@ -367,7 +497,50 @@ export async function syncPod(
     }
 
     // Ours, not theirs: neither pulled down nor treated as a conflict.
-    if (isPodOwnedPath(rel, binding)) continue;
+    if (isPodOwnedPath(rel)) continue;
+
+    // A file of a skill already synced by `/dust-skills` routes back to that
+    // skill's real local directory instead of the pod's literal path — see
+    // `syncSyncedSkillEntry`. Checked before the adopted-skill branch, though
+    // the two are mutually exclusive: a name only reaches `adoptedPaths` on
+    // the run that adopts it, before it is ever added to `binding.skills`.
+    const skillEntry = syncedSkillNames.size > 0 ? splitPodSkillPath(rel) : null;
+    if (skillEntry && syncedSkillNames.has(skillEntry.name)) {
+      const watermark = seen[rel];
+      const podChanged = !watermark || entry.lastModifiedMs > watermark.podMs;
+      // Not pod-changed: nothing incoming, and the local→pod direction here
+      // is `/dust-skills sync`'s job, not this sync's. A push-only sync must
+      // never write into a skill directory, same rule the adoption branch
+      // follows for `.pi/skills/`.
+      if (podChanged && pull) {
+        const skill = skillLookup(skillEntry.name);
+        if (!skill) {
+          if (!missingSkills.has(skillEntry.name)) {
+            missingSkills.add(skillEntry.name);
+            // `rel` — a real file the pod holds — not a directory prefix, so
+            // `report.skipped` stays a list of actual paths throughout.
+            report.skipped.push({
+              rel,
+              reason: `no local directory for synced skill "${skillEntry.name}" — run /dust-skills sync to reconcile`,
+            });
+          }
+        } else {
+          const pulled = await syncSyncedSkillEntry({
+            api,
+            podId: binding.podId,
+            rel,
+            relFile: skillEntry.relFile,
+            entryMs: entry.lastModifiedMs,
+            skill,
+            seen,
+            report,
+            root,
+          });
+          if (pulled) touchedSkills.add(skillEntry.name);
+        }
+      }
+      continue;
+    }
 
     // An adopted skill goes to `.pi/skills/…` rather than its literal pod path,
     // which is the whole point — `<root>/skills/` is not somewhere pi looks.
@@ -423,6 +596,21 @@ export async function syncPod(
     }
   }
 
+  if (touchedSkills.size > 0) {
+    // Recomputed from disk rather than from the pre-pull `LocalSkill.files`
+    // snapshot, since the pull may have just added or removed a file the
+    // snapshot never saw. This is what stops `[DustSkills]` claiming `synced`
+    // for a skill whose pod-side edit was just written locally — a conflicted
+    // skill's fingerprint is deliberately left alone, so it keeps reading
+    // `stale` and pointing the user at `/dust-skills sync`.
+    const fingerprints = { ...binding.skillFingerprints };
+    for (const name of touchedSkills) {
+      const skill = skillLookup(name);
+      if (skill) fingerprints[name] = fingerprintSkillAt(skill.baseDir);
+    }
+    binding.skillFingerprints = fingerprints;
+  }
+
   if (adoptable.size > 0) {
     // Registering them is what makes the adoption complete. Without it pi would
     // discover the skill on disk while AGENTS.md kept omitting it — the agent
@@ -465,6 +653,14 @@ export async function syncPod(
     // away; the rest are counted as their uploads land, inside `uploadAll`.
     const toUpload: string[] = [];
     for (const rel of missing) {
+      // A synced skill's watermark key maps to `skill.baseDir`, not
+      // `join(root, rel)` — pushing it is `/dust-skills sync`'s job, not this
+      // sync's, the same rule the pull side follows. Guarded by `existsSync`
+      // too: a name added to `binding.skills` by adoption bypasses the
+      // `/dust-skills` picker's collision check, so a genuine project file at
+      // that same literal path must still be pushed rather than silently
+      // dropped from the sync.
+      if (isPodSkillPath(rel, binding.skills ?? []) && !existsSync(join(root, rel))) continue;
       if (podPaths.has(rel)) step();
       else toUpload.push(rel);
     }

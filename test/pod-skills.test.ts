@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -12,6 +13,7 @@ import {
   podSkillPath,
   removeSkillsFromPod,
   skillSearchDirs,
+  splitPodSkillPath,
   stripSkillsListing,
   syncSkillsToPod,
 } from "../src/dust-pod-skills.js";
@@ -180,6 +182,7 @@ describe("pod skills", () => {
       vi.spyOn(podApi, "uploadPodFile").mockImplementation(async (_a, _p, rel) => {
         uploads.push(rel);
       });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([]);
 
       await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "herdr", ["SKILL.md", "references/keys.md"])]);
 
@@ -189,10 +192,63 @@ describe("pod skills", () => {
       ]);
     });
 
+    it("settles a watermark for each uploaded file, matched against a fresh listing", async () => {
+      // Without this, every skill file starts with no watermark at all, and a
+      // pod-side edit made before the next sync reads as changed-on-both-sides
+      // instead of pulled — see #54.
+      vi.spyOn(podApi, "uploadPodFile").mockResolvedValue(undefined);
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        {
+          path: `pod-vlt_1/${POD_SKILLS_PREFIX}/herdr/SKILL.md`,
+          fileName: "SKILL.md",
+          isDirectory: false,
+          sizeBytes: 20,
+          lastModifiedMs: 555,
+        },
+      ]);
+
+      const result = await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "herdr", ["SKILL.md"])]);
+
+      const expectedHash = createHash("sha256").update("content of SKILL.md").digest("hex");
+      expect(result.seen).toEqual({
+        [`${POD_SKILLS_PREFIX}/herdr/SKILL.md`]: { podMs: 555, hash: expectedHash },
+      });
+    });
+
+    it("does not watermark a file the pod refused", async () => {
+      vi.spyOn(podApi, "uploadPodFile").mockImplementation(async (_a, _p, rel) => {
+        if (rel.endsWith("bad.md")) throw new Error("HTTP 400");
+      });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([
+        { path: `pod-vlt_1/${POD_SKILLS_PREFIX}/s/SKILL.md`, fileName: "SKILL.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+        { path: `pod-vlt_1/${POD_SKILLS_PREFIX}/s/bad.md`, fileName: "bad.md", isDirectory: false, sizeBytes: 1, lastModifiedMs: 1 },
+      ]);
+
+      const result = await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "s", ["SKILL.md", "bad.md"])]);
+
+      expect(Object.keys(result.seen)).toEqual([`${POD_SKILLS_PREFIX}/s/SKILL.md`]);
+    });
+
+    it("degrades to no watermarks rather than failing the whole sync when the settle listing fails", async () => {
+      // The uploads already landed. Failing the whole function here would stop
+      // the caller from ever recording `binding.skills` for files that really
+      // are in the pod — and the next sync's adoption logic would then treat
+      // the user's own just-uploaded skill as agent-authored and install it a
+      // second time.
+      vi.spyOn(podApi, "uploadPodFile").mockResolvedValue(undefined);
+      vi.spyOn(podApi, "listPodFiles").mockRejectedValue(new Error("network blip"));
+
+      const result = await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "herdr", ["SKILL.md"])]);
+
+      expect(result.uploaded).toEqual([`${POD_SKILLS_PREFIX}/herdr/SKILL.md`]);
+      expect(result.seen).toEqual({});
+    });
+
     it("records a file the pod refused and keeps going", async () => {
       vi.spyOn(podApi, "uploadPodFile").mockImplementation(async (_a, _p, rel) => {
         if (rel.endsWith("bad.md")) throw new Error("HTTP 400");
       });
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([]);
 
       const result = await syncSkillsToPod(api, "vlt_1", [realSkill(cwd, "s", ["SKILL.md", "bad.md"])]);
 
@@ -204,6 +260,7 @@ describe("pod skills", () => {
 
     it("reports progress across every file of every skill as one count", async () => {
       vi.spyOn(podApi, "uploadPodFile").mockResolvedValue(undefined);
+      vi.spyOn(podApi, "listPodFiles").mockResolvedValue([]);
       const steps: string[] = [];
 
       await syncSkillsToPod(
@@ -270,8 +327,6 @@ describe("pod skills", () => {
   });
 
   describe("path ownership", () => {
-    const bound = (skills: string[]) => ({ podId: "vlt_1", name: "proj", seen: {}, skills });
-
     it("builds pod paths under the skills prefix", () => {
       expect(podSkillPath("herdr", "SKILL.md")).toBe("skills/herdr/SKILL.md");
     });
@@ -294,13 +349,25 @@ describe("pod skills", () => {
       expect(isPodSkillPath("skills/herdr/SKILL.md", [])).toBe(false);
     });
 
-    it("keeps the extension's own pod files out of the pull direction", () => {
-      // Otherwise AGENTS.md and copies of the user's skill files would be
-      // written into their project as if they had authored them.
-      expect(isPodOwnedPath("AGENTS.md", bound([]))).toBe(true);
-      expect(isPodOwnedPath("skills/herdr/SKILL.md", bound(["herdr"]))).toBe(true);
-      expect(isPodOwnedPath("src/main.py", bound(["herdr"]))).toBe(false);
-      expect(isPodOwnedPath("skills/theirs/x.md", bound(["herdr"]))).toBe(false);
+    it("keeps only the extension's own rendered files out of the pull direction", () => {
+      // AGENTS.md is never pulled. A synced skill's files are NOT excluded
+      // here any more — they come back through syncPod's skill-routing branch
+      // instead, which is what fixes #54.
+      expect(isPodOwnedPath("AGENTS.md")).toBe(true);
+      expect(isPodOwnedPath("skills/herdr/SKILL.md")).toBe(false);
+      expect(isPodOwnedPath("src/main.py")).toBe(false);
+      expect(isPodOwnedPath("skills/theirs/x.md")).toBe(false);
+    });
+
+    it("splits a pod skill path into the skill name and its file", () => {
+      expect(splitPodSkillPath("skills/herdr/SKILL.md")).toEqual({ name: "herdr", relFile: "SKILL.md" });
+      expect(splitPodSkillPath("skills/herdr/refs/a.md")).toEqual({ name: "herdr", relFile: "refs/a.md" });
+    });
+
+    it("does not split a path that is not skill-shaped", () => {
+      expect(splitPodSkillPath("src/main.py")).toBeNull();
+      expect(splitPodSkillPath("skills/herdr")).toBeNull();
+      expect(splitPodSkillPath("AGENTS.md")).toBeNull();
     });
   });
 

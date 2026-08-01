@@ -113,6 +113,9 @@ export function registerDustIngestCommand(pi: ExtensionAPI, runtime: DustSession
           for (const rel of report.conflicted) {
             notify(`Conflict (changed on both sides, left alone): ${rel}`, "warning");
           }
+          for (const [rel, target] of Object.entries(report.skillWritesOutsideRoot ?? {})) {
+            notify(`Pod edit for synced skill written outside the project: ${rel} → ${target}`, "warning");
+          }
         } catch (err) {
           notify(`Pod sync failed: ${errorMessage(err)}`, "error");
         }

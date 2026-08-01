@@ -156,6 +156,20 @@ export function podSkillPath(skillName: string, relFile: string): string {
 }
 
 /**
+ * Splits a pod-relative path under `skills/` into the skill name and the
+ * file's path within it, or `null` when `rel` is not skill-shaped.
+ *
+ * The inverse of `podSkillPath`, used on the pull side where the extension
+ * only has the pod's flat listing to work from.
+ */
+export function splitPodSkillPath(rel: string): { name: string; relFile: string } | null {
+  const match = /^skills\/([^/]+)\/(.+)$/.exec(rel);
+  if (!match) return null;
+  const [, name, relFile] = match as unknown as [string, string, string];
+  return { name, relFile };
+}
+
+/**
  * A digest of everything that was uploaded for a skill.
  *
  * This is what makes "synced" a checkable claim rather than a record of intent.
@@ -185,21 +199,55 @@ export function fingerprintSkill(skill: LocalSkill): string {
 }
 
 /**
+ * `fingerprintSkill`, but reading the file list fresh off disk instead of
+ * trusting a `LocalSkill.files` snapshot.
+ *
+ * After a pod-side pull writes into a skill's directory, any `LocalSkill`
+ * held from before that write is stale — the pod may have added or removed a
+ * file `skillFiles` never walked. This is the disk-truthful digest for that
+ * moment.
+ */
+export function fingerprintSkillAt(baseDir: string): string {
+  const { files } = skillFiles(baseDir);
+  return fingerprintSkill({ name: "", description: "", baseDir, filePath: "", files, bytes: 0 });
+}
+
+/** A sync watermark, in the same shape `DustPodBinding.seen` stores it. */
+export interface PodWatermark {
+  podMs: number;
+  hash: string;
+}
+
+/**
  * Uploads each skill's whole directory.
  *
  * The directory rather than SKILL.md alone, because pi tells the agent to
  * resolve a skill's relative references against its own directory — shipping
  * only the entry point would leave those references pointing at files the pod
  * does not have.
+ *
+ * Also returns a watermark per uploaded file, settled against a fresh listing
+ * the same way `ingestFiles` settles an ordinary ingest. Without this, every
+ * skill file starts with no watermark at all — and `syncSyncedSkillEntry` in
+ * dust-pod-sync.ts reads "no watermark, local file present, pod file present"
+ * as changed-on-both-sides. That makes the *first* pod-side edit after a
+ * `/dust-skills` selection an immediate, permanent conflict: the very failure
+ * mode #54 exists to fix would survive for exactly the files that just got
+ * synced.
  */
 export async function syncSkillsToPod(
   api: PodApi,
   podId: string,
   skills: LocalSkill[],
   onProgress?: SyncProgress,
-): Promise<{ uploaded: string[]; skipped: Array<{ rel: string; reason: string }> }> {
+): Promise<{
+  uploaded: string[];
+  skipped: Array<{ rel: string; reason: string }>;
+  seen: Record<string, PodWatermark>;
+}> {
   const uploaded: string[] = [];
   const skipped: Array<{ rel: string; reason: string }> = [];
+  const hashes = new Map<string, string>();
   const total = skills.reduce((sum, skill) => sum + skill.files.length, 0);
   let done = 0;
 
@@ -217,13 +265,34 @@ export async function syncSkillsToPod(
       try {
         await uploadPodFile(api, podId, podPath, content);
         uploaded.push(podPath);
+        hashes.set(podPath, createHash("sha256").update(content).digest("hex"));
       } catch (err) {
         skipped.push({ rel: podPath, reason: err instanceof Error ? err.message : String(err) });
       }
     }
   }
 
-  return { uploaded, skipped };
+  const seen: Record<string, PodWatermark> = {};
+  if (hashes.size > 0) {
+    try {
+      for (const entry of await listPodFiles(api, podId)) {
+        const rel = toRelativePath(podId, entry.path);
+        const hash = hashes.get(rel);
+        if (hash) seen[rel] = { podMs: entry.lastModifiedMs, hash };
+      }
+    } catch (err) {
+      // The uploads already landed; a failed settle must not fail the whole
+      // sync. If it did, the caller would never record `binding.skills` for
+      // files that really are in the pod — and the next `syncPod` would then
+      // see the user's own just-uploaded skill as untouched (no watermark, no
+      // `binding.skills` entry) and hand it to `detectAdoptableSkills`, which
+      // installs it a second time as if the agent had authored it. Degrading
+      // to no watermarks is strictly the pre-fix behavior, not a regression.
+      debugLog("dust:pod", "Could not settle skill watermarks after upload", { error: String(err) });
+    }
+  }
+
+  return { uploaded, skipped, seen };
 }
 
 /**

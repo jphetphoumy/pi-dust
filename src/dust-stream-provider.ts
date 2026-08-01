@@ -197,6 +197,12 @@ async function syncPodQuietly(
     for (const { rel, reason } of report.skipped) {
       console.error(`[dust] pod skipped ${rel}: ${reason}`);
     }
+    // A skill synced from a shared home (~/.agents/skills) writes back there,
+    // changing the skill for every project on the machine — named explicitly,
+    // like an adoption, rather than left as just a number in the pulled count.
+    for (const [rel, target] of Object.entries(report.skillWritesOutsideRoot ?? {})) {
+      console.error(`[dust] pod edit for synced skill written outside the project: ${rel} → ${target}`);
+    }
   } catch (err) {
     console.error(`[dust] pod sync ${phase} failed: ${errorMessage(err)}`);
   }

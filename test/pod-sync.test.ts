@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SESSION_EXPIRED_MESSAGE } from "../src/dust-constants.js";
+import { fingerprintSkillAt, type LocalSkill } from "../src/dust-pod-skills.js";
 import type { PodApi } from "../src/dust-pod.js";
 import * as podApi from "../src/dust-pod.js";
 import {
@@ -680,6 +681,293 @@ describe("pod sync", () => {
 
       expect(report.adopted).toEqual([]);
       expect(existsSync(join(root, ".pi/skills/deploy-helper"))).toBe(false);
+    });
+  });
+
+  /**
+   * A pod-side edit to a skill that was already synced via `/dust-skills` —
+   * #54. Before the fix, every file under `skills/<name>/` for a name in
+   * `binding.skills` was excluded from the pull outright, so the edit could
+   * never reach disk. Now it routes back to the skill's real local directory,
+   * through the same watermark/conflict handling as any other file.
+   */
+  describe("pod-side edits to a synced skill", () => {
+    function writeSkillDir(baseDir: string, files: Record<string, string>): void {
+      for (const [rel, content] of Object.entries(files)) {
+        const path = join(baseDir, rel);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, content);
+      }
+    }
+
+    function localSkill(name: string, baseDir: string): LocalSkill {
+      return { name, description: "", baseDir, filePath: join(baseDir, "SKILL.md"), files: [], bytes: 0 };
+    }
+
+    function skillsOption(...skills: LocalSkill[]): { resolveLocalSkills: () => LocalSkill[] } {
+      return { resolveLocalSkills: () => skills };
+    }
+
+    it("names the write when a shared-home skill's baseDir sits outside the project", async () => {
+      // Nothing else says where a synced skill's bytes landed — `pulled` is
+      // only ever surfaced as a count — so a write reaching outside the
+      // project would otherwise be invisible.
+      const sharedDir = mkdtempSync(join(tmpdir(), "pi-dust-shared-"));
+      try {
+        const baseDir = join(sharedDir, "herdr");
+        writeSkillDir(baseDir, { "SKILL.md": "old" });
+        const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+        const bound: DustPodBinding = {
+          ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+          skills: ["herdr"],
+        };
+
+        const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+        expect(report.skillWritesOutsideRoot).toEqual({
+          "skills/herdr/SKILL.md": join(baseDir, "SKILL.md"),
+        });
+      } finally {
+        rmSync(sharedDir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not name a pulled skill file's write when it lands inside the project", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+        skills: ["herdr"],
+      };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(report.skillWritesOutsideRoot ?? {}).toEqual({});
+    });
+
+    it("reaches the skill's real baseDir, not the literal pod path", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+        skills: ["herdr"],
+      };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(readFileSync(join(baseDir, "SKILL.md"), "utf8")).toBe("new");
+      expect(report.pulled).toEqual(["skills/herdr/SKILL.md"]);
+      expect(existsSync(join(root, "skills"))).toBe(false);
+    });
+
+    it("reaches an adopted skill's directory too, on a later pod-side edit", async () => {
+      const baseDir = join(root, ".pi", "skills", "deploy-helper");
+      writeSkillDir(baseDir, { "SKILL.md": "first version" });
+      const pod = makeFakePod({ "skills/deploy-helper/SKILL.md": { content: "improved", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/deploy-helper/SKILL.md": { podMs: 100, hash: hash("first version") } }),
+        skills: ["deploy-helper"],
+      };
+
+      const report = await syncPod(
+        pod.api,
+        root,
+        bound,
+        skillsOption(localSkill("deploy-helper", baseDir)),
+      );
+
+      expect(readFileSync(join(baseDir, "SKILL.md"), "utf8")).toBe("improved");
+      expect(report.pulled).toEqual(["skills/deploy-helper/SKILL.md"]);
+    });
+
+    it("leaves both sides alone and reports a conflict, rather than overwriting either", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "local version" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "pod version", ms: 200 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("base") } }),
+        skills: ["herdr"],
+      };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(report.conflicted).toEqual(["skills/herdr/SKILL.md"]);
+      expect(report.pulled).toEqual([]);
+      expect(readFileSync(join(baseDir, "SKILL.md"), "utf8")).toBe("local version");
+      expect(pod.files.get("skills/herdr/SKILL.md")?.content).toBe("pod version");
+    });
+
+    it("converges the watermark silently when both sides already hold the same bytes", async () => {
+      // The state every skill synced by `/dust-skills` starts in: no
+      // watermark for its files at all.
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "same" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "same", ms: 200 } });
+      const bound: DustPodBinding = { ...binding(), skills: ["herdr"] };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(isEmptyReport(report)).toBe(true);
+      expect(bound.seen["skills/herdr/SKILL.md"]).toEqual({ podMs: 200, hash: hash("same") });
+    });
+
+    it("refreshes the skill's fingerprint after a successful pull", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+        skills: ["herdr"],
+        skillFingerprints: { herdr: "stale-digest" },
+      };
+
+      await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(bound.skillFingerprints?.herdr).toBe(fingerprintSkillAt(baseDir));
+      expect(bound.skillFingerprints?.herdr).not.toBe("stale-digest");
+    });
+
+    it("leaves the fingerprint alone when the pull is a conflict, so staleness keeps reading true", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "local version" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "pod version", ms: 200 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("base") } }),
+        skills: ["herdr"],
+        skillFingerprints: { herdr: "original-digest" },
+      };
+
+      await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(bound.skillFingerprints?.herdr).toBe("original-digest");
+    });
+
+    it("reports once when a synced skill has no local directory to route to", async () => {
+      const pod = makeFakePod({
+        "skills/gone/SKILL.md": { content: "a", ms: 500 },
+        "skills/gone/ref.md": { content: "b", ms: 500 },
+      });
+      const bound: DustPodBinding = { ...binding(), skills: ["gone"] };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption());
+
+      // Reported once even though both of the skill's files moved — and
+      // against a real pod path, not a directory prefix.
+      expect(report.skipped).toEqual([
+        { rel: "skills/gone/SKILL.md", reason: expect.stringContaining('"gone"') },
+      ]);
+      expect(report.pulled).toEqual([]);
+      expect(existsSync(join(root, "skills"))).toBe(false);
+    });
+
+    it("does not report a missing skill whose pod copy has not moved", async () => {
+      const pod = makeFakePod({ "skills/gone/SKILL.md": { content: "a", ms: 100 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/gone/SKILL.md": { podMs: 100, hash: hash("a") } }),
+        skills: ["gone"],
+      };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption());
+
+      expect(isEmptyReport(report)).toBe(true);
+    });
+
+    it("never writes into a skill directory on a push-only sync", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+        skills: ["herdr"],
+      };
+
+      await syncPod(
+        pod.api,
+        root,
+        bound,
+        { push: true, pull: false, ...skillsOption(localSkill("herdr", baseDir)) },
+      );
+
+      expect(readFileSync(join(baseDir, "SKILL.md"), "utf8")).toBe("old");
+      expect(pod.downloads).toEqual([]);
+    });
+
+    it("does not let a pod-supplied relative path escape the skill's own directory", async () => {
+      // Crafted to pass the root-level check (it resolves to `root/evil.txt`,
+      // which is inside `root`) while still climbing out of the deeper
+      // `baseDir` — exactly the gap the ordinary `isPodPathSafe(root, rel)`
+      // check cannot cover, since a shared-home skill's baseDir is
+      // legitimately nested differently than the pod's `skills/<name>/`
+      // prefix.
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({
+        "skills/herdr/../../evil.txt": { content: "pwned", ms: 500 },
+      });
+      const bound: DustPodBinding = { ...binding(), skills: ["herdr"] };
+
+      const report = await syncPod(pod.api, root, bound, skillsOption(localSkill("herdr", baseDir)));
+
+      expect(report.pulled).toEqual([]);
+      expect(existsSync(join(root, "evil.txt"))).toBe(false);
+      expect(existsSync(join(root, ".agents", "evil.txt"))).toBe(false);
+      expect(report.skipped.some((s) => /escapes/.test(s.reason))).toBe(true);
+    });
+
+    it("does not re-download once the watermark has caught up", async () => {
+      const baseDir = join(root, ".agents", "skills", "herdr");
+      writeSkillDir(baseDir, { "SKILL.md": "old" });
+      const pod = makeFakePod({ "skills/herdr/SKILL.md": { content: "new", ms: 500 } });
+      const bound: DustPodBinding = {
+        ...binding({ "skills/herdr/SKILL.md": { podMs: 100, hash: hash("old") } }),
+        skills: ["herdr"],
+      };
+      const option = skillsOption(localSkill("herdr", baseDir));
+
+      await syncPod(pod.api, root, bound, option);
+      const before = pod.downloads.length;
+      const second = await syncPod(pod.api, root, bound, option);
+
+      expect(isEmptyReport(second)).toBe(true);
+      expect(pod.downloads.length).toBe(before);
+    });
+
+    it("still syncs the project's own skills/ directory normally when it holds no synced skill", async () => {
+      const pod = makeFakePod({ "skills/other/notes.md": { content: "mine", ms: 500 } });
+      const bound = binding();
+
+      const report = await syncPod(pod.api, root, bound, skillsOption());
+
+      expect(report.pulled).toEqual(["skills/other/notes.md"]);
+      expect(readLocal("skills/other/notes.md")).toBe("mine");
+    });
+
+    it("still pushes a genuine project file whose path collides with a synced skill name", async () => {
+      // The `/dust-skills` picker's collision check would normally prevent
+      // this, but adoption adds a name to `binding.skills` without going
+      // through that check — so a project `skills/<name>/…` file created
+      // afterwards must still be pushed, not silently dropped because its
+      // path happens to look like a routed skill watermark.
+      writeLocal("skills/herdr/notes.md", "mine");
+      const pod = makeFakePod({});
+      const bound: DustPodBinding = { ...binding(), skills: ["herdr"] };
+
+      const report = await syncPod(pod.api, root, bound, { push: true, pull: false, ...skillsOption() });
+
+      expect(report.pushed).toContain("skills/herdr/notes.md");
+      expect(pod.files.get("skills/herdr/notes.md")?.content).toBe("mine");
+    });
+
+    it("never runs local-skill discovery when nothing in the pod needs it", async () => {
+      const pod = makeFakePod({ "main.py": { content: "x", ms: 100 } });
+      writeLocal("main.py", "x");
+      const resolveLocalSkills = vi.fn(() => []);
+
+      await syncPod(pod.api, root, binding(), { resolveLocalSkills });
+
+      expect(resolveLocalSkills).not.toHaveBeenCalled();
     });
   });
 
