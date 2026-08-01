@@ -45,13 +45,21 @@ Division of labor:
    - Explicit instruction to report findings as a list, or an explicit empty list if there is
      nothing to raise — you need an unambiguous signal to end the loop.
 
-   Run this in the foreground; you need the verdict before deciding whether to loop.
+   Run this in the foreground; you need the verdict before deciding whether to loop. The reviewer
+   also drives the live Hunk session started by `just feature` (`hunk diff master --watch`) and
+   leaves an inline comment per finding there, so the person watching that pane sees the review
+   land in real time — the returned findings list, not the presence of Hunk comments, is what you
+   use for loop control.
 
 5. **Branch on the review result.**
-   - **Findings exist:** treat them as the next round's plan input. You may go straight back to
-     step 3 for small/mechanical fixes, but for anything non-trivial or that changes the approach,
-     loop back to step 2 (Opus re-plans incorporating the findings) to keep planning and
-     implementing separated. Then re-run step 4. Repeat.
+   - **Findings exist:** treat them as the next round's plan input. Before re-implementing, you may
+     also check `hunk session comment list --repo . --type agent` for the reviewer's inline notes —
+     they carry the same content as the structured findings but are useful for pinpointing exact
+     lines. You may go straight back to step 3 for small/mechanical fixes, but for anything
+     non-trivial or that changes the approach, loop back to step 2 (Opus re-plans incorporating the
+     findings) to keep planning and implementing separated. After fixing each finding, don't clear
+     its Hunk comment yourself — the next review round's reviewer clears its own resolved comments
+     per its own instructions. Then re-run step 4. Repeat.
    - **No findings:** the loop is done. Move to step 6.
 
 6. **Hand off to PR.** Invoke the `open-pr` skill to open the pull request. Do not open the PR
@@ -66,3 +74,6 @@ Division of labor:
   blocker to the user rather than looping indefinitely.
 - Keep review agents scoped to the diff plus enough surrounding context to judge it — don't dump
   the whole repo into the prompt.
+- If the worktree's Hunk pane was never started or was closed, the reviewer falls back to a plain
+  findings report — that's expected, not a failure; don't try to relaunch Hunk yourself (it's
+  interactive and meant for the user).
