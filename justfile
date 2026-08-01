@@ -100,3 +100,60 @@ clean:
     @printf "{{bold}}{{blue}}{{box_top}}\n│ ▶️  Cleaning generated artifacts\n{{box_bot}}{{reset}}\n"
     rm -rf coverage RELEASE_NOTES.md
     @printf "{{yell}}⚠️  Removed coverage/ and RELEASE_NOTES.md if they existed.{{reset}}\n"
+
+worktrees_dir := justfile_directory() + "/../pi-dust-worktrees"
+herdr_state_dir := justfile_directory() + "/.herdr-workspaces"
+
+# Create a worktree + branch for a new feature and open it as a herdr workspace
+feature name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf "{{bold}}{{blue}}{{box_top}}\n│ ▶️  Setting up feature '{{name}}'\n{{box_bot}}{{reset}}\n"
+    branch="feat/{{name}}"
+    worktree_dir="{{worktrees_dir}}/{{name}}"
+    if [ -e "$worktree_dir" ]; then
+        printf "{{bold}}{{red}}❌  $worktree_dir already exists.{{reset}}\n"
+        exit 1
+    fi
+    mkdir -p "{{worktrees_dir}}" "{{herdr_state_dir}}"
+    git -C "{{justfile_directory()}}" fetch origin master
+    git -C "{{justfile_directory()}}" worktree add -b "$branch" "$worktree_dir" origin/master
+    printf "{{green}}✅  Worktree created at $worktree_dir on branch $branch.{{reset}}\n"
+    response=$(herdr workspace create --cwd "$worktree_dir" --label "{{name}}")
+    workspace_id=$(printf '%s' "$response" | grep -oP '"workspace_id":"\K[^"]+' | head -n1)
+    if [ -n "$workspace_id" ]; then
+        printf '%s' "$workspace_id" > "{{herdr_state_dir}}/{{name}}"
+        printf "{{green}}✅  herdr workspace '{{name}}' ($workspace_id) is ready.{{reset}}\n"
+    else
+        printf "{{yell}}⚠️  Worktree created, but could not parse herdr workspace id from: $response{{reset}}\n"
+    fi
+
+# Delete a feature's worktree, branch, and herdr workspace
+delete name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf "{{bold}}{{blue}}{{box_top}}\n│ ▶️  Deleting feature '{{name}}'\n{{box_bot}}{{reset}}\n"
+    branch="feat/{{name}}"
+    worktree_dir="{{worktrees_dir}}/{{name}}"
+    workspace_file="{{herdr_state_dir}}/{{name}}"
+    if [ -f "$workspace_file" ]; then
+        workspace_id=$(cat "$workspace_file")
+        herdr workspace close "$workspace_id" 2>/dev/null && \
+            printf "{{green}}✅  Closed herdr workspace $workspace_id.{{reset}}\n" || \
+            printf "{{yell}}⚠️  Could not close herdr workspace $workspace_id (already closed?).{{reset}}\n"
+        rm -f "$workspace_file"
+    else
+        printf "{{yell}}⚠️  No tracked herdr workspace for '{{name}}'.{{reset}}\n"
+    fi
+    if [ -d "$worktree_dir" ]; then
+        git -C "{{justfile_directory()}}" worktree remove "$worktree_dir" --force
+        printf "{{green}}✅  Removed worktree $worktree_dir.{{reset}}\n"
+    else
+        printf "{{yell}}⚠️  No worktree found at $worktree_dir.{{reset}}\n"
+    fi
+    if git -C "{{justfile_directory()}}" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "{{justfile_directory()}}" branch -D "$branch"
+        printf "{{green}}✅  Deleted branch $branch.{{reset}}\n"
+    else
+        printf "{{yell}}⚠️  Branch $branch not found locally.{{reset}}\n"
+    fi

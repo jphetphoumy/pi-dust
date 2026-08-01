@@ -3,3 +3,4 @@ node_modules/
 coverage/
 RELEASE_NOTES.md
 .nvmrc
+.herdr-workspaces/
