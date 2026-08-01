@@ -121,11 +121,22 @@ feature name:
     printf "{{green}}✅  Worktree created at $worktree_dir on branch $branch.{{reset}}\n"
     response=$(herdr workspace create --cwd "$worktree_dir" --label "{{name}}")
     workspace_id=$(printf '%s' "$response" | grep -oP '"workspace_id":"\K[^"]+' | head -n1)
-    if [ -n "$workspace_id" ]; then
-        printf '%s' "$workspace_id" > "{{herdr_state_dir}}/{{name}}"
-        printf "{{green}}✅  herdr workspace '{{name}}' ($workspace_id) is ready.{{reset}}\n"
+    root_pane=$(printf '%s' "$response" | grep -oP '"pane_id":"\K[^"]+' | head -n1)
+    if [ -z "$workspace_id" ] || [ -z "$root_pane" ]; then
+        printf "{{yell}}⚠️  Worktree created, but could not parse herdr workspace/pane id from: $response{{reset}}\n"
+        exit 0
+    fi
+    printf '%s' "$workspace_id" > "{{herdr_state_dir}}/{{name}}"
+    printf "{{green}}✅  herdr workspace '{{name}}' ($workspace_id) is ready.{{reset}}\n"
+    herdr pane run "$root_pane" "claude --permission-mode auto"
+    printf "{{green}}✅  Started claude (auto mode) in $root_pane.{{reset}}\n"
+    hunk_tab=$(herdr tab create --workspace "$workspace_id" --label hunk)
+    hunk_pane=$(printf '%s' "$hunk_tab" | grep -oP '"pane_id":"\K[^"]+' | head -n1)
+    if [ -n "$hunk_pane" ]; then
+        herdr pane run "$hunk_pane" "hunk diff master --watch"
+        printf "{{green}}✅  Started hunk diff (vs master) in $hunk_pane.{{reset}}\n"
     else
-        printf "{{yell}}⚠️  Worktree created, but could not parse herdr workspace id from: $response{{reset}}\n"
+        printf "{{yell}}⚠️  Could not parse hunk tab pane id from: $hunk_tab{{reset}}\n"
     fi
 
 # Delete a feature's worktree, branch, and herdr workspace
