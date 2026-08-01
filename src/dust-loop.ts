@@ -152,12 +152,21 @@ function describeLoopFooter(loop: DustLoopState): string {
   return `${STATUS_KEY}: ${cadence} (${progress}${waiting})`;
 }
 
+function formatElapsed(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h`;
+}
+
 /** Human-readable form for `/loop status` toasts — distinct from the terse footer text. */
 function describeLoopMessage(loop: DustLoopState): string {
   const cadence = loop.mode === "interval" ? `every ${formatInterval(loop.intervalMs as number)}` : "self-paced";
   const progress = loop.maxIterations !== null ? `${loop.iterations} of ${loop.maxIterations} iterations` : `${loop.iterations} iterations so far`;
   const waiting = loop.waitingOnBusyAgent ? " — waiting for the agent to go idle" : "";
-  return `Looping ${cadence} (${progress})${waiting}.`;
+  const elapsed = formatElapsed(Date.now() - loop.startedAt);
+  return `Looping ${cadence} (${progress})${waiting}. Started ${elapsed} ago.`;
 }
 
 function showStatus(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
@@ -217,9 +226,12 @@ function armSelfPacedRetry(runtime: DustSessionRuntime, ctx?: PiRuntimeContext):
  * hijack `expectingSettle` exists to prevent).
  *
  * Wrapped in try/catch: this runs from bare `setInterval`/`setTimeout`
- * callbacks, and `pi.sendUserMessage` can throw (e.g. mid-turn without a
- * `deliverAs`) — an uncaught throw here would otherwise crash the process,
- * the same reason `dust-mcp.ts`'s heartbeat wraps its timer body.
+ * callbacks, and `pi.sendUserMessage` is a thin wrapper over pi's own
+ * `assertActive()` guard, which throws synchronously if this extension's
+ * runtime has gone stale — an uncaught throw here would otherwise crash the
+ * process, the same reason `dust-mcp.ts`'s heartbeat wraps its timer body.
+ * (pi swallows any *async* rejection from the send itself internally, so
+ * that failure mode never reaches this catch — only the synchronous one does.)
  */
 function runIteration(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
   const loop = runtime.loop;
@@ -330,7 +342,7 @@ function startLoop(
   debugLog("dust:loop", "Loop started", { mode: request.mode, intervalMs: request.intervalMs });
 
   showStatus(runtime, ctx);
-  // First iteration fires immediately, same as the user typing the command by hand.
+  // First iteration fires immediately, same as the user typing the prompt by hand.
   runIteration(runtime, ctx);
 }
 
