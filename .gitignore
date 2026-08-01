@@ -4,3 +4,16 @@ coverage/
 RELEASE_NOTES.md
 .nvmrc
 .herdr-workspaces/
+
+# Claude Code local/personal state (mirrors this project's .git/info/exclude)
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+.claude/routines/.state/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/agent-registry.json
+.claude/agent-memory-local/
+.claude/first-run
+.claude/assistant-daemon-state.json

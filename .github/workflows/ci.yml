@@ -126,6 +126,8 @@ jobs:
 
       - name: Generate release notes preview
         run: npm run changelog:release-notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Validate release notes preview
         run: npm run validate:release-notes

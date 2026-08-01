@@ -8,16 +8,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+This repo uses [`just`](https://github.com/casey/just) as its task runner (no Makefile):
+
 ```bash
-make check        # Full quality gate: typecheck + lint + test
-make prepush      # Extended gate: typecheck + lint + coverage (run before pushing)
-make test         # Run Vitest test suite once
-make test-watch   # Run Vitest in watch mode
-make coverage     # Generate coverage reports
-make lint         # Run ESLint
-make typecheck    # TypeScript type checking
-make setup-dev    # First-time setup: install deps + git hooks
-make changelog    # Generate/update CHANGELOG.md
+just check        # Full quality gate: typecheck + lint + test
+just prepush      # Extended gate: typecheck + lint + coverage (run before pushing)
+just test         # Run Vitest test suite once
+just test-watch   # Run Vitest in watch mode
+just coverage     # Generate coverage reports
+just lint         # Run ESLint
+just typecheck    # TypeScript type checking
+just setup-dev    # First-time setup: install deps + git hooks
+just changelog    # Generate/update CHANGELOG.md
 ```
 
 Feature worktree harness (requires `just`, `herdr`, `claude`, `hunk` on `PATH`, run from inside a herdr pane):
@@ -86,6 +88,6 @@ The project is organized as 27 TypeScript modules in `src/`, each with a single 
 ## Conventions
 
 - Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) — enforced by `commitlint`
-- `make prepush` must pass before pushing (runs full coverage gate)
+- `just prepush` must pass before pushing (runs full coverage gate)
 - Test files live in `test/` and mirror the `src/` module structure
 - `dust-types.ts` is intentionally excluded from coverage metrics
