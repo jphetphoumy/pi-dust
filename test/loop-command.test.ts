@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseLoopArgs, registerDustLoopCommand } from "../src/dust-loop.js";
 import { applyRuntimeContext, DustSessionRuntime } from "../src/dust-runtime.js";
+import { registerDustSessionEvents } from "../src/dust-session-events.js";
 
 function makeCtx(overrides: { isIdle?: () => boolean } = {}) {
   return {
@@ -12,6 +13,7 @@ function makeCtx(overrides: { isIdle?: () => boolean } = {}) {
   } as any;
 }
 
+/** Registers just the `/loop` command and its `agent_settled` hook. */
 function register(runtime: DustSessionRuntime) {
   const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
   const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
@@ -23,6 +25,13 @@ function register(runtime: DustSessionRuntime) {
 
   registerDustLoopCommand(pi, runtime);
   runtime.pi = pi;
+  return { commands, events, pi };
+}
+
+/** Also wires session lifecycle events (`session_shutdown`), which live in dust-session-events.ts, not dust-loop.ts. */
+function registerWithSessionEvents(runtime: DustSessionRuntime) {
+  const { commands, events, pi } = register(runtime);
+  registerDustSessionEvents(pi, runtime, vi.fn());
   return { commands, events, pi };
 }
 
@@ -57,11 +66,11 @@ describe("parseLoopArgs", () => {
     });
   });
 
-  it.each(["off", "stop"])("parses %s as a stop request", (word) => {
+  it.each(["off", "stop", "Off", "STOP"])("parses %s as a stop request, case-insensitively", (word) => {
     expect(parseLoopArgs(word)).toEqual({ kind: "stop" });
   });
 
-  it.each(["", "status", "   "])("parses %j as a status request", (raw) => {
+  it.each(["", "status", "   ", "Status"])("parses %j as a status request, case-insensitively", (raw) => {
     expect(parseLoopArgs(raw)).toEqual({ kind: "status" });
   });
 
@@ -71,6 +80,20 @@ describe("parseLoopArgs", () => {
       mode: "selfPaced",
       payload: "10x /y",
       intervalMs: null,
+      clamped: false,
+    });
+  });
+
+  it("rejects a zero-duration interval instead of swallowing it into the payload", () => {
+    expect(parseLoopArgs("0s /x")).toMatchObject({ kind: "error" });
+  });
+
+  it("splits on any whitespace, not just a single space", () => {
+    expect(parseLoopArgs("5m\t/x")).toEqual({
+      kind: "start",
+      mode: "interval",
+      payload: "/x",
+      intervalMs: 300_000,
       clamped: false,
     });
   });
@@ -85,9 +108,24 @@ describe("parseLoopArgs", () => {
     });
   });
 
+  it("only treats a standalone -- as the escape, not any leading --", () => {
+    expect(parseLoopArgs("--check the CI")).toEqual({
+      kind: "start",
+      mode: "selfPaced",
+      payload: "--check the CI",
+      intervalMs: null,
+      clamped: false,
+    });
+  });
+
   it("rejects an attempt to loop /loop itself", () => {
     expect(parseLoopArgs("/loop x")).toMatchObject({ kind: "error" });
     expect(parseLoopArgs("5m /loop x")).toMatchObject({ kind: "error" });
+  });
+
+  it("catches a self-reference regardless of trailing whitespace style", () => {
+    expect(parseLoopArgs("/loop\tx")).toMatchObject({ kind: "error" });
+    expect(parseLoopArgs("/loop")).toMatchObject({ kind: "error" });
   });
 
   it("rejects an interval above the 24h ceiling", () => {
@@ -135,7 +173,30 @@ describe("dust loop command", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
   });
 
-  it("skips a tick while the agent is busy, and records it", async () => {
+  it("replaces a running loop rather than stacking a second timer", async () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const { commands, pi } = register(runtime);
+
+    await commands.get("loop")!("5m /old", ctx);
+    const firstTimer = runtime.loopTimer;
+    await commands.get("loop")!("1m /new", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Replacing the running loop.", "info");
+    expect(runtime.loopTimer).not.toBe(firstTimer);
+    expect(runtime.loop?.payload).toBe("/new");
+
+    // The old timer must be dead — advancing 5m must fire only the new
+    // 1m-cadence timer's ticks (5), not a leftover old-cadence tick too.
+    pi.sendUserMessage.mockClear();
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(5);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("/new");
+    expect(pi.sendUserMessage).not.toHaveBeenCalledWith("/old");
+  });
+
+  it("skips a tick while the agent is busy, records it, and clears 'waiting' once it resumes", async () => {
     const runtime = new DustSessionRuntime();
     let idle = true;
     const ctx = makeCtx({ isIdle: () => idle });
@@ -154,6 +215,10 @@ describe("dust loop command", () => {
     idle = true;
     await vi.advanceTimersByTimeAsync(300_000);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    // Lifetime skip count is preserved, but the footer's "waiting" flag reflects
+    // only the most recent tick, which just succeeded.
+    expect(runtime.loop?.skipped).toBe(1);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("dust-loop", expect.not.stringContaining("waiting"));
   });
 
   it("clamps sub-floor intervals and warns", async () => {
@@ -194,7 +259,7 @@ describe("dust loop command", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(20);
   });
 
-  it("debounces repeated agent_settled events before a self-paced loop's cooldown fires", async () => {
+  it("ignores an unrelated turn's agent_settled between iterations", async () => {
     const runtime = new DustSessionRuntime();
     const ctx = makeCtx();
     applyRuntimeContext(runtime, ctx);
@@ -203,14 +268,45 @@ describe("dust loop command", () => {
     await commands.get("loop")!("/x", ctx);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
 
+    // Consume the loop's own settle, arming its cooldown.
     const onSettled = events.get("agent_settled")!;
     onSettled({}, ctx);
-    await vi.advanceTimersByTimeAsync(2_000);
+
+    // A second settle before the cooldown fires — e.g. the user ran an
+    // unrelated /ask in between — must not reset or double the cooldown, or
+    // spend an iteration on activity the loop didn't cause.
     onSettled({}, ctx);
-    await vi.advanceTimersByTimeAsync(4_999);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(runtime.loop?.iterations).toBe(2);
+
+    // The next iteration's own send re-arms `expectingSettle`; a stray settle
+    // that arrives before *its* cooldown fires is likewise ignored.
+    onSettled({}, ctx); // this is the real settle for iteration 2
+    onSettled({}, ctx); // stray — must be ignored
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it("self-schedules a retry when a self-paced tick finds the agent busy, without needing another settle", async () => {
+    const runtime = new DustSessionRuntime();
+    let idle = true;
+    const ctx = makeCtx({ isIdle: () => idle });
+    applyRuntimeContext(runtime, ctx);
+    const { commands, events, pi } = register(runtime);
+
+    await commands.get("loop")!("/x", ctx);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(1);
+    const onSettled = events.get("agent_settled")!;
+    onSettled({}, ctx);
+    idle = false;
+    await vi.advanceTimersByTimeAsync(5_000); // cooldown fires, finds the agent busy, skips
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(runtime.loop?.skipped).toBe(1);
+
+    idle = true;
+    await vi.advanceTimersByTimeAsync(5_000); // self-armed retry, agent now idle
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
@@ -230,7 +326,7 @@ describe("dust loop command", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // only the initial immediate send
   });
 
-  it("reports status with and without an active loop", async () => {
+  it("reports status with and without an active loop, using human-readable wording distinct from the footer", async () => {
     const runtime = new DustSessionRuntime();
     const ctx = makeCtx();
     applyRuntimeContext(runtime, ctx);
@@ -241,14 +337,16 @@ describe("dust loop command", () => {
 
     await commands.get("loop")!("5m /x", ctx);
     await commands.get("loop")!("status", ctx);
-    expect(ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("every 5m"), "info");
+    expect(ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Looping every 5m"), "info");
+    // The notify body is human phrasing, not the terse "dust-loop: ..." footer text.
+    expect(ctx.ui.notify).not.toHaveBeenLastCalledWith(expect.stringContaining("dust-loop:"), "info");
   });
 
   it("stops the loop on session_shutdown without notifying", async () => {
     const runtime = new DustSessionRuntime();
     const ctx = makeCtx();
     applyRuntimeContext(runtime, ctx);
-    const { commands, events, pi } = register(runtime);
+    const { commands, events, pi } = registerWithSessionEvents(runtime);
 
     await commands.get("loop")!("5m /x", ctx);
     events.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx);
@@ -282,5 +380,18 @@ describe("dust loop command", () => {
 
     expect(() => registerDustLoopCommand(pi, runtime)).not.toThrow();
     expect(pi.registerCommand).toHaveBeenCalledWith("loop", expect.anything());
+  });
+
+  it("does not crash the process when sendUserMessage throws mid-iteration", async () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const { commands, pi } = register(runtime);
+    pi.sendUserMessage.mockImplementationOnce(() => {
+      throw new Error("boom");
+    });
+
+    await expect(commands.get("loop")!("5m /x", ctx)).resolves.toBeUndefined();
+    expect(runtime.loop).not.toBeNull();
   });
 });

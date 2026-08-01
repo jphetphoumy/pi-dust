@@ -67,8 +67,19 @@ export interface DustLoopState {
   /** Null for self-paced loops, which have no fixed cadence. */
   intervalMs: number | null;
   iterations: number;
-  /** Ticks skipped because the agent was still busy from a previous iteration. */
+  /** Total ticks skipped over the loop's lifetime, because the agent was still busy. */
   skipped: number;
+  /** Whether the *most recent* tick was skipped — drives the footer's "waiting" flag, unlike the lifetime `skipped` counter. */
+  waitingOnBusyAgent: boolean;
+  /**
+   * Self-paced only: true right after this loop sends its own payload, until
+   * the matching `agent_settled` is consumed. Lets `handleAgentSettled` in
+   * dust-loop.ts tell "the turn we just started" apart from an unrelated
+   * turn the user ran while the loop was idle between iterations — settle
+   * events are ignored unless this is true, so a stray user turn never
+   * burns one of the loop's iterations.
+   */
+  expectingSettle: boolean;
   /** Self-paced loops auto-stop after this many iterations; interval loops run unbounded. */
   maxIterations: number | null;
   startedAt: number;

@@ -261,6 +261,14 @@ export function registerDustSessionEvents(
 ): void {
   const registerEvent = piWithEvents.on as (event: string, handler: (event: unknown, ctx: PiRuntimeContext) => unknown) => void;
 
+  // Fired before this extension runtime is torn down (quit, reload, or a
+  // session switch) — the primary way an active /loop is cancelled. The
+  // `session_start` handler below also stops one, belt-and-braces, in case a
+  // host skips this event for a given transition.
+  registerEvent("session_shutdown", (_event: unknown, ctx: PiRuntimeContext) => {
+    stopDustLoop(runtime, ctx, "session");
+  });
+
   // pi 0.65 folded the old post-transition `session_switch` into this event:
   // startup, /new, /resume and /fork all arrive here, told apart by `reason`.
   registerEvent("session_start", async (_event: unknown, ctx: PiRuntimeContext) => {

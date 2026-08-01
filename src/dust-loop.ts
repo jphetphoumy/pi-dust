@@ -30,8 +30,11 @@ const SELF_PACED_MAX_ITERATIONS = 20;
 
 const DURATION_PATTERN = /^(\d+(?:\.\d+)?)(s|m|h)$/i;
 const UNIT_MS: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000 };
+/** Splits `rest` into its first whitespace-delimited token and the remainder, tolerating tabs/newlines, not just spaces. */
+const FIRST_TOKEN_PATTERN = /^(\S+)(?:\s+([\s\S]*))?$/;
+const LOOP_SELF_REFERENCE_PATTERN = /^\/loop(\s|$)/i;
 
-/** Parses a token like `30s`, `5m`, `1h` into milliseconds, or null if it isn't a duration. */
+/** Parses a token like `30s`, `5m`, `1h` into milliseconds, or null if it isn't a valid duration. */
 export function parseDuration(token: string): number | null {
   const match = DURATION_PATTERN.exec(token.trim());
   if (!match) return null;
@@ -40,49 +43,81 @@ export function parseDuration(token: string): number | null {
   return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
+const USAGE_MESSAGE = "Usage: /loop <interval> <prompt|/command>, or /loop <prompt|/command> to self-pace.";
+
 /**
  * Parses `/loop`'s argument string into a request.
  *
  * Grammar: the first whitespace-delimited token is treated as an interval
- * only if it fully matches a duration pattern; otherwise the whole string is
- * the payload. `off`/`stop`/`status` are reserved only when they are the
- * *entire* argument, so `/loop stop the deploy` loops that prompt rather than
- * being misread as a stop request. `--` forces payload interpretation, so a
- * payload that happens to start with a reserved word (`/loop -- off the
- * lights`) still loops instead of stopping.
+ * only if it fully matches a duration pattern; a token that merely *looks*
+ * like a duration attempt (`0s`, digits followed by letters) but fails to
+ * parse is reported as an error rather than silently becoming the payload.
+ * Otherwise the whole string is the payload. `off`/`stop`/`status` (any case)
+ * are reserved only when they are the *entire* argument, so `/loop stop the
+ * deploy` loops that prompt rather than being misread as a stop request.
+ * A leading `-- ` forces payload interpretation, so a payload that happens to
+ * start with a reserved word (`/loop -- off the lights`) still loops instead
+ * of stopping.
  */
 export function parseLoopArgs(raw: string): LoopRequest {
   const trimmed = raw.trim();
-  if (trimmed === "" || trimmed === "status") return { kind: "status" };
-  if (trimmed === "off" || trimmed === "stop") return { kind: "stop" };
+  const lower = trimmed.toLowerCase();
+  if (trimmed === "" || lower === "status") return { kind: "status" };
+  if (lower === "off" || lower === "stop") return { kind: "stop" };
 
-  const rest = trimmed.startsWith("--") ? trimmed.slice(2).trim() : trimmed;
-  if (rest === "") return { kind: "error", message: "Usage: /loop <interval> <prompt|/command>, or /loop <prompt|/command> to self-pace." };
+  const forcePayload = trimmed === "--" || trimmed.startsWith("-- ");
+  const rest = forcePayload ? trimmed.slice(2).trim() : trimmed;
+  if (rest === "") return { kind: "error", message: USAGE_MESSAGE };
 
-  const firstSpace = rest.indexOf(" ");
-  const firstToken = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
-  const durationMs = trimmed.startsWith("--") ? null : parseDuration(firstToken);
+  const tokenMatch = FIRST_TOKEN_PATTERN.exec(rest);
+  const firstToken = tokenMatch ? tokenMatch[1] : rest;
+  const remainder = (tokenMatch?.[2] ?? "").trim();
 
-  const mode: DustLoopMode = durationMs === null ? "selfPaced" : "interval";
-  const payload = (durationMs === null ? rest : rest.slice(firstSpace + 1)).trim();
+  let mode: DustLoopMode;
+  let payload: string;
+  let intervalMs: number | null;
+
+  if (forcePayload) {
+    mode = "selfPaced";
+    payload = rest;
+    intervalMs = null;
+  } else {
+    const durationMs = parseDuration(firstToken);
+    // A token that matches the duration *shape* (digits + s/m/h) but fails to
+    // parse — the only way that happens is a non-positive amount like `0s` —
+    // is a near-miss worth an error, not a token that just happens to start
+    // the payload (e.g. `10x`, which doesn't match the shape at all).
+    if (durationMs === null && DURATION_PATTERN.test(firstToken)) {
+      return { kind: "error", message: "Invalid loop interval — use digits followed by s/m/h (e.g. 30s, 5m, 1h)." };
+    }
+    if (durationMs === null) {
+      mode = "selfPaced";
+      payload = rest;
+      intervalMs = null;
+    } else {
+      mode = "interval";
+      payload = remainder;
+      intervalMs = durationMs;
+    }
+  }
 
   if (payload === "") {
-    return { kind: "error", message: "Usage: /loop <interval> <prompt|/command>, or /loop <prompt|/command> to self-pace." };
+    return { kind: "error", message: USAGE_MESSAGE };
   }
-  if (payload === "/loop" || payload.startsWith("/loop ")) {
+  if (LOOP_SELF_REFERENCE_PATTERN.test(payload)) {
     return { kind: "error", message: "/loop cannot loop itself." };
   }
 
-  if (durationMs === null) {
+  if (mode === "selfPaced") {
     return { kind: "start", mode, payload, intervalMs: null, clamped: false };
   }
 
-  if (durationMs > MAX_INTERVAL_MS) {
+  if ((intervalMs as number) > MAX_INTERVAL_MS) {
     return { kind: "error", message: "Loop interval must be at most 24h." };
   }
 
-  const clamped = durationMs < MIN_INTERVAL_MS;
-  return { kind: "start", mode, payload, intervalMs: clamped ? MIN_INTERVAL_MS : durationMs, clamped };
+  const clamped = (intervalMs as number) < MIN_INTERVAL_MS;
+  return { kind: "start", mode, payload, intervalMs: clamped ? MIN_INTERVAL_MS : intervalMs, clamped };
 }
 
 function ui(runtime: DustSessionRuntime, ctx?: PiRuntimeContext) {
@@ -101,16 +136,25 @@ function formatInterval(ms: number): string {
   return `${ms / 1000}s`;
 }
 
-function describeLoop(loop: DustLoopState): string {
+/** Short form for the footer slot. `waiting` reflects only the most recent tick, not lifetime skip count. */
+function describeLoopFooter(loop: DustLoopState): string {
   const progress = loop.maxIterations !== null ? `#${loop.iterations}/${loop.maxIterations}` : `#${loop.iterations}`;
-  const waiting = loop.skipped > 0 ? ", waiting" : "";
+  const waiting = loop.waitingOnBusyAgent ? ", waiting" : "";
   const cadence = loop.mode === "interval" ? `every ${formatInterval(loop.intervalMs as number)}` : "self-paced";
   return `${STATUS_KEY}: ${cadence} (${progress}${waiting})`;
 }
 
+/** Human-readable form for `/loop status` toasts — distinct from the terse footer text. */
+function describeLoopMessage(loop: DustLoopState): string {
+  const cadence = loop.mode === "interval" ? `every ${formatInterval(loop.intervalMs as number)}` : "self-paced";
+  const progress = loop.maxIterations !== null ? `${loop.iterations} of ${loop.maxIterations} iterations` : `${loop.iterations} iterations so far`;
+  const waiting = loop.waitingOnBusyAgent ? " — waiting for the agent to go idle" : "";
+  return `Looping ${cadence} (${progress})${waiting}.`;
+}
+
 function showStatus(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
   const handle = ui(runtime, ctx);
-  handle?.setStatus?.(STATUS_KEY, runtime.loop ? describeLoop(runtime.loop) : undefined);
+  handle?.setStatus?.(STATUS_KEY, runtime.loop ? describeLoopFooter(runtime.loop) : undefined);
 }
 
 /** Prefers the host's own idle check; falls back to our own turn tracking when it isn't wired up. */
@@ -143,40 +187,68 @@ function sendPayload(runtime: DustSessionRuntime, payload: string): void {
   pi?.sendUserMessage?.(payload);
 }
 
-/** Runs one iteration if the agent is idle, otherwise records a skip. Stops the loop once a self-paced cap is hit. */
-function runIteration(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
-  const loop = runtime.loop;
-  if (!loop || !runtime.pi) return;
-
-  if (!agentIsIdle(runtime, ctx)) {
-    loop.skipped++;
-    showStatus(runtime, ctx);
-    debugLog("dust:loop", "Skipped tick — agent busy", { iterations: loop.iterations, skipped: loop.skipped });
-    return;
-  }
-
-  sendPayload(runtime, loop.payload);
-  loop.iterations++;
-  showStatus(runtime, ctx);
-  debugLog("dust:loop", "Sent iteration", { mode: loop.mode, iterations: loop.iterations });
-
-  if (loop.maxIterations !== null && loop.iterations >= loop.maxIterations) {
-    notify(runtime, `Loop reached its ${loop.maxIterations}-iteration limit and stopped.`, "warning", ctx);
-    stopDustLoop(runtime, ctx, "session");
-  }
-}
-
-/**
- * Fires on `agent_settled`. A no-op unless a self-paced loop is active — it
- * arms (replacing any pending) cooldown timer that runs the next iteration.
- */
-export function handleAgentSettled(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
-  if (!runtime.loop || runtime.loop.mode !== "selfPaced") return;
+/** Arms (replacing any pending) the cooldown timer that retries a self-paced iteration. */
+function armSelfPacedRetry(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
   if (runtime.loopCooldownTimer) clearTimeout(runtime.loopCooldownTimer);
   runtime.loopCooldownTimer = setTimeout(() => {
     runtime.loopCooldownTimer = null;
     runIteration(runtime, ctx);
   }, SELF_PACED_COOLDOWN_MS);
+}
+
+/**
+ * Runs one iteration if the agent is idle, otherwise records a skip and — for
+ * self-paced loops — schedules its own retry directly, rather than waiting on
+ * whatever turn is currently occupying the agent to settle (that turn isn't
+ * ours; piggybacking on its `agent_settled` is exactly the stray-event
+ * hijack `expectingSettle` exists to prevent).
+ *
+ * Wrapped in try/catch: this runs from bare `setInterval`/`setTimeout`
+ * callbacks, and `pi.sendUserMessage` can throw (e.g. mid-turn without a
+ * `deliverAs`) — an uncaught throw here would otherwise crash the process,
+ * the same reason `dust-mcp.ts`'s heartbeat wraps its timer body.
+ */
+function runIteration(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
+  const loop = runtime.loop;
+  if (!loop || !runtime.pi) return;
+
+  try {
+    if (!agentIsIdle(runtime, ctx)) {
+      loop.skipped++;
+      loop.waitingOnBusyAgent = true;
+      showStatus(runtime, ctx);
+      debugLog("dust:loop", "Skipped tick — agent busy", { iterations: loop.iterations, skipped: loop.skipped });
+      if (loop.mode === "selfPaced") armSelfPacedRetry(runtime, ctx);
+      return;
+    }
+
+    sendPayload(runtime, loop.payload);
+    loop.iterations++;
+    loop.waitingOnBusyAgent = false;
+    if (loop.mode === "selfPaced") loop.expectingSettle = true;
+    showStatus(runtime, ctx);
+    debugLog("dust:loop", "Sent iteration", { mode: loop.mode, iterations: loop.iterations });
+
+    if (loop.maxIterations !== null && loop.iterations >= loop.maxIterations) {
+      notify(runtime, `Loop reached its ${loop.maxIterations}-iteration limit and stopped.`, "warning", ctx);
+      stopDustLoop(runtime, ctx, "session");
+    }
+  } catch (err) {
+    debugLog("dust:loop", "Iteration failed", { error: String(err) });
+  }
+}
+
+/**
+ * Fires on `agent_settled`. A no-op unless a self-paced loop is active and
+ * `expectingSettle` — set only right after this loop's own send — is true;
+ * an unrelated turn the user ran between iterations settles with the flag
+ * false and is ignored, so it can't burn one of the loop's iterations.
+ */
+export function handleAgentSettled(runtime: DustSessionRuntime, ctx?: PiRuntimeContext): void {
+  const loop = runtime.loop;
+  if (!loop || loop.mode !== "selfPaced" || !loop.expectingSettle) return;
+  loop.expectingSettle = false;
+  armSelfPacedRetry(runtime, ctx);
 }
 
 function startLoop(
@@ -193,6 +265,8 @@ function startLoop(
     intervalMs: request.intervalMs,
     iterations: 0,
     skipped: 0,
+    waitingOnBusyAgent: false,
+    expectingSettle: false,
     maxIterations: request.mode === "selfPaced" ? SELF_PACED_MAX_ITERATIONS : null,
     startedAt: Date.now(),
   };
@@ -231,7 +305,7 @@ export function registerDustLoopCommand(pi: ExtensionAPI, runtime: DustSessionRu
 
       switch (request.kind) {
         case "status": {
-          const message = runtime.loop ? describeLoop(runtime.loop) : "No loop running.";
+          const message = runtime.loop ? describeLoopMessage(runtime.loop) : "No loop running.";
           notify(runtime, message, "info", runtimeCtx);
           return;
         }
@@ -248,11 +322,13 @@ export function registerDustLoopCommand(pi: ExtensionAPI, runtime: DustSessionRu
     },
   });
 
+  // `session_shutdown` is pi's session-lifecycle event, so that half of loop
+  // cleanup is wired from dust-session-events.ts (the module that owns every
+  // other lifecycle hook) instead of here — see registerDustSessionEvents.
   const piWithEvents = pi as ExtensionAPIWithEvents;
   if (typeof piWithEvents.on === "function") {
     const registerEvent = piWithEvents.on as (event: string, handler: (event: unknown, ctx: PiRuntimeContext) => unknown) => void;
     registerEvent("agent_settled", (_event, ctx) => handleAgentSettled(runtime, ctx));
-    registerEvent("session_shutdown", (_event, ctx) => stopDustLoop(runtime, ctx, "session"));
   } else {
     debugLog("dust:loop", "Extension event API unavailable; /loop off is the only way to stop a loop");
   }
