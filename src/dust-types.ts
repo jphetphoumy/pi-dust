@@ -62,7 +62,11 @@ export type DustLoopMode = "interval" | "selfPaced";
  */
 export interface DustLoopState {
   mode: DustLoopMode;
-  /** Text re-sent via `pi.sendUserMessage` each iteration — a slash command or a plain prompt. */
+  /**
+   * Text re-sent via `pi.sendUserMessage` each iteration. Always sent as a
+   * plain prompt — pi's `sendUserMessage` never dispatches pi slash commands,
+   * even when this starts with `/` (see dust-loop.ts's `startLoop`).
+   */
   payload: string;
   /** Null for self-paced loops, which have no fixed cadence. */
   intervalMs: number | null;

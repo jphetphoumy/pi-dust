@@ -43,7 +43,7 @@ export function parseDuration(token: string): number | null {
   return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
-const USAGE_MESSAGE = "Usage: /loop <interval> <prompt|/command>, or /loop <prompt|/command> to self-pace.";
+const USAGE_MESSAGE = "Usage: /loop <interval> <prompt>, or /loop <prompt> to self-pace.";
 
 /**
  * Parses `/loop`'s argument string into a request.
@@ -58,6 +58,11 @@ const USAGE_MESSAGE = "Usage: /loop <interval> <prompt|/command>, or /loop <prom
  * A leading `-- ` forces payload interpretation, so a payload that happens to
  * start with a reserved word (`/loop -- off the lights`) still loops instead
  * of stopping.
+ *
+ * The payload is always sent as a plain prompt via `pi.sendUserMessage`,
+ * which sets `expandPromptTemplates: false` on pi's side — so it is never
+ * dispatched as a pi slash command, even if it starts with `/` (see
+ * `startLoop`'s one-time warning for a payload that looks like one).
  */
 export function parseLoopArgs(raw: string): LoopRequest {
   const trimmed = raw.trim();
@@ -306,6 +311,14 @@ function startLoop(
   if (request.clamped) {
     notify(runtime, `Interval below the ${formatInterval(MIN_INTERVAL_MS)} floor — clamped up.`, "warning", ctx);
   }
+  if (request.payload.startsWith("/")) {
+    // pi's own sendUserMessage() (which every iteration goes through) skips
+    // extension-command dispatch by design — the payload always reaches the
+    // agent as plain text, even when it starts with `/`. Worth saying once at
+    // start, since "/loop 5m /some-pi-command" reads like it should run that
+    // command, but never will.
+    notify(runtime, "Note: the payload is sent as plain text — pi slash commands aren't run by /loop.", "warning", ctx);
+  }
   notify(
     runtime,
     request.mode === "interval"
@@ -326,7 +339,7 @@ export function registerDustLoopCommand(pi: ExtensionAPI, runtime: DustSessionRu
   const supportsSettleEvents = typeof piWithEvents.on === "function";
 
   pi.registerCommand("loop", {
-    description: "Re-run a prompt or command on an interval (/loop 5m /cmd) or self-paced (/loop /cmd); /loop off to stop",
+    description: "Re-send a prompt on an interval (/loop 5m <prompt>) or self-paced (/loop <prompt>); /loop off to stop",
     handler: async (args, ctx) => {
       const runtimeCtx = ctx as PiRuntimeContext;
       const request = parseLoopArgs(args);

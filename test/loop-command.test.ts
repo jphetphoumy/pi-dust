@@ -36,7 +36,7 @@ function registerWithSessionEvents(runtime: DustSessionRuntime) {
 }
 
 describe("parseLoopArgs", () => {
-  it("parses an interval plus a slash command", () => {
+  it("parses an interval plus a payload that starts with a slash (sent as plain text, not dispatched)", () => {
     expect(parseLoopArgs("5m /babysit-prs")).toEqual({
       kind: "start",
       mode: "interval",
@@ -171,6 +171,20 @@ describe("dust loop command", () => {
 
     await vi.advanceTimersByTimeAsync(300_000);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it("warns once that a slash-prefixed payload is sent as plain text, not dispatched", async () => {
+    const runtime = new DustSessionRuntime();
+    const ctx = makeCtx();
+    applyRuntimeContext(runtime, ctx);
+    const { commands } = register(runtime);
+
+    await commands.get("loop")!("5m /babysit-prs", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("aren't run by /loop"), "warning");
+
+    ctx.ui.notify.mockClear();
+    await commands.get("loop")!("5m check the deploy", ctx);
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("aren't run by /loop"), "warning");
   });
 
   it("replaces a running loop rather than stacking a second timer", async () => {
