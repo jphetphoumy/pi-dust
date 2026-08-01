@@ -125,7 +125,10 @@ export function diffSkills(args: {
     const prefix = podSkillPathsFor(name);
     const watermarks = Object.entries(binding.seen).filter(([rel]) => rel.startsWith(prefix));
 
-    if (!localSkill && podRelsForSkill.length === 0 && watermarks.length === 0) {
+    // `missing` takes precedence over `pod-only`/`local-only`: a skill can
+    // have stale watermarks (never pruned outside a real sync) with nothing
+    // left on either side, and "pod-only, 0 files" would be self-contradictory.
+    if (!localSkill && podRelsForSkill.length === 0) {
       diffs.push({
         name,
         state: "missing",
@@ -250,12 +253,21 @@ export function formatSkillDiff(diffs: SkillDiff[], podName: string): string {
 
   const lines = [`Skills in pod "${podName}":`, ...diffs.map((diff) => `  ${diff.name}: ${describeState(diff)}`)];
 
-  const needsSync = diffs.some((diff) =>
+  // A pod-side deletion is not something `syncPod` ever repairs on its own:
+  // its push side explicitly skips a synced skill's own paths, and there is
+  // nothing to pull back for a file that no longer exists anywhere to
+  // download from. Only an explicit `/dust-skills sync` re-uploads it, so a
+  // deletion has to earn the same hint a local edit does — the other
+  // pod-changed case (an addition or modification) genuinely is pulled down
+  // by the ordinary background sync, and does not need re-uploading.
+  const hasPodDeletion = diffs.some((diff) => diff.podDeletedFiles.length > 0);
+  const needsSync = hasPodDeletion || diffs.some((diff) =>
     diff.state === "local-changed" || diff.state === "local-only" || diff.state === "unverified" || diff.state === "missing",
   );
   if (needsSync) lines.push("Run /dust-skills sync to bring the pod up to date.");
 
-  if (diffs.some((diff) => diff.state === "pod-changed")) {
+  const hasPulledChange = diffs.some((diff) => diff.podChangedFiles.length > 0);
+  if (hasPulledChange) {
     lines.push("Pod-side edits are pulled by the next sync.");
   }
 

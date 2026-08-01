@@ -94,22 +94,30 @@ describe("the [DustSkills] startup section", () => {
     ]);
   });
 
-  it("leaves synced skills alone when seen is omitted or empty", () => {
-    // Callers that predate this field, or an entirely fresh binding, must not
-    // have every skill downgraded just because `seen` has nothing in it yet.
+  it("leaves synced skills alone only when seen is entirely omitted", () => {
+    // A binding that predates this field can genuinely lack it at runtime
+    // despite the type — that is the only case allowed to skip the check.
     const withoutSeen = buildDustSkillsBanner(
       [skill("old-caller")],
       { skills: ["old-caller"], skillFingerprints: { "old-caller": "fp" } },
       () => "fp",
     );
+
+    expect(withoutSeen).toEqual([{ name: "old-caller", state: "synced" }]);
+  });
+
+  it("downgrades to unverified when seen is present but empty, not just when it lacks this skill's entry", () => {
+    // An explicitly empty `seen` is the normal shape of a brand-new binding —
+    // not a legacy signal — so it must not be treated as "nothing to check
+    // against" the way an entirely absent `seen` is. Confirming a skill
+    // actually landed in the pod is exactly what this check exists to do.
     const withEmptySeen = buildDustSkillsBanner(
-      [skill("old-caller")],
-      { skills: ["old-caller"], skillFingerprints: { "old-caller": "fp" }, seen: {} },
+      [skill("brand-new")],
+      { skills: ["brand-new"], skillFingerprints: { "brand-new": "fp" }, seen: {} },
       () => "fp",
     );
 
-    expect(withoutSeen).toEqual([{ name: "old-caller", state: "synced" }]);
-    expect(withEmptySeen).toEqual([{ name: "old-caller", state: "synced" }]);
+    expect(withEmptySeen).toEqual([{ name: "brand-new", state: "unverified" }]);
   });
 
   it("drops a skill that is recorded as synced but no longer on disk", () => {
@@ -238,7 +246,7 @@ describe("wiring the [DustSkills] section into startup", () => {
     vi.spyOn(state, "getPodBinding").mockReturnValue({
       podId: "vlt_1",
       name: "proj",
-      seen: {},
+      seen: { "skills/synced/SKILL.md": { podMs: 1, hash: "h" } },
       skills: ["synced"],
       skillFingerprints: { synced: "matching" },
     } as never);

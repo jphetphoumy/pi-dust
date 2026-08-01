@@ -219,6 +219,21 @@ describe("/dust-skills", () => {
     expect(messages().some((message) => message.includes("Re-synced"))).toBe(true);
   });
 
+  it("`sync` still uploads blind when the preview listing fails", async () => {
+    // A preview is a nicety, not a gate: a listing failure must never block an
+    // upload that would otherwise have worked, so it falls back to today's
+    // blind behaviour instead of aborting the sync.
+    savePodBinding(root, { podId: "vlt_1", name: "proj", seen: {}, skills: ["herdr"] });
+    writeSkill("herdr");
+    vi.mocked(dustPod.listPodFiles).mockRejectedValue(new Error("HTTP 500"));
+
+    await handler("sync", ctx());
+
+    expect(podSkills.syncSkillsToPod).toHaveBeenCalled();
+    expect(messages().some((message) => message.includes("Re-synced"))).toBe(true);
+    expect(messages().some((message) => message.startsWith("Skills in pod"))).toBe(false);
+  });
+
   it("`sync` refreshes the fingerprints, so the section stops reporting stale", async () => {
     savePodBinding(root, {
       podId: "vlt_1",

@@ -196,6 +196,27 @@ describe("diffSkills", () => {
     ]);
   });
 
+  it("reports missing rather than a self-contradictory pod-only when stale watermarks outlive both sides", () => {
+    // A skill can be deleted from disk and from the pod between syncs — the
+    // watermarks are only pruned by a real /dust-skills sync — so a name with
+    // watermarks but zero live files on either side must not read "pod-only
+    // (0 files)".
+    const diffs = diffSkills({
+      local: [],
+      binding: binding({
+        skills: ["gone"],
+        seen: { "skills/gone/SKILL.md": { podMs: 1, hash: "h" } },
+      }),
+      podEntries: [],
+      podId: PODID,
+      fingerprint: () => "fp",
+    });
+
+    expect(diffs).toEqual([
+      { name: "gone", state: "missing", localFileCount: 0, podFileCount: 0, podChangedFiles: [], podDeletedFiles: [] },
+    ]);
+  });
+
   it("reports unverified when the local fingerprint was never recorded", () => {
     const diffs = diffSkills({
       local: [skill("old-binding")],
@@ -297,12 +318,24 @@ describe("formatSkillDiff", () => {
     expect(changed).toContain("Run /dust-skills sync to bring the pod up to date.");
   });
 
-  it("adds the pod-changed hint only when a pod-changed skill is present", () => {
+  it("adds the pod-changed hint only when a pod addition or modification is present", () => {
     const text = formatSkillDiff(
       [{ name: "a", state: "pod-changed", localFileCount: 1, podFileCount: 1, podChangedFiles: ["SKILL.md"], podDeletedFiles: [] }],
       "proj",
     );
     expect(text).toContain("Pod-side edits are pulled by the next sync.");
+  });
+
+  it("recommends /dust-skills sync, not the pull hint, for a pure pod-side deletion", () => {
+    // syncPod never repairs this on its own: its push side skips a synced
+    // skill's own paths, and there is nothing left to pull down. Only an
+    // explicit re-upload restores it.
+    const text = formatSkillDiff(
+      [{ name: "a", state: "pod-changed", localFileCount: 1, podFileCount: 0, podChangedFiles: [], podDeletedFiles: ["notes.md"] }],
+      "proj",
+    );
+    expect(text).toContain("Run /dust-skills sync to bring the pod up to date.");
+    expect(text).not.toContain("Pod-side edits are pulled by the next sync.");
   });
 
   it("names the skills a conflict hint applies to", () => {

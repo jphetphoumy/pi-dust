@@ -80,9 +80,14 @@ export function buildDustSkillsBanner(
   fingerprint: (skill: LocalSkill) => string = fingerprintSkill,
 ): DustSkillEntry[] {
   const synced = new Set(binding.skills ?? []);
-  // Only consulted to downgrade a `synced` claim — an omitted or empty `seen`
-  // (older bindings, or callers that never pass it) leaves every skill's
-  // classification exactly as it was before this field existed.
+  // Only consulted to downgrade a `synced` claim, and gated on `seen` existing
+  // at all rather than being non-empty: a binding written before this field
+  // existed can genuinely lack it at runtime despite the type, and that is the
+  // only case allowed to skip the check. A binding that *has* `seen` — the
+  // normal case, even a brand-new one with nothing in it yet — has to earn
+  // `synced` per skill: a global "seen has anything at all" gate would keep
+  // claiming `synced` for a skill whose own watermark settle failed, for as
+  // long as some *other* skill in the same pod happened to have one.
   const hasWatermark = (name: string): boolean =>
     Object.keys(binding.seen ?? {}).some((rel) => rel.startsWith(podSkillPathsFor(name)));
 
@@ -92,7 +97,7 @@ export function buildDustSkillsBanner(
       const recorded = binding.skillFingerprints?.[skill.name];
       if (recorded === undefined) return { name: skill.name, state: "unverified" as const };
       if (recorded !== fingerprint(skill)) return { name: skill.name, state: "stale" as const };
-      if (binding.seen && Object.keys(binding.seen).length > 0 && !hasWatermark(skill.name)) {
+      if (binding.seen !== undefined && !hasWatermark(skill.name)) {
         return { name: skill.name, state: "unverified" as const };
       }
       return { name: skill.name, state: "synced" as const };
