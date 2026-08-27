@@ -161,6 +161,8 @@ export interface PostMessageResponse {
   message: {
     sId: string;
   };
+  /** Agent messages created by the same POST, when returned by the API. */
+  agentMessages?: unknown[];
 }
 
 export interface McpRegisterResponse {
