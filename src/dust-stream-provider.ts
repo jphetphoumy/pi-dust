@@ -672,6 +672,21 @@ async function createConversation(
   };
 }
 
+function findAgentMessageSIdInPostResponse(
+  agentMessages: unknown[] | undefined,
+  userMessageSId: string,
+): string | undefined {
+  const agentMessage = agentMessages?.find((candidate) =>
+    isRecord(candidate)
+      && candidate.type === "agent_message"
+      && candidate.parentMessageId === userMessageSId
+      && typeof candidate.sId === "string"
+  );
+  return isRecord(agentMessage) && typeof agentMessage.sId === "string"
+    ? agentMessage.sId
+    : undefined;
+}
+
 async function postMessageToConversation(
   baseUrl: string,
   authHeaders: Record<string, string>,
@@ -682,7 +697,7 @@ async function postMessageToConversation(
   userText: string,
   username: string,
   timezone: string,
-): Promise<string> {
+): Promise<{ userMessageSId: string; agentMessageSId?: string }> {
   debugLog("dust:session", "Posting message to existing conversation", { conversationSId, userText });
 
   const msgRes = await fetch(`${baseUrl}/assistant/conversations/${conversationSId}/messages`, {
@@ -708,8 +723,13 @@ async function postMessageToConversation(
   }
 
   const msgData = parsePostMessageResponse(await msgRes.json());
-  debugLog("dust:session", "Posted user message", msgData);
-  return msgData.message.sId;
+  const userMessageSId = msgData.message.sId;
+  const agentMessageSId = findAgentMessageSIdInPostResponse(msgData.agentMessages, userMessageSId);
+  debugLog("dust:session", "Posted user message", {
+    ...msgData,
+    agentMessageSId,
+  });
+  return { userMessageSId, agentMessageSId };
 }
 
 async function fetchConversationAgentMessageId(
@@ -954,7 +974,7 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
           startTurn(runtime.beginTurn(conversationSId, userMessageSId, agentMessageSId));
         } else {
           conversationSId = runtime.conversationId;
-          userMessageSId = await postMessageToConversation(
+          const postedMessage = await postMessageToConversation(
             baseUrl,
             resolveAuthHeaders(),
             signal,
@@ -965,18 +985,25 @@ export function createDustStreamHandler(runtime: DustSessionRuntime) {
             username,
             timezone,
           );
+          userMessageSId = postedMessage.userMessageSId;
           // Posting the user message is what starts the agent loop, so the turn
           // begins here rather than after the lookup below: escaping during that
           // lookup has to count as a cancellation, not as a turn that never was.
           const turn = runtime.beginTurn(conversationSId, userMessageSId);
           startTurn(turn);
-          agentMessageSId = await fetchConversationAgentMessageId(
-            baseUrl,
-            resolveAuthHeaders(),
-            signal,
-            conversationSId,
-            userMessageSId,
-          );
+          // The message POST already returns the agent messages it created. Use
+          // that durable id directly. Fetching the whole conversation here is
+          // racy: a retry after a transient/timeout error can observe the user
+          // message before the conversation read is updated and report
+          // "No agent message found", even though the agent message exists.
+          agentMessageSId = postedMessage.agentMessageSId
+            ?? await fetchConversationAgentMessageId(
+              baseUrl,
+              resolveAuthHeaders(),
+              signal,
+              conversationSId,
+              userMessageSId,
+            );
           turn.agentMessageSId = agentMessageSId;
         }
 

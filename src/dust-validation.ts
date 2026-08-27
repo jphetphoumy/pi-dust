@@ -256,6 +256,12 @@ export function parsePostMessageResponse(value: unknown): PostMessageResponse {
     message: {
       sId: getStringField(message, "sId", "post message response"),
     },
+    // The API returns the agent messages created by this POST. Keep the field
+    // optional for older Dust deployments, where the caller must fall back to
+    // fetching the conversation to discover the agent message id.
+    agentMessages: data.agentMessages === undefined
+      ? undefined
+      : getArrayField(data, "agentMessages", "post message response"),
   };
 }
 

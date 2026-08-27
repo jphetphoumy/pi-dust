@@ -1011,6 +1011,43 @@ describe("dust extension", () => {
       expect(body.mentions[0].configurationId).toBe("agentSId-1");
       expect(body.context.origin).toBe("cli");
     });
+
+    it("uses the agent message returned by POST instead of racing a conversation fetch", async () => {
+      const fetchMock = vi.fn()
+        // Turn 1: MCP register
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ serverId: "mcp-s1", expiresAt: new Date(Date.now() + 300_000).toISOString() }) })
+        // Turn 1: MCP requests SSE (empty)
+        .mockResolvedValueOnce({ ok: true, body: makePendingSseStream() })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(makeConversationResponse("conv-1", "msg-1", "amsg-1")),
+        })
+        .mockResolvedValueOnce({ ok: true, body: makeSseStream([{ type: "agent_message_success" }]) })
+        // Turn 2: the API response includes the agent message created by this POST.
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            message: { sId: "msg-2" },
+            agentMessages: [{
+              type: "agent_message",
+              sId: "amsg-direct",
+              parentMessageId: "msg-2",
+            }],
+          }),
+        })
+        // There must be no GET conversation between these two calls.
+        .mockResolvedValueOnce({
+          ok: true,
+          body: makeSseStream([{ type: "agent_message_success" }]),
+        });
+
+      const { calls } = await runTwoTurns(fetchMock);
+
+      expect(calls.some(([url, opts]: [string, any]) =>
+        url.endsWith("/assistant/conversations/conv-1") && (!opts?.method || opts.method === "GET")
+      )).toBe(false);
+      expect(calls.some(([url]: [string]) => url.includes("amsg-direct/events"))).toBe(true);
+    });
   });
 
   // ---------------------------------------------------------------------------
