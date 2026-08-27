@@ -77,7 +77,9 @@ describe("dust extension", () => {
 
     expect(registeredConfig?.baseUrl).toContain("/api/v1/w/ws-1");
     expect(registeredConfig?.models).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: "helper", name: "Helper" })]),
+      expect.arrayContaining([
+        expect.objectContaining({ id: "helper", name: "Helper", reasoning: true }),
+      ]),
     );
 
     rmSync(agentDir, { recursive: true, force: true });
@@ -112,6 +114,7 @@ describe("dust extension", () => {
         id: "agent-sonnet",       // slugified name — what the user sees
         name: "AgentSonnet",      // original name — used for search
         provider: "dust",
+        reasoning: true,
       });
       // sId is preserved for API calls
       expect(models[0].sId).toBe("miV7ukZhGD");

@@ -22,7 +22,7 @@ interactively. Usage must be classified as `origin: "cli"` (user usage, not prog
 | `username` stored from `/api/v1/me` at login | ✅ |
 | Real `streamSimple` — creates conversation, streams SSE | ✅ |
 | Subsequent messages reuse existing conversation | ✅ |
-| SSE event → pi stream mapping | ✅ |
+| SSE event → pi stream mapping, including live thinking blocks | ✅ |
 
 ---
 
@@ -42,6 +42,7 @@ in `/model` does not crash pi. (Superseded by Milestone 2.)
 | Credential access in `streamSimple` | `model.authStorage` field (set at `buildDustProviderConfig` time, `{ get, set }`) |
 | Conversation state | Module-level `let currentConversationId: string \| null` — reset on `dustExtension()` call and on `buildDustProviderConfig()` call |
 | Username in credentials | `meData.user.username` (dedicated field on Dust `UserType`, matches dust-cli) |
+| Thinking support | Dust `chain_of_thought` events map to Pi `thinking` blocks; Dust models advertise `reasoning: true` |
 
 ### Overview
 

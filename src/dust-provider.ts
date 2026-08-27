@@ -20,7 +20,9 @@ function buildRegisteredModels(credentials: DustCredentials) {
     sId: agent.sId,
     name: agent.name,
     api: "dust" as Api,
-    reasoning: false,
+    // Dust streams chain-of-thought tokens as native Pi thinking blocks. Mark
+    // the model as reasoning-capable so Pi exposes and renders that content.
+    reasoning: true,
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 100_000,
@@ -41,7 +43,9 @@ export function buildOAuthDustModels(credentials: OAuthCredentials): DustProvide
     name: agent.name,
     api: "dust" as Api,
     baseUrl,
-    reasoning: false,
+    // Dust streams chain-of-thought tokens as native Pi thinking blocks. Mark
+    // the model as reasoning-capable so Pi exposes and renders that content.
+    reasoning: true,
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 100_000,
