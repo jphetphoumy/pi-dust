@@ -53,6 +53,56 @@ export interface UiLike {
   setStatus?: (key: string, text: string | undefined) => void;
 }
 
+/** How a `/loop` iteration's payload is re-sent: a fixed cadence, or back-to-back once the agent settles. */
+export type DustLoopMode = "interval" | "selfPaced";
+
+/**
+ * In-memory state for an active `/loop`. Session-scoped: never persisted, and
+ * always cleared on session switch/shutdown (see `DustSessionRuntime.clearLoopState`).
+ */
+export interface DustLoopState {
+  mode: DustLoopMode;
+  /**
+   * Text re-sent via `pi.sendUserMessage` each iteration. Always sent as a
+   * plain prompt — pi's `sendUserMessage` never dispatches pi slash commands,
+   * even when this starts with `/` (see dust-loop.ts's `startLoop`).
+   */
+  payload: string;
+  /** Null for self-paced loops, which have no fixed cadence. */
+  intervalMs: number | null;
+  iterations: number;
+  /** Total ticks skipped over the loop's lifetime, because the agent was still busy. */
+  skipped: number;
+  /** Whether the *most recent* tick was skipped — drives the footer's "waiting" flag, unlike the lifetime `skipped` counter. */
+  waitingOnBusyAgent: boolean;
+  /**
+   * Self-paced only: true right after this loop sends its own payload, until
+   * the matching `agent_settled` is consumed. Lets `handleAgentSettled` in
+   * dust-loop.ts tell "the turn we just started" apart from an unrelated
+   * turn the user ran while the loop was idle between iterations — settle
+   * events are ignored unless this is true, so a stray user turn never
+   * burns one of the loop's iterations.
+   */
+  expectingSettle: boolean;
+  /** Self-paced loops auto-stop after this many iterations; interval loops run unbounded. */
+  maxIterations: number | null;
+  startedAt: number;
+}
+
+/** Parsed `/loop` invocation, before it is turned into a `DustLoopState` or an early return. */
+export type LoopRequest =
+  | { kind: "status" }
+  | { kind: "stop" }
+  | {
+      kind: "start";
+      mode: DustLoopMode;
+      payload: string;
+      intervalMs: number | null;
+      /** True when the requested interval was below the floor and got clamped up. */
+      clamped: boolean;
+    }
+  | { kind: "error"; message: string };
+
 /**
  * pi 0.81 removed `ModelRegistry.authStorage`. What remains that we care about
  * is `getProviderAuth`, which resolves a provider's current API key and, for
@@ -69,6 +119,8 @@ export interface PiRuntimeContext {
   modelRegistry?: ModelRegistryLike;
   sessionManager?: SessionManagerLike;
   ui?: UiLike;
+  /** Whether the agent is idle (not streaming). Always present on pi's real ExtensionContext. */
+  isIdle?: () => boolean;
 }
 
 export type ExtensionAPIWithEvents = ExtensionAPI & {

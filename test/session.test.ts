@@ -808,4 +808,51 @@ describe("dust extension", () => {
       expect(result.username).toBe("janedoe");
     });
   });
+
+  describe("session_start: belt-and-braces /loop stop", () => {
+    let sessionStartHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+    let loopHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+    let sendUserMessage: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      sendUserMessage = vi.fn();
+      const mockApi = {
+        registerProvider: vi.fn(),
+        registerCommand: vi.fn((name: string, cfg: any) => {
+          if (name === "loop") loopHandler = cfg.handler;
+        }),
+        on: vi.fn((event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
+          if (event === "session_start") sessionStartHandler = handler;
+        }),
+        sendUserMessage,
+      };
+      dustExtension(mockApi as any);
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    it("stops an active loop when a new session_start arrives, even without a matching session_shutdown", async () => {
+      const creds = makeCredentials();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ agentConfigurations: [] }) }),
+      );
+      seedLoggedIn(creds);
+
+      const ctx = { modelRegistry: {}, ui: { notify: vi.fn(), setStatus: vi.fn() }, isIdle: () => true };
+      await loopHandler!("5m /babysit-prs", ctx);
+      expect(sendUserMessage).toHaveBeenCalledTimes(1);
+
+      await sessionStartHandler!({ reason: "new" }, ctx);
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith("dust-loop", undefined);
+
+      sendUserMessage.mockClear();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(sendUserMessage).not.toHaveBeenCalled();
+    });
+  });
 });

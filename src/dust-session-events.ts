@@ -4,6 +4,7 @@ import { describeConversation, resolveAttachment, verifyConversation } from "./d
 import type { ConversationAttachment } from "./dust-conversation.js";
 import { debugLog } from "./dust-debug.js";
 import { refreshApprovalStatus } from "./dust-approval.js";
+import { stopDustLoop } from "./dust-loop.js";
 import { refreshPodStatus } from "./dust-pod-status.js";
 import { appendDustSkillsBanner, shouldAppendBannerFor } from "./dust-pod-skills-banner.js";
 import { applyRuntimeContext, HOST_TOKEN_ASSUMED_TTL_MS, invalidateCredentials, shouldRefreshAccessToken } from "./dust-runtime.js";
@@ -260,6 +261,14 @@ export function registerDustSessionEvents(
 ): void {
   const registerEvent = piWithEvents.on as (event: string, handler: (event: unknown, ctx: PiRuntimeContext) => unknown) => void;
 
+  // Fired before this extension runtime is torn down (quit, reload, or a
+  // session switch) — the primary way an active /loop is cancelled. The
+  // `session_start` handler below also stops one, belt-and-braces, in case a
+  // host skips this event for a given transition.
+  registerEvent("session_shutdown", (_event: unknown, ctx: PiRuntimeContext) => {
+    stopDustLoop(runtime, ctx, "session");
+  });
+
   // pi 0.65 folded the old post-transition `session_switch` into this event:
   // startup, /new, /resume and /fork all arrive here, told apart by `reason`.
   registerEvent("session_start", async (_event: unknown, ctx: PiRuntimeContext) => {
@@ -281,6 +290,10 @@ export function registerDustSessionEvents(
     // pointed at a thread its first message never reached.
     applyRuntimeContext(runtime, ctx);
     refreshApprovalStatus(runtime, ctx);
+    // Belt-and-braces: a loop must never bleed into a new session, even on a
+    // host that skipped `session_shutdown` for this transition. `stopDustLoop`
+    // already redraws the footer, so no separate refresh is needed here.
+    stopDustLoop(runtime, ctx, "session");
     // Show the pod in the footer straight away. Syncs refresh it, but the first
     // one is a turn away, and a session resumed in an ingested project should
     // say so before the user types anything.

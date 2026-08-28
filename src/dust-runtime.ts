@@ -10,6 +10,7 @@ import {
 } from "./dust-state.js";
 import type {
   DustCredentials,
+  DustLoopState,
   FairUseCredits,
   MemberUsage,
   CreditTotals,
@@ -235,6 +236,12 @@ export class DustSessionRuntime {
   autoApprove = false;
   /** Session counters and credit caches read by `/status`. */
   credits = new DustCreditTracker();
+  /** The currently active `/loop`, if any. Session-scoped — never persisted. */
+  loop: DustLoopState | null = null;
+  /** Fixed-cadence timer for an interval-mode loop. */
+  loopTimer: ReturnType<typeof setInterval> | null = null;
+  /** Debounce timer that re-fires a self-paced loop's next iteration after `agent_settled`. */
+  loopCooldownTimer: ReturnType<typeof setTimeout> | null = null;
   preApprovedActions = new Map<string, boolean>();
   pendingApprovalPromise: Promise<void> | null = null;
   private resolveApprovalGateFn: (() => void) | null = null;
@@ -553,11 +560,31 @@ export class DustSessionRuntime {
     this.resolveApprovalGate();
   }
 
+  /**
+   * Cancels an active `/loop`, if any. Deliberately not folded into
+   * `clearMcpState()` — that fires from arbitrary mid-turn async callbacks
+   * (heartbeat 403, listener 404) and a loop must survive an MCP
+   * re-registration. Callers that must end a loop (stopping it explicitly, or
+   * a session switch/shutdown) call this directly.
+   */
+  clearLoopState(): void {
+    if (this.loopTimer) {
+      clearInterval(this.loopTimer);
+      this.loopTimer = null;
+    }
+    if (this.loopCooldownTimer) {
+      clearTimeout(this.loopCooldownTimer);
+      this.loopCooldownTimer = null;
+    }
+    this.loop = null;
+  }
+
   resetSessionState(): void {
     this.conversationId = null;
     this.credits.reset();
     this.clearRefreshedAccessToken();
     this.clearMcpState();
+    this.clearLoopState();
     this.lastAdvertisedTools = null;
   }
 }
